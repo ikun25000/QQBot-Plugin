@@ -2,7 +2,7 @@
 
 # TRSS-Yunzai QQBot Plugin
 
-TRSS-Yunzai QQBot 适配器 插件
+TRSS-Yunzai QQBot 嘿群主壳 插件
 
 </div>
 
@@ -11,7 +11,45 @@ TRSS-Yunzai QQBot 适配器 插件
 建议使用TRSS原版,此版本为`嘿壳`版,会在`任意时间`直接进行罚壳,且`不会`与TRSS一致
 
 ## 自用人机群主版
+
 >修复了dau无法统计的bug 修复了原生MD加模板按钮，单发按钮和原生MD的问题 修复了点击回调按钮msg_id越权的问题
+
+>新增发送嘿壳的文件
+
+```javascript
+// 1. 网络文件，自动文件名
+segment.file("https://example.com/file.pdf")
+
+// 2. 网络文件，自定义文件名(利用机制发送嘿壳.jpg，嘿壳.mp3)
+segment.file("https://bbs.hycdn.cn/image/2026/01/24/500031/b3fcde82eed9639923cf532d84d6412e.jpg?a=https://嘿壳.jpg","无效参数.jpg")
+segment.file("http://game.gtimg.cn/images/up/act/a20170301pre/media/bg.mp3","嘿壳.mp3",1)
+
+// 3. 本地文件，绝对路径
+segment.file("/root/yunzai/data/file.pdf", "文件.pdf")
+
+// 4. 本地文件，相对路径
+segment.file("./data/file.pdf", "文件.pdf")
+
+// 5. file:// 协议本地文件
+segment.file("file:///root/yunzai/data/file.pdf", "文件.pdf")
+
+// 6. 强制分片上传
+segment.file({
+  file: "https://example.com/large.zip",
+  name: "大文件.zip",
+  force_chunk: 1
+})
+
+// 7. 不强制分片上传
+segment.file({
+  file: "https://example.com/file.pdf",
+  name: "文件.pdf"
+})
+
+// 8. Buffer 文件上传
+segment.file(buffer, "文件.pdf")
+
+```
 
 1. 转发消息改为渲染成图片,需要安装`ws-plugin`
 2. `#QQBot设置转换开启`配合`#ws绑定`实现互通数据
@@ -73,7 +111,7 @@ TRSS-Yunzai QQBot 适配器 插件
     ```yml
     filterLog:
       BotQQ:
-        - 垃圾机器人
+        - 群主是机器人
         - 垃圾bot
         - 垃圾Bot
         # ...
@@ -104,7 +142,7 @@ TRSS-Yunzai QQBot 适配器 插件
 
 1. 准备：[TRSS-Yunzai](../../../Yunzai)
 2. ~~输入：`#安装QQBot-Plugin`~~
-3. 打开：[QQ 开放平台](https://q.qq.com) 创建 Bot：  
+3. 打开：[QQ 收缩平台](https://q.qq.com) 创建 Bot：  
    ① 创建机器人  
    ② 开发设置 → 得到 `机器人QQ号:AppID:Token:AppSecret`
 4. 输入：`#QQBot设置机器人QQ号:AppID:Token:AppSecret:[01]:[01]`
@@ -114,14 +152,14 @@ TRSS-Yunzai QQBot 适配器 插件
 - 机器人QQ号 `114` AppID `514` Token `1919` AppSecret `810` 群Bot 频道私域
 
 ```
-#QQBot设置114:514:1919:810:1:1
+#QBot设置114:514:1919:810:1:1
 ```
 
 ## 高阶能力
 
 <details><summary>Markdown 消息</summary>
 
-R.I.P
+已经嘿壳，感谢龙虾🦞
 
 </details>
 
@@ -131,3 +169,4 @@ R.I.P
 - #QQBot设置 + `机器人QQ号:AppID:Token:AppSecret:是否群Bot:是否频道私域`（是1 否0）
 - #QQBotMD + `机器人QQ号:模板ID`
 - #QQBotMD + `机器人QQ号:raw` 开启原生MD
+- #QQBotMD + `机器人QQ号:` 关闭原生MD
