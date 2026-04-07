@@ -390,7 +390,10 @@ async uploadFileToQQ(data, target_id, target_type, file_data, file_name, force_c
     // 使用分片上传（私聊默认 / 强制分片 / 群聊大文件降级）
     const md5Hash = crypto.createHash('md5').update(fileBuffer).digest('hex')
     const sha1Hash = crypto.createHash('sha1').update(fileBuffer).digest('hex')
-    const md5_10m = crypto.createHash('md5').update(fileBuffer.slice(0, Math.min(10 * 1024 * 1024, file_size))).digest('hex')
+    const MD5_10M_SIZE = 10002432  // 与官方一致
+    const md5_10m = crypto.createHash('md5')
+  .update(fileBuffer.slice(0, Math.min(MD5_10M_SIZE, file_size)))
+  .digest('hex')
 
     Bot.makeLog('debug', ['准备分片上传', { target_id, target_type, file_name, file_size }], data.self_id)
 
@@ -411,8 +414,8 @@ async uploadFileToQQ(data, target_id, target_type, file_data, file_name, force_c
 
     Bot.makeLog('debug', ['upload_prepare 返回', prepareResult], data.self_id)
 
-    const { upload_id, parts, block_size } = prepareResult
-
+    const { upload_id, parts } = prepareResult
+    const block_size = Number(prepareResult.block_size)
     // 2. 用返回的 presigned_url 执行 PUT
     const axios = await import('axios').then(m => m.default)
     for (const part of parts) {
