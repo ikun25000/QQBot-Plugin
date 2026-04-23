@@ -16,6 +16,8 @@ TRSS-Yunzai QQBot 嘿群主壳 插件
 
 >新增发送嘿壳的文件
 
+>原生按钮开放，新增按钮生成器
+
 ```javascript
 // 1. 网络文件，自动文件名
 segment.file("https://example.com/file.pdf")
