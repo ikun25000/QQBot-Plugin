@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.5, user-scalable=yes, viewport-fit=cover">
+  <title>QQ机器人 · 按钮生成器</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; }
+    body {
+      background: #f4fcf0;
+      font-family: 'Segoe UI', 'Roboto', system-ui, -apple-system, sans-serif;
+      padding: 20px 12px;
+      color: #1b3f28;
+    }
+    .container { max-width: 1500px; margin: 0 auto; }
+    h1 {
+      font-size: clamp(1.8rem, 6vw, 2.9rem);
+      background: linear-gradient(145deg, #1f6e3b, #4f9e63);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+      border-left: 8px solid #a1d494; padding-left: 16px;
+    }
+    h2 {
+      margin: 0;
+      font-size: clamp(1.5rem, 5vw, 2rem);
+      color: #236635;
+      white-space: nowrap;
+    }
+    .warning {
+      background: #fff6d6; border-left: 6px solid #e6b422;
+      padding: 16px 20px; border-radius: 20px; margin: 20px 0;
+      font-size: 0.95rem;
+    }
+    .btn {
+      background: #4a8f5c; color: white; border: none; border-radius: 40px;
+      padding: 8px 16px; font-weight: bold; cursor: pointer;
+      box-shadow: 0 4px 0 #235f2e; margin-right: 8px; margin-bottom: 8px;
+      font-size: 0.9rem;
+      transition: 0.1s;
+    }
+    .btn-secondary { background: #d7eace; color: #1d4f28; box-shadow: 0 4px 0 #8dad7e; }
+    .output {
+      background: #1d3421; color: #d2efc5; border-radius: 20px; padding: 16px;
+      font-family: monospace; white-space: pre-wrap; margin-top: 20px;
+      font-size: 0.9rem; overflow-x: auto;
+    }
+    .button-row-editor {
+      background: #d9efd0; border-radius: 20px; padding: 14px; margin-bottom: 16px;
+    }
+    .row-header {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .row-header strong {
+      white-space: nowrap;
+      background: #a1c897; padding: 4px 14px; border-radius: 30px; color: #1a4722;
+    }
+    .button-item {
+      background: white; border-radius: 18px; padding: 14px; margin: 10px 0;
+      border: 1px solid #9fc193;
+    }
+    .small-btn { padding: 6px 12px; font-size: 0.85rem; box-shadow: 0 2px 0 #3e6a3e; }
+    .field-group {
+      display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      margin-right: 12px; margin-bottom: 6px;
+    }
+    .field-group label {
+      font-weight: 600; color: #1e532e; min-width: 70px; font-size: 0.9rem;
+    }
+    .field-group input, .field-group select {
+      padding: 6px 10px; border-radius: 24px; border: 1px solid #7aa86e;
+      background: white; font-size: 0.9rem;
+    }
+    .hint-note {
+      color: #4a7040; font-size: 0.75rem; margin-left: 4px; white-space: nowrap;
+    }
+    .auto-prefix-note { font-size: 0.75rem; color: #3e6d41; margin-left: 6px; }
+    .error-text { color: #c73b1e; font-weight: 500; }
+    .success-tip {
+      background: #c6e6b5; color: #1d4f28; padding: 8px 20px; border-radius: 40px;
+      font-weight: 500; display: inline-block; margin-left: 16px;
+      opacity: 0; transition: opacity 0.2s;
+    }
+    .success-tip.show { opacity: 1; }
+    
+    .add-row-section {
+      margin: 16px 0 20px;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+    .row-footer {
+      margin-top: 12px;
+      padding-top: 8px;
+      border-top: 1px dashed #8bb87d;
+      display: flex;
+      justify-content: flex-end;
+    }
+    .required-hint { color: #c73b1e; margin-left: 4px; }
+    .future-note {
+      background: #fff9e0;
+      color: #9e7e1f;
+      font-size: 0.7rem;
+      padding: 2px 8px;
+      border-radius: 30px;
+      margin-left: 6px;
+    }
+    @media (max-width: 640px) {
+      body { padding: 12px 8px; }
+      .field-group { width: 100%; }
+      .field-group label { min-width: 80px; }
+      .btn { padding: 8px 14px; font-size: 0.85rem; }
+      .hint-note { white-space: normal; }
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>🤖 按钮生成器</h1>
+  <div class="warning">
+    <strong>⚠️ 必须携带Markdown！</strong> 平台禁止单独发送键盘。<br>
+    ✅ <code>this.e.reply([segment.markdown('群主是人机'), keyboard])</code>
+  </div>
+
+  <!-- 标题 + 格式/小字体/预填 -->
+  <div style="display:flex; align-items:center; gap:20px; flex-wrap:wrap; margin-bottom:10px;">
+    <h2>⚙️ 动态多行按钮编辑</h2>
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-left:auto;">
+      <label>输出格式:
+        <select id="outputFormat" style="padding:6px 12px; border-radius:30px; border:2px solid #86bc79;">
+          <option value="segment">框架代码 (segment.raw)</option>
+          <option value="json">通用 JSON</option>
+        </select>
+      </label>
+      <label>🔘 全局小字体:
+        <select id="globalSmallFont">
+          <option value="no" selected>默认大小</option>
+          <option value="small">small (小字体)</option>
+        </select>
+      </label>
+      <label style="display:flex; align-items:center;">
+        <input type="checkbox" id="prefillSample" checked> 预填示例
+      </label>
+    </div>
+  </div>
+
+  <!-- 动态按钮编辑区域 -->
+  <div id="rowsContainer"></div>
+
+  <!-- 添加一行按钮 -->
+  <div class="add-row-section">
+    <button class="btn" id="addRowBtn" style="font-size:0.95rem;">➕ 添加一行</button>
+    <span style="color:#3a6741;">按钮最多五行</span>
+  </div>
+
+  <!-- 全局默认属性 -->
+  <details style="margin:10px 0 20px; background:#e2f0da; border-radius:20px; padding:16px;">
+    <summary style="font-weight:bold; font-size:1.2rem; cursor:pointer;">🔧 全局默认属性 (新按钮预填)</summary>
+    <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(180px,1fr)); gap:12px; margin-top:16px;">
+      <label>样式: <select id="defaultStyle">
+        <option value="0">0 灰框</option><option value="1" selected>1 蓝框</option><option value="2">2 智能体</option><option value="3">3 红框</option><option value="4">4 蓝底白字</option>
+      </select></label>
+      <label>类型: <select id="defaultType">
+        <option value="0">0 链接</option><option value="1">1 回调</option><option value="2" selected>2 指令</option><option value="3">3 native</option><option value="4">4 订阅</option><option value="5">5 自定义</option>
+      </select></label>
+      <label>权限: <select id="defaultPerm">
+        <option value="0">0 指定用户</option><option value="1">1 管理员</option><option value="2" selected>2 所有人</option><option value="3">3 身份组</option>
+      </select></label>
+      <label>enter: <select id="defaultEnter"><option value="false">否</option><option value="true">是</option></select></label>
+      <label>reply: <select id="defaultReply"><option value="false">否</option><option value="true">是</option></select></label>
+      <label>不支持提示: <input id="defaultUnsupport" placeholder="unsupport_tips" value="请升级QQ版本"></label>
+      <label>点击限制: <input id="defaultClickLimit" type="number" placeholder="可选"></label>
+      <label>anchor: <select id="defaultAnchor"><option value="0">0 无</option><option value="1">1 选图器</option></select></label>
+    </div>
+  </details>
+
+  <div style="margin:20px 0; display:flex; align-items:center; flex-wrap:wrap;">
+    <button class="btn" id="genBtn">✨ 生成代码</button>
+    <button class="btn btn-secondary" id="copyBtn">📋 复制</button>
+    <span id="successMessage" class="success-tip">✅ 生成成功！可点击复制</span>
+  </div>
+  <div id="errorMsg" class="error-text" style="min-height:24px;"></div>
+  <div class="output" id="outputCode">// 点击生成按钮显示代码</div>
+  <p class="note">群主一定是机器人，嘿群主壳，人群主机</p>
+  <footer>🌱 QQBot-Plugin</footer>
+</div>
+
+<script>
+  (function(){
+    let rows = [];
+    const prefillCheck = document.getElementById('prefillSample');
+    const successMsg = document.getElementById('successMessage');
+    let successTimer = null;
+
+    function showSuccessTip() {
+      if (successTimer) clearTimeout(successTimer);
+      successMsg.classList.add('show');
+      successTimer = setTimeout(() => successMsg.classList.remove('show'), 2500);
+    }
+
+    // 生成订阅默认模板ID: appid_时间戳
+    function generateDefaultTemplateId() {
+      return 'appid_' + Date.now();
+    }
+
+    function createDefaultButton() {
+      const useSample = prefillCheck.checked;
+      const defType = document.getElementById('defaultType').value;
+      let defaultData = '#签到';
+      if (defType === '0') defaultData = 'https://www.qq.com';
+      else if (defType === '3') defaultData = 'mqqapi://';
+      return {
+        id: 'btn_' + Date.now() + '_' + Math.random().toString(36).substr(2,6),
+        label: useSample ? '日签' : '',
+        visited_label: useSample ? '已签到' : '',
+        style: document.getElementById('defaultStyle').value,
+        actionType: defType,
+        data: useSample ? defaultData : '',
+        permissionType: document.getElementById('defaultPerm').value,
+        specifyIds: '',
+        useModal: false,
+        modalContent: '确认执行？',
+        modalConfirm: '✔️确认',
+        modalCancel: '❌取消',
+        templateId: generateDefaultTemplateId(),   // 订阅模板ID
+        unsupportTips: document.getElementById('defaultUnsupport').value,
+        enter: document.getElementById('defaultEnter').value === 'true',
+        reply: document.getElementById('defaultReply').value === 'true',
+        atBotList: false,
+        clickLimit: document.getElementById('defaultClickLimit').value,
+        anchor: document.getElementById('defaultAnchor').value,
+      };
+    }
+
+    function initDefaultRows() {
+      rows = [{ buttons: [createDefaultButton()] }];
+      renderRows();
+    }
+
+    const container = document.getElementById('rowsContainer');
+    
+    function renderRows() {
+      let html = '';
+      rows.forEach((row, rowIdx) => {
+        html += `<div class="button-row-editor">
+          <div class="row-header">
+            <strong>第 ${rowIdx+1} 行</strong>
+            <button class="btn small-btn" data-add-btn-top="${rowIdx}">➕ 添加按钮</button>
+            <button class="btn small-btn btn-secondary" data-del-row="${rowIdx}">🗑️ 删除行</button>
+          </div>`;
+        row.buttons.forEach((btn, btnIdx) => {
+          html += renderButtonEditor(btn, rowIdx, btnIdx);
+        });
+        html += `<div class="row-footer">
+          <button class="btn small-btn btn-secondary" data-add-btn-bottom="${rowIdx}">➕ 在此行添加按钮</button>
+        </div>`;
+        html += `</div>`;
+      });
+      container.innerHTML = html;
+      attachEvents();
+    }
+
+    function renderButtonEditor(btn, rowIdx, btnIdx) {
+      const isLinkType = btn.actionType === '0' || btn.actionType === '3';
+      const modalSupported = ['0','1','2','3','5'].includes(btn.actionType);
+      const isSubscribe = btn.actionType === '4';
+      return `<div class="button-item" data-row="${rowIdx}" data-btn="${btnIdx}">
+        <div style="display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-bottom:10px;">
+          <div class="field-group"><label>按钮文字 *</label><input value="${btn.label}" placeholder="必填" style="width:130px;" data-field="label"></div>
+          <div class="field-group"><label>点击后文字</label><input value="${btn.visited_label}" placeholder="可选" style="width:130px;" data-field="visited_label"></div>
+          <div class="field-group"><label>样式</label><select data-field="style">${styleOptions(btn.style)}</select></div>
+          <div class="field-group"><label>动作类型</label><select data-field="actionType">${typeOptions(btn.actionType)}</select></div>
+          <div class="field-group"><label>指令/数据/链接</label><input value="${btn.data}" placeholder="${isLinkType ? (btn.actionType==='0'?'https://...':'mqqapi://...') : (isSubscribe ? '#指令(可选)' : '#指令')}" style="width:180px;" data-field="data">${isLinkType?'<span class="auto-prefix-note">⚡自动前缀</span>':''}</div>
+          <button class="btn small-btn btn-secondary" data-del-btn="${rowIdx},${btnIdx}">删除</button>
+        </div>
+        <div style="display:flex; flex-wrap:wrap; align-items:center; gap:10px;">
+          <div class="field-group"><label>权限</label><select data-field="permissionType">${permOptions(btn.permissionType)}</select></div>
+          <div class="field-group"><label>指定ID</label><input value="${btn.specifyIds}" placeholder="逗号分隔" style="width:130px;" data-field="specifyIds"></div>
+          <div class="field-group" style="${modalSupported ? '' : 'display:none;'}"><label><input type="checkbox" data-field="useModal" ${btn.useModal?'checked':''}> 弹窗</label></div>
+          <span id="modalFields_${rowIdx}_${btnIdx}" style="${btn.useModal?'':'display:none;'}">
+            <input value="${btn.modalContent}" placeholder="内容" size="10" data-field="modalContent">
+            <input value="${btn.modalConfirm}" placeholder="确认" size="6" data-field="modalConfirm">
+            <input value="${btn.modalCancel}" placeholder="取消" size="6" data-field="modalCancel">
+          </span>
+          <div class="field-group" style="${isSubscribe ? '' : 'display:none;'}">
+            <label>模板ID <span class="required-hint">*</span></label>
+            <input value="${btn.templateId}" placeholder="custom_template_id" style="width:200px;" data-field="templateId">
+            <span class="future-note">即将开放</span>
+            <span class="hint-note">订阅必填</span>
+          </div>
+        </div>
+        <div style="display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-top:8px;">
+          <div class="field-group"><label>不支持提示</label><input value="${btn.unsupportTips}" placeholder="unsupport_tips" data-field="unsupportTips"></div>
+          <div class="field-group"><label><input type="checkbox" data-field="enter" ${btn.enter?'checked':''}> enter</label><label style="margin-left:8px;"><input type="checkbox" data-field="reply" ${btn.reply?'checked':''}> reply</label><label style="margin-left:8px;"><input type="checkbox" data-field="atBotList" ${btn.atBotList?'checked':''}> at_bot_show</label></div>
+          <div class="field-group"><label>点击限制</label><input value="${btn.clickLimit}" type="number" placeholder="可选" style="width:80px;" data-field="clickLimit"><span class="hint-note">💡 文字相同可无限点</span></div>
+          <div class="field-group"><label>anchor</label><select data-field="anchor">${anchorOptions(btn.anchor)}</select></div>
+        </div>
+      </div>`;
+    }
+
+    function styleOptions(val) {
+      const opts = {0:'0 灰框',1:'1 蓝框',2:'2 智能体',3:'3 红框',4:'4 蓝底白字'};
+      return Object.entries(opts).map(([v,t])=>`<option value="${v}" ${v==val?'selected':''}>${t}</option>`).join('');
+    }
+    function typeOptions(val) {
+      const opts = {0:'0 链接',1:'1 回调',2:'2 指令',3:'3 native',4:'4 订阅',5:'5 自定义'};
+      return Object.entries(opts).map(([v,t])=>`<option value="${v}" ${v==val?'selected':''}>${t}</option>`).join('');
+    }
+    function permOptions(val) {
+      const opts = {0:'0 指定用户',1:'1 管理员',2:'2 所有人',3:'3 身份组'};
+      return Object.entries(opts).map(([v,t])=>`<option value="${v}" ${v==val?'selected':''}>${t}</option>`).join('');
+    }
+    function anchorOptions(val) {
+      return `<option value="0" ${val==='0'?'selected':''}>0 无</option><option value="1" ${val==='1'?'selected':''}>1 选图器</option>`;
+    }
+
+    function attachEvents() {
+      document.querySelectorAll('[data-field]').forEach(el => {
+        el.addEventListener('input', function(e) {
+          const rowIdx = this.closest('[data-row]')?.dataset.row;
+          const btnIdx = this.closest('[data-row]')?.dataset.btn;
+          if (rowIdx === undefined) return;
+          const field = this.dataset.field;
+          const value = this.type === 'checkbox' ? this.checked : this.value;
+          const btn = rows[rowIdx].buttons[btnIdx];
+          btn[field] = value;
+          
+          if (field === 'useModal') {
+            const span = document.getElementById(`modalFields_${rowIdx}_${btnIdx}`);
+            if (span) span.style.display = value ? 'inline' : 'none';
+          }
+          if (field === 'actionType') {
+            const itemDiv = this.closest('.button-item');
+            // 订阅模板ID控制
+            const subscribeGroup = Array.from(itemDiv.querySelectorAll('.field-group')).find(g => g.querySelector('label')?.textContent.includes('模板ID'));
+            if (subscribeGroup) {
+              subscribeGroup.style.display = value === '4' ? 'flex' : 'none';
+            }
+            const dataInput = itemDiv.querySelector('[data-field="data"]');
+            const modalCheckGroup = itemDiv.querySelector('[data-field="useModal"]')?.closest('.field-group');
+            const modalSupported = ['0','1','2','3','5'].includes(value);
+            if (modalCheckGroup) {
+              modalCheckGroup.style.display = modalSupported ? 'flex' : 'none';
+              if (!modalSupported) {
+                const cb = itemDiv.querySelector('[data-field="useModal"]');
+                if (cb) { cb.checked = false; btn.useModal = false; }
+                const span = document.getElementById(`modalFields_${rowIdx}_${btnIdx}`);
+                if (span) span.style.display = 'none';
+              }
+            }
+            if (value === '0' || value === '3') {
+              let cur = btn.data;
+              if (value==='0' && cur && !cur.match(/^https?:\/\//)) cur = 'https://' + cur.replace(/^https?:\/\//, '');
+              if (value==='3' && cur && !cur.startsWith('mqqapi://')) cur = 'mqqapi://' + cur.replace(/^mqqapi:\/\//, '');
+              if (cur !== btn.data) { btn.data = cur; dataInput.value = cur; }
+            }
+          }
+          if (field === 'data') {
+            let val = value;
+            if (btn.actionType==='0' && val && !val.match(/^https?:\/\//)) val = 'https://' + val.replace(/^https?:\/\//, '');
+            if (btn.actionType==='3' && val && !val.startsWith('mqqapi://')) val = 'mqqapi://' + val.replace(/^mqqapi:\/\//, '');
+            if (val !== value) { btn.data = val; this.value = val; }
+          }
+        });
+      });
+      
+      document.querySelectorAll('[data-add-btn-top]').forEach(btn => {
+        btn.addEventListener('click', e => {
+          const rowIdx = e.target.dataset.addBtnTop;
+          rows[rowIdx].buttons.push(createDefaultButton());
+          renderRows();
+        });
+      });
+      document.querySelectorAll('[data-add-btn-bottom]').forEach(btn => {
+        btn.addEventListener('click', e => {
+          const rowIdx = e.target.dataset.addBtnBottom;
+          rows[rowIdx].buttons.push(createDefaultButton());
+          renderRows();
+        });
+      });
+      document.querySelectorAll('[data-del-row]').forEach(btn => {
+        btn.addEventListener('click', e => {
+          const idx = e.target.dataset.delRow;
+          rows.splice(idx, 1);
+          if (rows.length===0) rows.push({ buttons: [createDefaultButton()] });
+          renderRows();
+        });
+      });
+      document.querySelectorAll('[data-del-btn]').forEach(btn => {
+        btn.addEventListener('click', e => {
+          const [r,c] = e.target.dataset.delBtn.split(',').map(Number);
+          rows[r].buttons.splice(c,1);
+          if (rows[r].buttons.length===0) rows.splice(r,1);
+          if (rows.length===0) rows.push({ buttons: [createDefaultButton()] });
+          renderRows();
+        });
+      });
+    }
+
+    document.getElementById('addRowBtn').addEventListener('click', ()=>{
+      rows.push({ buttons: [createDefaultButton()] });
+      renderRows();
+    });
+
+    function validateButtons() {
+      for (let r of rows) {
+        for (let btn of r.buttons) {
+          if (!btn.label || btn.label.trim() === '') {
+            document.getElementById('errorMsg').innerText = '❌ 存在按钮文字为空';
+            return false;
+          }
+          if (btn.actionType === '4' && (!btn.templateId || btn.templateId.trim() === '')) {
+            document.getElementById('errorMsg').innerText = '❌ 订阅按钮必须填写模板ID';
+            return false;
+          }
+        }
+      }
+      return true;
+    }
+
+    function buildContentRows() {
+      return rows.map(row => ({
+        buttons: row.buttons.map(btn => {
+          const perm = { type: parseInt(btn.permissionType) };
+          if (perm.type === 0 || perm.type === 3) {
+            const ids = btn.specifyIds.split(',').map(s=>s.trim()).filter(s=>s);
+            if (perm.type === 0) perm.specify_user_ids = ids;
+            else perm.specify_role_ids = ids;
+          }
+          const action = { type: parseInt(btn.actionType), permission: perm };
+          let finalData = btn.data || '';
+          if (btn.actionType === '0' && finalData && !finalData.match(/^https?:\/\//)) finalData = 'https://' + finalData.replace(/^https?:\/\//, '');
+          if (btn.actionType === '3' && finalData && !finalData.startsWith('mqqapi://')) finalData = 'mqqapi://' + finalData.replace(/^mqqapi:\/\//, '');
+          if (btn.actionType !== '4') action.data = finalData;
+          else if (finalData) action.data = finalData;
+          
+          if (btn.unsupportTips) action.unsupport_tips = btn.unsupportTips;
+          if (btn.enter) action.enter = true;
+          if (btn.reply) action.reply = true;
+          if (btn.atBotList) action.at_bot_show_channel_list = true;
+          if (btn.clickLimit && !isNaN(btn.clickLimit)) action.click_limit = parseInt(btn.clickLimit);
+          if (btn.anchor === '1') action.anchor = 1;
+          if (btn.useModal && ['0','1','2','3','5'].includes(btn.actionType)) {
+            action.modal = { content: btn.modalContent, confirm_text: btn.modalConfirm, cancel_text: btn.modalCancel };
+          }
+          if (btn.actionType === '4') {
+            action.subscribe_data = { template_ids: [{ custom_template_id: btn.templateId }] };
+          }
+          return {
+            id: btn.id,
+            render_data: { label: btn.label.trim(), visited_label: btn.visited_label || btn.label, style: parseInt(btn.style) },
+            action
+          };
+        })
+      }));
+    }
+
+    function generateOutput() {
+      if (!validateButtons()) {
+        return null;
+      }
+      const rowsData = buildContentRows();
+      const content = { rows: rowsData };
+      const useSmallFont = document.getElementById('globalSmallFont').value === 'small';
+      if (useSmallFont) content.style = { font_size: 'small' };
+      
+      const format = document.getElementById('outputFormat').value;
+      if (format === 'segment') {
+        const full = { type: 'keyboard', content };
+        return `const md = segment.markdown('操作提示')\nconst keyboard = segment.raw(${JSON.stringify(full, null, 2)});\n\nthis.e.reply([md, keyboard]);`;
+      } else {
+        return JSON.stringify({ rows: rowsData, ...(useSmallFont && { style: { font_size: 'small' } }) }, null, 2);
+      }
+    }
+
+    document.getElementById('genBtn').addEventListener('click', ()=>{
+      const code = generateOutput();
+      if (code) {
+        document.getElementById('outputCode').textContent = code;
+        document.getElementById('errorMsg').innerText = '';
+        showSuccessTip();
+      } else {
+        document.getElementById('outputCode').textContent = '// 请先填写所有必填项（按钮文字、订阅模板ID）';
+        successMsg.classList.remove('show');
+      }
+    });
+
+    function fallbackCopy(text) {
+      const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); alert('✅ 已复制'); } catch(e) { alert('❌ 复制失败'); }
+      document.body.removeChild(ta);
+    }
+    document.getElementById('copyBtn').addEventListener('click', ()=>{
+      const text = document.getElementById('outputCode').textContent;
+      if (!text || text.startsWith('//')) { alert('请先生成'); return; }
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(text).then(()=>alert('✅ 已复制')).catch(()=>fallbackCopy(text));
+      } else fallbackCopy(text);
+    });
+
+    initDefaultRows();
+    document.getElementById('genBtn').click();
+  })();
+</script>
+</body>
+</html>
