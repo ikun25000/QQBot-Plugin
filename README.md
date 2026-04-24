@@ -18,6 +18,8 @@ TRSS-Yunzai QQBot 嘿群主壳 插件
 
 >原生按钮开放，新增按钮生成器
 
+>由于龙虾占用腾讯服务器，增加了ws断线检测和通知，24小时内没有次数了，机器人会被罚壳。
+
 ```javascript
 // 1. 网络文件，自动文件名
 segment.file("https://example.com/file.pdf")
@@ -51,6 +53,130 @@ segment.file({
 // 8. Buffer 文件上传
 segment.file(buffer, "文件.pdf")
 
+```
+## 文件撤回示例
+
+### 基础用法
+```javascript
+// 发送文件，20秒后自动撤回
+segment.file("https://example.com/file.pdf", "文档.pdf", 0, 20)
+
+// 参数说明：
+// 参数1: 文件URL或路径
+// 参数2: 文件名
+// 参数3: force_chunk (0=自动判断, 1=强制分片上传)
+// 参数4: recall_time (撤回时间，单位：秒，0=不撤回)
+```
+
+### 更多示例
+```javascript
+// 1. 普通文件，60秒后撤回
+segment.file("https://example.com/data.zip", "人机模块.zip", 0, 60)
+
+// 2. 强制分片上传，30秒后撤回
+segment.file("https://example.com/large.mp4", "人机视频.mp4", 1, 30)
+
+// 3. 本地文件，120秒后撤回
+segment.file("file:///data/report.xlsx", "人机群主.xlsx", 0, 120)
+
+// 4. 对象形式参数
+segment.file({
+  file: "https://example.com/file.txt",
+  name: "文本.txt",
+  force_chunk: 0,
+  recall_time: 45
+})
+
+// 5. 私聊文件（自动分片），10秒后撤回
+segment.file("https://example.com/secret.doc", "机密的嘿壳模块.doc", 0, 10)
+```
+
+### 注意事项
+- `recall_time` 为 `0` 或不填时，不会自动撤回
+- 撤回时间从文件发送成功开始计算
+- 超过2分钟的消息无法撤回（QQ官方限制）
+- 私聊文件会自动使用分片上传，`force_chunk` 参数无效
+
+---
+
+## 账号掉线检测与重连命令
+
+### 总开关
+```bash
+# 开启掉线检测（总开关，必须先开启此项其他功能才生效）
+#QQBot账号掉线检测 开启
+
+# 关闭掉线检测
+#QQBot账号掉线检测 关闭
+```
+
+### 掉线提醒
+```bash
+# 开启掉线提醒（会向所有管理员发送掉线通知）
+#QQBot账号掉线提醒 开启
+
+# 关闭掉线提醒
+#QQBot账号掉线提醒 关闭
+```
+
+### 自动重连
+```bash
+# 开启自动重连（检测到掉线后自动尝试重连）
+#QQBot账号掉线自动重连 开启
+
+# 关闭自动重连
+#QQBot账号掉线自动重连 关闭
+```
+
+### 检测时间间隔
+```bash
+# 设置检测间隔为1分钟（最小值）
+#QQBot账号掉线检测时间设置 1分钟
+
+# 设置检测间隔为5分钟（推荐值）
+#QQBot账号掉线检测时间设置 5分钟
+
+# 设置检测间隔为10分钟
+#QQBot账号掉线检测时间设置 10分钟
+
+# 设置检测间隔为30分钟（最大值）
+#QQBot账号掉线检测时间设置 30分钟
+
+# 支持范围：1-30 分钟
+#QQBot账号掉线检测时间设置 15分钟
+```
+
+### 工作原理
+1. **检测机制**：定时调用 `/gateway/bot` 接口查询 `session_start_limit.remaining`
+2. **掉线判断**：`remaining === 0` 表示账号已掉线，无剩余连接次数
+3. **重连流程**：
+   - 检测到 `remaining === 0` 时，记录 `reset_after`（重置等待时间）
+   - 发送掉线提醒（如已开启）
+   - 等待 `reset_after` 毫秒后，再次检查 `remaining` 是否恢复
+   - 若 `remaining > 0`，执行 `logout()` → `login()` 重连
+   - 重连成功后发送通知（如已开启）
+
+### 配置示例
+```yaml
+# config.yaml
+offlineDetect:
+  enabled: true           # 总开关
+  notify: true            # 掉线提醒
+  autoReconnect: true     # 自动重连
+  interval: 5             # 检测间隔（分钟）
+```
+
+### 通知消息示例
+```
+掉线提醒：
+[3889000008] 账号下线：[下线通知]你的帐号当前登录已失效，请5小时6分钟7秒后重新登录。
+发送 /Bot上线3889000008 重新登录
+
+重连成功：
+[3889000008] 账号重连成功！
+
+重连失败：
+[3889000008] 自动重连失败：Connection timeout
 ```
 
 1. 转发消息改为渲染成图片,需要安装`ws-plugin`
