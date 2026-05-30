@@ -73,6 +73,9 @@
     .hint-note {
       color: #4a7040; font-size: 0.75rem; margin-left: 4px; white-space: nowrap;
     }
+    .warn-note {
+      color: #b7791f; font-size: 0.75rem; margin-left: 4px; white-space: nowrap;
+    }
     .auto-prefix-note { font-size: 0.75rem; color: #3e6d41; margin-left: 6px; }
     .error-text { color: #c73b1e; font-weight: 500; }
     .success-tip {
@@ -95,6 +98,240 @@
       display: flex;
       justify-content: flex-end;
     }
+    .preview-section {
+      background: #e2f0da;
+      border-radius: 20px;
+      padding: 16px;
+      margin: 18px 0 20px;
+    }
+    .preview-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .preview-container {
+      background: #eef2f7;
+      border: 1px solid #d5dde8;
+      border-radius: 16px;
+      padding: 12px;
+      max-width: 460px;
+      min-height: 72px;
+    }
+    .preview-container.small-font .preview-button {
+      height: 19px;
+      border-radius: 4px;
+      font-size: 0.62rem;
+      padding: 0 6px;
+    }
+    .chat-preview {
+      background: #f6f8fb;
+      border: 1px solid #d5dde8;
+      border-radius: 16px;
+      max-width: 460px;
+      overflow: hidden;
+    }
+    .chat-header {
+      background: #fff;
+      border-bottom: 1px solid #e3e8ef;
+      padding: 10px 14px;
+      color: #344054;
+      font-weight: 700;
+      font-size: 0.9rem;
+    }
+    .chat-body {
+      padding: 12px;
+      min-height: 160px;
+    }
+    .markdown-preview {
+      background: #fff;
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin: 0 0 8px;
+      color: #25323f;
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.08);
+      font-size: 0.9rem;
+    }
+    .preview-container.small-font .markdown-preview {
+      font-size: 0.78rem;
+    }
+    .chat-message {
+      max-width: 82%;
+      width: fit-content;
+      background: #fff;
+      border-radius: 14px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+      color: #25323f;
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.08);
+      font-size: 0.9rem;
+    }
+    .chat-message.user {
+      margin-left: auto;
+      background: #d7f5c7;
+    }
+    .chat-message.status {
+      margin-left: auto;
+      margin-right: auto;
+      background: #fff8db;
+      color: #9a6b10;
+      font-size: 0.82rem;
+    }
+    .chat-message.success {
+      background: #daf7df;
+      color: #20703a;
+    }
+    .chat-spinner {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid #c8d0db;
+      border-top-color: #12b7f5;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: -2px;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .chat-input-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      background: #fff;
+      border-top: 1px solid #e3e8ef;
+    }
+    .chat-input {
+      flex: 1;
+      min-height: 34px;
+      border: 1px solid #d5dde8;
+      border-radius: 18px;
+      color: #667085;
+      padding: 8px 12px;
+      background: #f8fafc;
+      font-size: 0.85rem;
+    }
+    .chat-send-btn {
+      border: none;
+      border-radius: 18px;
+      padding: 8px 12px;
+      background: #12b7f5;
+      color: #fff;
+      font-weight: 700;
+    }
+    .subscribe-modal-mask {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.35);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 20px;
+    }
+    .subscribe-modal-mask.show { display: flex; }
+    .subscribe-modal {
+      width: min(360px, 100%);
+      background: #fff;
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 18px 48px rgba(15, 23, 42, 0.22);
+      color: #22313f;
+    }
+    .subscribe-modal h3 {
+      margin: 0 0 8px;
+      color: #236635;
+      font-size: 1.15rem;
+    }
+    .subscribe-modal p {
+      margin: 0 0 16px;
+      color: #667085;
+      font-size: 0.9rem;
+    }
+    .subscribe-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+    .preview-empty {
+      color: #667085;
+      text-align: center;
+      padding: 16px;
+      font-size: 0.9rem;
+    }
+    .preview-row {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+    .preview-row:last-child { margin-bottom: 0; }
+    .preview-button {
+      flex: 1 1 0;
+      min-width: 0;
+      height: 38px;
+      border: 1px solid #c9ced6;
+      border-radius: 7px;
+      background: #fff;
+      color: #263238;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 10px;
+      font-size: 0.9rem;
+      line-height: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      cursor: pointer;
+      transition: opacity 0.15s, filter 0.15s, transform 0.1s;
+      position: relative;
+    }
+    .preview-button:hover { transform: translateY(-1px); }
+    .preview-button.style-0 {
+      border-color: #c9ced6;
+      color: #30353b;
+      background: #fff;
+    }
+    .preview-button.style-1 {
+      border-color: #12b7f5;
+      color: #0e9fd8;
+      background: #fff;
+    }
+    .preview-button.style-2 {
+      border-color: #c9ced6;
+      color: #30353b;
+      background: #fff;
+      gap: 4px;
+    }
+    .preview-ai-icon {
+      width: 16px;
+      height: 16px;
+      flex: 0 0 auto;
+    }
+    .preview-container.small-font .preview-ai-icon {
+      width: 10px;
+      height: 10px;
+    }
+    .preview-button.style-3 {
+      border-color: #f24d4d;
+      color: #e03f3f;
+      background: #fff;
+    }
+    .preview-button.style-4 {
+      border-color: #12b7f5;
+      color: #fff;
+      background: #12b7f5;
+    }
+    .preview-button.visited {
+      opacity: 0.85;
+    }
+    .preview-button.disabled {
+      opacity: 0.45;
+      filter: grayscale(1);
+      pointer-events: none;
+    }
     .required-hint { color: #c73b1e; margin-left: 4px; }
     .future-note {
       background: #fff9e0;
@@ -110,10 +347,33 @@
       .field-group label { min-width: 80px; }
       .btn { padding: 8px 14px; font-size: 0.85rem; }
       .hint-note { white-space: normal; }
+      .preview-container { max-width: none; }
+      .chat-preview { max-width: none; }
+      .preview-button { font-size: 0.82rem; padding: 0 6px; }
     }
   </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute; overflow:hidden;" aria-hidden="true" focusable="false">
+  <symbol id="message_ai_24_icon" viewBox="0 0 24 24">
+    <path fill-rule="evenodd" clip-rule="evenodd" d="M5.82532 18.3693C3.44835 16.8851 1.85693 14.1719 1.85693 11.0707C1.85693 6.37686 5.50261 2.57178 9.99978 2.57178H13.4283C17.9255 2.57178 21.5712 6.37686 21.5712 11.0707C21.5712 15.3281 18.5718 18.8544 14.6582 19.4733L14.6548 19.4754L14.6538 19.4794C14.6559 19.4918 14.6595 19.5072 14.6642 19.5255C14.7176 19.7286 14.9295 20.2817 15.1773 20.9025C15.2021 20.9646 15.2203 21.0267 15.2324 21.0882L15.2368 21.1121C15.252 21.2005 15.2548 21.2876 15.2466 21.372C15.1844 22.0119 14.4924 22.4951 13.831 22.185L6.78031 18.8794L5.82532 18.3693ZM12.9598 19.7431L12.9617 19.7546C12.9712 19.8128 12.9118 19.8607 12.8584 19.8356L7.49573 17.3215L6.73321 16.9151C4.85648 15.7433 3.57116 13.5789 3.57116 11.0706C3.57116 7.2537 6.51773 4.28601 9.99973 4.28601H13.4283C16.9103 4.28601 19.8568 7.2537 19.8568 11.0706C19.8568 14.5267 17.4298 17.3002 14.3886 17.7802C13.4602 17.9268 12.8115 18.7987 12.9598 19.7431Z" fill="url(#message_ai_paint0)"></path>
+    <path fill-rule="evenodd" clip-rule="evenodd" d="M12.9439 12.3955C12.8887 12.4166 12.845 12.4601 12.8237 12.5152L12.0385 14.5461C11.9697 14.7239 11.7181 14.7239 11.6493 14.5461L10.8641 12.5152C10.8428 12.4601 10.7991 12.4166 10.7439 12.3955L8.70358 11.6168C8.52459 11.5485 8.52459 11.2953 8.70358 11.227L10.7439 10.4482C10.7991 10.4272 10.8428 10.3837 10.8641 10.3286L11.6493 8.2977C11.7181 8.11984 11.9697 8.11984 12.0385 8.2977L12.8237 10.3286C12.845 10.3837 12.8887 10.4272 12.9439 10.4482L14.9842 11.227C15.1632 11.2953 15.1632 11.5485 14.9842 11.6168L12.9439 12.3955Z" fill="url(#message_ai_paint1)"></path>
+    <defs>
+      <radialGradient id="message_ai_paint0" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(33.3938 28.0782) rotate(-144.727) scale(44.1686 48.1906)">
+        <stop stop-color="#9AFF35"></stop>
+        <stop offset="0.326433" stop-color="#FF9254"></stop>
+        <stop offset="0.564139" stop-color="#CB69FF"></stop>
+        <stop offset="0.9021" stop-color="#6F57FF"></stop>
+      </radialGradient>
+      <radialGradient id="message_ai_paint1" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(33.3937 28.0784) rotate(-144.727) scale(44.1686 48.1906)">
+        <stop stop-color="#9AFF35"></stop>
+        <stop offset="0.326433" stop-color="#FF9254"></stop>
+        <stop offset="0.564139" stop-color="#CB69FF"></stop>
+        <stop offset="0.9021" stop-color="#6F57FF"></stop>
+      </radialGradient>
+    </defs>
+  </symbol>
+</svg>
 <div class="container">
   <h1>🤖 按钮生成器</h1>
   <div class="warning">
@@ -157,7 +417,7 @@
     <summary style="font-weight:bold; font-size:1.2rem; cursor:pointer;">🔧 全局默认属性 (新按钮预填)</summary>
     <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(180px,1fr)); gap:12px; margin-top:16px;">
       <label>样式: <select id="defaultStyle">
-        <option value="0">0 灰框</option><option value="1" selected>1 蓝框</option><option value="2">2 智能体</option><option value="3">3 红框</option><option value="4">4 蓝底白字</option>
+        <option value="0">0 灰框</option><option value="1" selected>1 蓝框</option><option value="2">2 智能体(推荐回复)</option><option value="3">3 红框</option><option value="4">4 蓝底白字</option>
       </select></label>
       <label>类型: <select id="defaultType">
         <option value="0">0 链接</option><option value="1">1 回调</option><option value="2" selected>2 指令</option><option value="3">3 native</option><option value="4">4 订阅</option><option value="5">5 自定义</option>
@@ -172,6 +432,37 @@
       <label>anchor: <select id="defaultAnchor"><option value="0">0 无</option><option value="1">1 选图器</option></select></label>
     </div>
   </details>
+
+  <section class="preview-section">
+    <div class="preview-header">
+      <h2>👀 按钮预览</h2>
+      <button class="btn btn-secondary small-btn" id="resetPreviewBtn">重置预览状态</button>
+    </div>
+    <div class="chat-preview">
+      <div class="chat-header">QQ 聊天预览</div>
+      <div class="chat-body" id="chatPreviewBody">
+      </div>
+      <div class="preview-container" id="buttonPreview">
+        <div class="markdown-preview">操作提示</div>
+        <div class="preview-empty">暂无按钮</div>
+      </div>
+      <div class="chat-input-bar">
+        <div class="chat-input" id="chatInputPreview">点击按钮后，这里会模拟输入或发送结果</div>
+        <button type="button" class="chat-send-btn" id="chatSendPreviewBtn">发送</button>
+      </div>
+    </div>
+  </section>
+
+  <div class="subscribe-modal-mask" id="subscribeModal">
+    <div class="subscribe-modal">
+      <h3>订阅提醒</h3>
+      <p id="subscribeModalText">是否订阅该按钮消息？</p>
+      <div class="subscribe-actions">
+        <button class="btn btn-secondary small-btn" id="cancelSubscribeBtn">取消</button>
+        <button class="btn small-btn" id="confirmSubscribeBtn">订阅</button>
+      </div>
+    </div>
+  </div>
 
   <div style="margin:20px 0; display:flex; align-items:center; flex-wrap:wrap;">
     <button class="btn" id="genBtn">✨ 生成代码</button>
@@ -189,10 +480,18 @@
     let rows = [];
     const prefillCheck = document.getElementById('prefillSample');
     const successMsg = document.getElementById('successMessage');
+    const previewContainer = document.getElementById('buttonPreview');
+    const chatBody = document.getElementById('chatPreviewBody');
+    const chatInputPreview = document.getElementById('chatInputPreview');
+    const subscribeModal = document.getElementById('subscribeModal');
+    const subscribeModalText = document.getElementById('subscribeModalText');
+    let previewState = { clickedButtons: {}, selectedGroups: {} };
+    let pendingSubscribeButton = null;
     let successTimer = null;
 
-    function showSuccessTip() {
+    function showSuccessTip(message = '✅ 生成成功！可点击复制') {
       if (successTimer) clearTimeout(successTimer);
+      successMsg.textContent = message;
       successMsg.classList.add('show');
       successTimer = setTimeout(() => successMsg.classList.remove('show'), 2500);
     }
@@ -227,6 +526,7 @@
         reply: document.getElementById('defaultReply').value === 'true',
         atBotList: false,
         clickLimit: document.getElementById('defaultClickLimit').value,
+        groupId: '',
         anchor: document.getElementById('defaultAnchor').value,
       };
     }
@@ -257,12 +557,16 @@
       });
       container.innerHTML = html;
       attachEvents();
+      renderPreview();
     }
 
     function renderButtonEditor(btn, rowIdx, btnIdx) {
       const isLinkType = btn.actionType === '0' || btn.actionType === '3';
       const modalSupported = ['0','1','2','3','5'].includes(btn.actionType);
       const isSubscribe = btn.actionType === '4';
+      const showSpecifyIds = btn.permissionType === '0' || btn.permissionType === '3';
+      const groupId = (btn.groupId || '').trim();
+      const showGroupWarn = groupId && (btn.actionType !== '1' || !btn.data.trim());
       return `<div class="button-item" data-row="${rowIdx}" data-btn="${btnIdx}">
         <div style="display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-bottom:10px;">
           <div class="field-group"><label>按钮文字 *</label><input value="${btn.label}" placeholder="必填" style="width:130px;" data-field="label"></div>
@@ -274,7 +578,7 @@
         </div>
         <div style="display:flex; flex-wrap:wrap; align-items:center; gap:10px;">
           <div class="field-group"><label>权限</label><select data-field="permissionType">${permOptions(btn.permissionType)}</select></div>
-          <div class="field-group"><label>指定ID</label><input value="${btn.specifyIds}" placeholder="逗号分隔" style="width:130px;" data-field="specifyIds"></div>
+          <div class="field-group specify-ids-field" style="${showSpecifyIds ? '' : 'display:none;'}"><label>指定ID</label><input value="${btn.specifyIds}" placeholder="逗号分隔" style="width:130px;" data-field="specifyIds"></div>
           <div class="field-group" style="${modalSupported ? '' : 'display:none;'}"><label><input type="checkbox" data-field="useModal" ${btn.useModal?'checked':''}> 弹窗</label></div>
           <span id="modalFields_${rowIdx}_${btnIdx}" style="${btn.useModal?'':'display:none;'}">
             <input value="${btn.modalContent}" placeholder="内容" size="10" data-field="modalContent">
@@ -291,14 +595,15 @@
         <div style="display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-top:8px;">
           <div class="field-group"><label>不支持提示</label><input value="${btn.unsupportTips}" placeholder="unsupport_tips" data-field="unsupportTips"></div>
           <div class="field-group"><label><input type="checkbox" data-field="enter" ${btn.enter?'checked':''}> enter</label><label style="margin-left:8px;"><input type="checkbox" data-field="reply" ${btn.reply?'checked':''}> reply</label><label style="margin-left:8px;"><input type="checkbox" data-field="atBotList" ${btn.atBotList?'checked':''}> at_bot_show</label></div>
-          <div class="field-group"><label>点击限制</label><input value="${btn.clickLimit}" type="number" placeholder="可选" style="width:80px;" data-field="clickLimit"><span class="hint-note">💡 文字相同可无限点</span></div>
+          <div class="field-group"><label>点击限制</label><input value="${btn.clickLimit}" type="number" placeholder="可选" style="width:80px;" data-field="clickLimit"><span class="hint-note">相同 group_id 只可选一个</span></div>
+          <div class="field-group"><label>互斥组</label><input value="${btn.groupId || ''}" placeholder="group_id，可空" style="width:130px;" data-field="groupId"><span class="hint-note">回调按钮最佳效果</span><span class="warn-note group-warn" style="${showGroupWarn ? '' : 'display:none;'}">建议使用回调按钮并填写回调数据</span></div>
           <div class="field-group"><label>anchor</label><select data-field="anchor">${anchorOptions(btn.anchor)}</select></div>
         </div>
       </div>`;
     }
 
     function styleOptions(val) {
-      const opts = {0:'0 灰框',1:'1 蓝框',2:'2 智能体',3:'3 红框',4:'4 蓝底白字'};
+      const opts = {0:'0 灰框',1:'1 蓝框',2:'2 智能体(推荐回复)',3:'3 红框',4:'4 蓝底白字'};
       return Object.entries(opts).map(([v,t])=>`<option value="${v}" ${v==val?'selected':''}>${t}</option>`).join('');
     }
     function typeOptions(val) {
@@ -360,6 +665,12 @@
             if (btn.actionType==='3' && val && !val.startsWith('mqqapi://')) val = 'mqqapi://' + val.replace(/^mqqapi:\/\//, '');
             if (val !== value) { btn.data = val; this.value = val; }
           }
+          if (field === 'permissionType') {
+            const specifyIdsField = this.closest('.button-item')?.querySelector('.specify-ids-field');
+            if (specifyIdsField) specifyIdsField.style.display = value === '0' || value === '3' ? 'flex' : 'none';
+          }
+          updateGroupWarn(this.closest('.button-item'), btn);
+          renderPreview();
         });
       });
       
@@ -417,6 +728,164 @@
       return true;
     }
 
+    function updateGroupWarn(itemDiv, btn) {
+      const warn = itemDiv?.querySelector('.group-warn');
+      if (!warn) return;
+      const hasGroupId = !!(btn.groupId || '').trim();
+      const hasCallbackData = !!(btn.data || '').trim();
+      warn.style.display = hasGroupId && (btn.actionType !== '1' || !hasCallbackData) ? 'inline' : 'none';
+    }
+
+    function normalizeStyle(style) {
+      return ['0','1','2','3','4'].includes(String(style)) ? String(style) : '0';
+    }
+
+    function getActionText(type) {
+      const map = {0:'链接',1:'回调',2:'指令',3:'native',4:'订阅',5:'自定义'};
+      return map[type] || '未知';
+    }
+
+    function getPermissionText(type) {
+      const map = {0:'指定用户',1:'管理员',2:'所有人',3:'身份组'};
+      return map[type] || '未知';
+    }
+
+    function escapeHtml(text) {
+      return String(text ?? '').replace(/[&<>"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+    }
+
+    function cleanupPreviewState() {
+      const ids = new Set();
+      const idToGroup = {};
+      rows.forEach(row => row.buttons.forEach(btn => {
+        ids.add(btn.id);
+        idToGroup[btn.id] = (btn.groupId || '').trim();
+      }));
+      Object.keys(previewState.clickedButtons).forEach(id => {
+        if (!ids.has(id)) delete previewState.clickedButtons[id];
+      });
+      Object.keys(previewState.selectedGroups).forEach(groupId => {
+        const selectedId = previewState.selectedGroups[groupId];
+        if (!ids.has(selectedId) || idToGroup[selectedId] !== groupId) delete previewState.selectedGroups[groupId];
+      });
+    }
+
+    function appendChatMessage(text, type) {
+      const div = document.createElement('div');
+      div.className = `chat-message${type ? ' ' + type : ''}`;
+      div.textContent = text;
+      chatBody.appendChild(div);
+      chatBody.scrollTop = chatBody.scrollHeight;
+      return div;
+    }
+
+    function setChatInput(text) {
+      chatInputPreview.textContent = text || '点击按钮后，这里会模拟输入或发送结果';
+    }
+
+    function showUnsupportedTip(btn) {
+      appendChatMessage(btn.unsupportTips || '请升级QQ版本', 'status');
+    }
+
+    function markPreviewClicked(btn) {
+      previewState.clickedButtons[btn.id] = true;
+      const groupId = (btn.groupId || '').trim();
+      if (groupId) previewState.selectedGroups[groupId] = btn.id;
+      renderPreview();
+    }
+
+    function handlePreviewAction(btn) {
+      const actionType = parseInt(btn.actionType, 10);
+      if (![0,1,2,3,4,5].includes(actionType)) {
+        showUnsupportedTip(btn);
+        markPreviewClicked(btn);
+        return;
+      }
+
+      if (actionType === 0 || actionType === 3) {
+        appendChatMessage(`正在前往链接：${btn.data || '未填写链接'}`, 'status');
+        markPreviewClicked(btn);
+        return;
+      }
+
+      if (actionType === 1) {
+        const loading = appendChatMessage('', 'status');
+        loading.innerHTML = '<span class="chat-spinner"></span>操作处理中...';
+        window.setTimeout(() => {
+          loading.classList.add('success');
+          loading.textContent = '操作成功';
+        }, 1000);
+        markPreviewClicked(btn);
+        return;
+      }
+
+      if (actionType === 4) {
+        pendingSubscribeButton = btn;
+        subscribeModalText.textContent = `是否订阅「${btn.label || '未命名'}」消息？`;
+        subscribeModal.classList.add('show');
+        markPreviewClicked(btn);
+        return;
+      }
+
+      if (actionType === 2 || actionType === 5) {
+        const command = btn.data || btn.label || '';
+        if (btn.enter) {
+          appendChatMessage(command || btn.label || '已发送', 'user');
+          appendChatMessage('发送成功', 'success');
+          setChatInput('点击按钮后，这里会模拟输入或发送结果');
+        } else {
+          setChatInput(command || btn.label || '');
+        }
+        markPreviewClicked(btn);
+        return;
+      }
+
+      showUnsupportedTip(btn);
+      markPreviewClicked(btn);
+    }
+
+    function renderPreview() {
+      cleanupPreviewState();
+      const useSmallFont = document.getElementById('globalSmallFont').value === 'small';
+      previewContainer.classList.toggle('small-font', useSmallFont);
+      if (!rows.length || rows.every(row => !row.buttons.length)) {
+        previewContainer.innerHTML = '<div class="markdown-preview">操作提示</div><div class="preview-empty">暂无按钮</div>';
+        return;
+      }
+      let html = '<div class="markdown-preview">操作提示</div>';
+      rows.forEach((row, rowIdx) => {
+        if (!row.buttons.length) return;
+        html += '<div class="preview-row">';
+        row.buttons.forEach((btn, btnIdx) => {
+          const groupId = (btn.groupId || '').trim();
+          const selectedId = groupId ? previewState.selectedGroups[groupId] : '';
+          const isDisabled = groupId && selectedId && selectedId !== btn.id;
+          const isVisited = !!previewState.clickedButtons[btn.id];
+          const label = isVisited ? (btn.visited_label || btn.label) : btn.label;
+          const title = [
+            `按钮ID: ${btn.id}`,
+            `点击后: ${btn.visited_label || btn.label || '未设置'}`,
+            `动作类型: ${getActionText(btn.actionType)}`,
+            `权限: ${getPermissionText(btn.permissionType)}`,
+            `click_limit: ${btn.clickLimit || '未设置'}`,
+            `group_id: ${groupId || '未设置'}`
+          ].join('\n');
+          const icon = normalizeStyle(btn.style) === '2' ? '<svg class="preview-ai-icon" aria-hidden="true"><use href="#message_ai_24_icon"></use></svg>' : '';
+          html += `<button type="button" class="preview-button style-${normalizeStyle(btn.style)}${isVisited ? ' visited' : ''}${isDisabled ? ' disabled' : ''}" data-preview-btn="${rowIdx},${btnIdx}" title="${escapeHtml(title)}">${icon}<span>${escapeHtml(label || '未命名')}</span></button>`;
+        });
+        html += '</div>';
+      });
+      previewContainer.innerHTML = html || '<div class="markdown-preview">操作提示</div><div class="preview-empty">暂无按钮</div>';
+      previewContainer.querySelectorAll('[data-preview-btn]').forEach(el => {
+        el.addEventListener('click', e => {
+          const [rowIdx, btnIdx] = e.currentTarget.dataset.previewBtn.split(',').map(Number);
+          const btn = rows[rowIdx]?.buttons[btnIdx];
+          if (!btn) return;
+          handlePreviewAction(btn);
+        });
+      });
+    }
+
     function buildContentRows() {
       return rows.map(row => ({
         buttons: row.buttons.map(btn => {
@@ -445,11 +914,13 @@
           if (btn.actionType === '4') {
             action.subscribe_data = { template_ids: [{ custom_template_id: btn.templateId }] };
           }
-          return {
+          const result = {
             id: btn.id,
-            render_data: { label: btn.label.trim(), visited_label: btn.visited_label || btn.label, style: parseInt(btn.style) },
+            render_data: { label: btn.label.trim(), visited_label: btn.visited_label || btn.label, style: parseInt(normalizeStyle(btn.style)) },
             action
           };
+          if (btn.groupId && btn.groupId.trim()) result.group_id = btn.groupId.trim();
+          return result;
         })
       }));
     }
@@ -477,7 +948,7 @@
       if (code) {
         document.getElementById('outputCode').textContent = code;
         document.getElementById('errorMsg').innerText = '';
-        showSuccessTip();
+        showSuccessTip('✅ 生成成功！可点击复制');
       } else {
         document.getElementById('outputCode').textContent = '// 请先填写所有必填项（按钮文字、订阅模板ID）';
         successMsg.classList.remove('show');
@@ -486,15 +957,62 @@
 
     function fallbackCopy(text) {
       const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select();
-      try { document.execCommand('copy'); alert('✅ 已复制'); } catch(e) { alert('❌ 复制失败'); }
+      try {
+        document.execCommand('copy');
+        document.getElementById('errorMsg').innerText = '';
+        showSuccessTip('✅ 已复制');
+      } catch(e) {
+        document.getElementById('errorMsg').innerText = '❌ 复制失败';
+        successMsg.classList.remove('show');
+      }
       document.body.removeChild(ta);
     }
     document.getElementById('copyBtn').addEventListener('click', ()=>{
       const text = document.getElementById('outputCode').textContent;
-      if (!text || text.startsWith('//')) { alert('请先生成'); return; }
+      if (!text || text.startsWith('//')) {
+        document.getElementById('errorMsg').innerText = '❌ 请先生成';
+        successMsg.classList.remove('show');
+        return;
+      }
       if (navigator.clipboard) {
-        navigator.clipboard.writeText(text).then(()=>alert('✅ 已复制')).catch(()=>fallbackCopy(text));
+        navigator.clipboard.writeText(text).then(()=>{
+          document.getElementById('errorMsg').innerText = '';
+          showSuccessTip('✅ 已复制');
+        }).catch(()=>fallbackCopy(text));
       } else fallbackCopy(text);
+    });
+
+    document.getElementById('resetPreviewBtn').addEventListener('click', ()=>{
+      previewState = { clickedButtons: {}, selectedGroups: {} };
+      chatBody.innerHTML = '';
+      setChatInput('点击按钮后，这里会模拟输入或发送结果');
+      renderPreview();
+    });
+
+    document.getElementById('globalSmallFont').addEventListener('change', renderPreview);
+
+    document.getElementById('chatSendPreviewBtn').addEventListener('click', ()=>{
+      const text = chatInputPreview.textContent.trim();
+      if (!text || text === '点击按钮后，这里会模拟输入或发送结果') {
+        appendChatMessage('请输入内容后发送', 'status');
+        return;
+      }
+      appendChatMessage(text, 'user');
+      appendChatMessage('发送成功', 'success');
+      setChatInput('点击按钮后，这里会模拟输入或发送结果');
+    });
+
+    document.getElementById('cancelSubscribeBtn').addEventListener('click', ()=>{
+      subscribeModal.classList.remove('show');
+      pendingSubscribeButton = null;
+      appendChatMessage('已取消订阅', 'status');
+    });
+
+    document.getElementById('confirmSubscribeBtn').addEventListener('click', ()=>{
+      const label = pendingSubscribeButton?.label || '该按钮';
+      subscribeModal.classList.remove('show');
+      pendingSubscribeButton = null;
+      appendChatMessage(`已订阅「${label}」`, 'success');
     });
 
     initDefaultRows();

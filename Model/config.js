@@ -6,8 +6,9 @@ let { config, configSave } = await makeConfig('QQBot', {
   tips: '',
   permission: 'master',
   toQRCode: true,
-  toCallback: true,
+  toCallback: false,
   toBotUpload: true,
+  forceSilk: true,
   hideGuildRecall: false,
   toQQUin: false,
   toImg: true,
@@ -25,6 +26,21 @@ let { config, configSave } = await makeConfig('QQBot', {
   markdownImgScale: 1.0,
   sep: '',
   bus: {},
+  bots: {},
+  claw: {
+    bots: {}
+  },
+  fullMessage: {
+    bots: {}
+  },
+  icebreaker: {
+    bots: {}
+  },
+  recall: {
+    bots: {}
+  },
+  fullMessageDB: 'level',
+  inviteDB: 'level',
   dauDB: 'redis',
   // dau: {
   //   enable: true,
