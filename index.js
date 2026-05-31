@@ -625,6 +625,36 @@ const adapter = new class QQBotAdapter {
     return (await QRCode.toDataURL(data)).replace('data:image/png;base64,', 'base64://')
   }
 
+  async uploadImage (file, selfId = '', opts = {}) {
+    const buffer = await Bot.Buffer(file)
+    const image = { url: await Bot.fileToUrl(file) }
+
+    try {
+      const size = imageSize(buffer)
+      image.width = size.width
+      image.height = size.height
+    } catch (err) {
+      Bot.makeLog('error', ['图片分辨率检测错误', file, err], selfId)
+    }
+
+    if (!opts.skipHandler && Handler.has('QQBot.makeMarkdownImage')) {
+      const res = await Handler.call(
+        'QQBot.makeMarkdownImage',
+        { self_id: selfId, bot: Bot[selfId] },
+        {
+          image,
+          buffer,
+          file,
+          summary: opts.summary || '图片',
+          config
+        }
+      )
+      if (res) typeof res == 'object' ? Object.assign(image, res) : image.url = res
+    }
+
+    return image
+  }
+
   async makeRawMarkdownText (data, text, button) {
     const toQRCodeRegExp = getQRCodeRegExp(data.self_id)
     const match = toQRCodeRegExp && text.match(toQRCodeRegExp)
@@ -644,7 +674,7 @@ const adapter = new class QQBotAdapter {
         if (!Bot[i].uploadImage) continue
         if (Bot[i].adapter?.name !== 'QQBot') continue
         try {
-          const image = await Bot[i].uploadImage(file)
+          const image = await Bot[i].uploadImage(file, { skipHandler: true })
           if (image.url) return image
         } catch (err) {
           Bot.makeLog('error', ['Bot', i, '图片上传错误', file, err])
@@ -2474,6 +2504,12 @@ const adapter = new class QQBotAdapter {
       return
     }
 
+    const botNames = [event.bot?.nickname, event.bot?._qqbotNickname]
+    const normalizedMessage = this.normalizeSdkMessage(event.message).map(seg => {
+      if (seg?.type === 'text') return { ...seg, text: normalizeIncomingCommandText(seg.text, botNames) }
+      return seg
+    }).filter(seg => !(seg?.type === 'text' && !seg.text))
+
     const data = {
       raw: event,
       bot: Bot[id],
@@ -2483,8 +2519,8 @@ const adapter = new class QQBotAdapter {
       sub_type: event.sub_type,
       message_id: event.message_id,
       get user_id () { return this.sender.user_id },
-      message: this.normalizeSdkMessage(event.message),
-      raw_message: normalizeIncomingCommandText(event.raw_message, [event.bot?.nickname, event.bot?._qqbotNickname])
+      message: normalizedMessage,
+      raw_message: normalizeIncomingCommandText(event.raw_message, botNames)
     }
 
     for (const i of data.message) {
@@ -3507,6 +3543,8 @@ async connect (token) {
     getGroupMap () { return this.gl },
     gl: await this.getGroupMap(id),
     gml: await this.getMemberMap(id),
+
+    uploadImage: (file, opts = {}) => this.uploadImage(file, id, opts),
 
     dau: new Dau(id, this.sep, config.dauDB),
 
