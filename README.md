@@ -19,6 +19,48 @@ TRSS-Yunzai QQBot 嘿群主壳 插件
    - 新增 `forceSilk` 配置
    - 新增 `icebreaker` 和 `recall` 配置对象
    - `fullMessageDB` 改为 `level` 存储
+   
+上传图片用法(需要自己的上传插件加载成功)
+
+```js
+// 网络图片
+await Bot.uploadImage("https://example.com/a.png")
+
+// 本地图片路径
+await Bot.uploadImage("/root/qqbot/data/images/a.png")
+
+// file 协议本地图片
+await Bot.uploadImage("file:///root/qqbot/data/images/a.png")
+
+// base64 图片
+await Bot.uploadImage("base64://iVBORw0KGgoAAAANSUhEUgAA...")
+
+// 图片 Buffer
+const buffer = fs.readFileSync("/root/qqbot/data/images/a.png")
+await Bot.uploadImage(buffer)
+```
+
+最简单写法：
+
+```js
+const image = await Bot.uploadImage("https://example.com/a.png")
+```
+
+返回：
+
+```js
+{
+  url: "https://上传后的图片地址",
+  width: 640,
+  height: 360
+}
+```
+
+如果要指定某个 QQBot 账号上传：
+
+```js
+const image = await Bot[3889000008].uploadImage("https://example.com/a.png")
+```
 
 >为了感谢龙虾，新增模拟龙虾在线。优化全量部分内容，优化多机器人配置，修复非本适配器可以触发命令的问题
 
