@@ -227,6 +227,56 @@ function sleep (ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+function extractRobotUinFromShareUrl (shareUrl = '') {
+  const match = String(shareUrl || '').match(/[?&]robot_uin=(\d+)/)
+  return match?.[1] || ''
+}
+
+function normalizeQQBotOpenid (value = '') {
+  const text = String(value || '')
+  if (!text) return ''
+  const prefixed = text.match(/^\d{10}.(.+)$/)
+  return prefixed?.[1] || text
+}
+
+async function validateQQBotToken (tokenText) {
+  const parts = String(tokenText || '').split(':')
+  const [selfId, appid, token, secret, sandboxRaw, intentRaw] = parts
+  if (!selfId || !appid || !secret || parts.length < 6) {
+    return { ok: false, error: '配置格式错误' }
+  }
+  const sandbox = sandboxRaw === '1'
+  try {
+    const tokenRes = await axios.post('https://bots.qq.com/app/getAppAccessToken', {
+      appId: appid,
+      clientSecret: secret
+    }, { timeout: 15000 })
+    const accessToken = tokenRes.data?.access_token
+    if (!accessToken) {
+      return { ok: false, error: getQQBotAuthError(tokenRes.data) || 'secret验证失败' }
+    }
+    const apiBase = sandbox ? 'https://sandbox.api.sgroup.qq.com' : 'https://api.sgroup.qq.com'
+    const meRes = await axios.get(`${apiBase}/users/@me`, {
+      timeout: 15000,
+      headers: {
+        Authorization: `QQBot ${accessToken}`,
+        'X-Union-Appid': appid,
+        'User-Agent': 'BotNodeSDK/0.0.1'
+      }
+    })
+    const me = meRes.data || {}
+    const robotUin = extractRobotUinFromShareUrl(me.share_url)
+    const warnings = []
+    if (robotUin && String(robotUin) !== String(selfId)) {
+      warnings.push(`配置QQ(${selfId})与@me返回robot_uin(${robotUin})不一致`)
+    }
+    return { ok: true, selfId, appid, token, secret, sandbox, intentRaw, me, robotUin, warnings }
+  } catch (err) {
+    const authError = getQQBotAuthError(err.response?.data)
+    return { ok: false, error: authError || err.response?.data?.message || err.message || 'secret验证失败' }
+  }
+}
+
 function isQQBotNoOfficialWsError (data) {
   const message = String(data?.message || data?.msg || data || '')
   return message.includes('4925')
@@ -4295,15 +4345,20 @@ export class QQBotAdapter extends plugin {
   }
 
   async Token () {
-    if (!this.guardOfficialBot()) return true
     const token = this.e.msg.replace(/^#q+bot设置/i, '').trim()
     if (config.token.includes(token)) {
       config.token = config.token.filter(item => item != token)
       this.reply(`账号已删除，重启后生效，共${config.token.length}个账号`, true)
     } else {
+      const validation = await validateQQBotToken(token)
+      if (!validation.ok) {
+        this.reply(`账号验证失败，未写入配置文件：${validation.error}`, true)
+        return false
+      }
       if (await adapter.connect(token)) {
         config.token.push(token)
-        this.reply(`账号已连接，共${config.token.length}个账号`, true)
+        const warnText = validation.warnings?.length ? `\n警告：${validation.warnings.join('\n')}` : ''
+        this.reply(`账号已验证并连接，共${config.token.length}个账号${warnText}`, true)
       } else {
         this.reply('账号连接失败', true)
         return false
@@ -4875,8 +4930,11 @@ export class QQBotAdapter extends plugin {
     const match = /^#q+bot(可|不可)召回列表(?:\s+(\d+))?$/i.exec(this.e.msg)
     const type = match[1] === '可' ? 'can' : 'cannot'
     const page = match?.[2] ? Number(match[2]) : 1
+    const userId = normalizeQQBotOpenid(this.e.raw?.user_id || this.e.user_id || this.e.sender?.user_id || '')
+    const prompt = userId && typeof segment.at === 'function' ? segment.at(userId) : `触发用户: ${userId || '-'}`
     this.reply([
-      getRecallListMsg(config, this.e.self_id, type, page, 20),
+      prompt,
+      getRecallListMsg(config, this.e.self_id, type, page, 20, userId),
       segment.button(...getRecallListButtons(config, this.e.self_id, type, page, 20))
     ], true)
   }
@@ -4925,7 +4983,7 @@ export class QQBotAdapter extends plugin {
     const actualCount = Math.min(count, maxCount)
 
     if (count > maxCount) {
-      this.reply(`[${this.e.self_id}] 输入数量(${count})超过可召回最大数量(${maxCount})，已设置为${maxCount}`, true)
+      this.reply(`[${this.e.self_id}] 输入数量 ${count} 超过可召回最大数量 ${maxCount}，已按最大值设置`, true)
     }
 
     const rc = ensureRecallConfig(config, this.e.self_id)
@@ -4933,11 +4991,25 @@ export class QQBotAdapter extends plugin {
     await configSave()
 
     this.reply([
-      `[${this.e.self_id}] 全部召回数量已设置为 ${actualCount}\n\n>确认后将向 ${actualCount} 个用户发送召回消息`,
-      '',
-      `><qqbot-cmd-input text="#QQBot全部召回确认" show="确认执行"/>`,
-      '',
-      `><qqbot-cmd-input text="#QQBot全部召回修改 ${actualCount}" show="修改数量"/>`,
+      [
+        `#[${this.e.self_id}] 全部召回确认`,
+        '',
+        `>请求数量: ${count}`,
+        '',
+        `>可召回最大数量: ${maxCount}`,
+        '',
+        `>本次执行数量: ${actualCount}`,
+        '',
+        '>确认后将按当前可召回列表顺序发送召回消息',
+        '',
+        '>超过5分钟完成时，结果将通知主人，不再回复当前会话',
+        '',
+        `><qqbot-cmd-input text="#QQBot全部召回确认" show="确认执行"/>`,
+        '',
+        `><qqbot-cmd-input text="#QQBot全部召回确认 强制" show="强制执行"/>`,
+        '',
+        `><qqbot-cmd-input text="#QQBot全部召回修改 ${actualCount}" show="修改数量"/>`
+      ].join('\n'),
       segment.button(
         [
           { text: '确认执行', callback: '#QQBot全部召回确认' },
@@ -4961,7 +5033,7 @@ export class QQBotAdapter extends plugin {
     const actualCount = Math.min(count, maxCount)
 
     if (count > maxCount) {
-      this.reply(`[${this.e.self_id}] 输入数量(${count})超过最大(${maxCount})，已设置为${maxCount}`, true)
+      this.reply(`[${this.e.self_id}] 输入数量 ${count} 超过可召回最大数量 ${maxCount}，已按最大值设置`, true)
     }
 
     const rc = ensureRecallConfig(config, this.e.self_id)
@@ -4969,7 +5041,19 @@ export class QQBotAdapter extends plugin {
     await configSave()
 
     this.reply([
-      `[${this.e.self_id}] 全部召回数量已修改为 ${actualCount}\n\n>确认后将向 ${actualCount} 个用户发送召回消息`,
+      [
+        `#[${this.e.self_id}] 全部召回确认`,
+        '',
+        `>请求数量: ${count}`,
+        '',
+        `>可召回最大数量: ${maxCount}`,
+        '',
+        `>本次执行数量: ${actualCount}`,
+        '',
+        '>确认后将按当前可召回列表顺序发送召回消息',
+        '',
+        '>超过5分钟完成时，结果将通知主人，不再回复当前会话'
+      ].join('\n'),
       segment.button(
         [
           { text: '确认执行', callback: '#QQBot全部召回确认' },
@@ -5130,6 +5214,14 @@ export class QQBotAdapter extends plugin {
     if (m) {
       const msg = await switchInviteDB(config, configSave, m[1].toLowerCase())
       this.reply(`[${selfId}] ${msg}`, true)
+      return
+    }
+
+    m = /^时间加8小时\s*(开启|关闭)$/i.exec(argsRaw)
+    if (m) {
+      rc.displayTimeOffset8 = m[1] === '开启'
+      await configSave()
+      this.reply(`[${selfId}] 召回列表时间+8小时已${m[1]}`, true)
       return
     }
 

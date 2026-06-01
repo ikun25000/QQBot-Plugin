@@ -42,6 +42,7 @@ function ensureRecallConfig (config, selfId = '') {
   if (typeof rc.buttonEnabled !== 'boolean') rc.buttonEnabled = false
   if (!rc.button || typeof rc.button !== 'object') rc.button = null
   if (typeof rc.batchCount !== 'number') rc.batchCount = 0
+  if (typeof rc.displayTimeOffset8 !== 'boolean') rc.displayTimeOffset8 = false
   return rc
 }
 
@@ -126,6 +127,8 @@ function getRecallMenuMsg (config, selfId = '') {
     '',
     `>召回Button: ${rc.buttonEnabled ? '开启' : '关闭'}${rc.button ? '' : '(未配置)'}`,
     '',
+    `>列表时间+8小时: ${rc.displayTimeOffset8 ? '开启' : '关闭'}`,
+    '',
     `>存储方式: ${dbType}`,
     '',
     `><qqbot-cmd-input text="#QQBot召回预览" show="打开预览菜单"/>`,
@@ -139,6 +142,7 @@ function getRecallMenuMsg (config, selfId = '') {
 }
 
 function getRecallMenuButtons (config, selfId = '') {
+  const rc = ensureRecallConfig(config, selfId)
   const dbType = config.inviteDB || 'json'
   return limitButtonRows([
     [
@@ -157,6 +161,9 @@ function getRecallMenuButtons (config, selfId = '') {
       dbType === 'level'
         ? { text: '切JSON存储', callback: '#QQBot召回设置 存储 json' }
         : { text: '切LevelDB存储', callback: '#QQBot召回设置 存储 level' },
+      { text: `${rc.displayTimeOffset8 ? '关' : '开'}时间+8`, callback: `#QQBot召回设置 时间加8小时 ${rc.displayTimeOffset8 ? '关闭' : '开启'}` }
+    ],
+    [
       { text: '返回', callback: '#QQBot普通设置' }
     ]
   ])
@@ -212,7 +219,15 @@ function getRecallPeriodLabel (period) {
   return map[String(period)] || '-'
 }
 
-function getRecallListMsg (config, selfId = '', type = 'can', page = 1, pageSize = 20) {
+function formatRecallTime (time, add8Hours = false) {
+  if (!time) return '-'
+  const timestamp = typeof time === 'number' ? time : Date.parse(time)
+  if (!Number.isFinite(timestamp)) return String(time)
+  return new Date(timestamp + (add8Hours ? 8 * 60 * 60 * 1000 : 0)).toISOString().replace('T', ' ').slice(0, 19)
+}
+
+function getRecallListMsg (config, selfId = '', type = 'can', page = 1, pageSize = 20, triggerOpenid = '') {
+  const rc = ensureRecallConfig(config, selfId)
   const { canRecall, cannotRecall } = inviteStore.getRecallableList(selfId)
   const list = type === 'can' ? canRecall : cannotRecall
   const typeName = type === 'can' ? '可召回' : '不可召回'
@@ -227,6 +242,8 @@ function getRecallListMsg (config, selfId = '', type = 'can', page = 1, pageSize
     `#[${selfId || '-'}] ${typeName}列表`,
     '',
     `>共 ${total} 个，第 ${page}/${maxPage} 页`,
+    '',
+    `>列表时间+8小时: ${rc.displayTimeOffset8 ? '开启' : '关闭'}`,
     ''
   ]
 
@@ -236,8 +253,9 @@ function getRecallListMsg (config, selfId = '', type = 'can', page = 1, pageSize
     lines.push('```QbotRecallList')
     pageList.forEach((item, index) => {
       const idx = start + index + 1
-      lines.push(`${idx}. ${item.openid}`)
-      lines.push(`   最后活跃: ${item.lastActive || '-'}`)
+      const isTrigger = triggerOpenid && String(item.openid).toUpperCase() === String(triggerOpenid).toUpperCase()
+      lines.push(`${idx}. ${item.openid}${isTrigger ? ' （本人）' : ''}`)
+      lines.push(`   最后活跃: ${formatRecallTime(item.lastActive, rc.displayTimeOffset8)}`)
       lines.push(`   周期: ${getRecallPeriodLabel(item.period)}`)
       if (item.reason) lines.push(`   原因: ${item.reason}`)
     })
