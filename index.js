@@ -213,6 +213,20 @@ function isQQBotCanceledError (data) {
   return Number(data?.code || data?.err_code) === 11700 || message.includes('code(11700)') || message.includes('robot has canceled')
 }
 
+function isQQBotRateLimitError (data) {
+  const message = String(data?.message || data?.msg || data || '')
+  return Number(data?.code || data?.err_code) === 100017 || message.includes('code(100017)') || message.includes('接口调用超过频率限制')
+}
+
+function isQQBotSdkError (data) {
+  const message = String(data?.message || data?.msg || data?.stack || data || '')
+  return message.includes('request "') || message.includes('qq-official-bot') || message.includes('/gateway/bot')
+}
+
+function sleep (ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 function isQQBotNoOfficialWsError (data) {
   const message = String(data?.message || data?.msg || data || '')
   return message.includes('4925')
@@ -539,7 +553,8 @@ const adapter = new class QQBotAdapter {
     this.id = 'QQBot'
     this.name = 'QQBot'
     this.path = 'data/QQBot/'
-    this.version = 'qq-group-bot v11.45.14'
+    this.version = 'qq-heike-bot v9.9.9'
+    this.installUnhandledGuard()
 
     const defaultToQRCode = typeof config.toQRCode === 'undefined' ? true : config.toQRCode
     if (typeof defaultToQRCode == 'boolean') {
@@ -549,6 +564,20 @@ const adapter = new class QQBotAdapter {
     }
 
     this.sep = config.sep || ((process.platform == 'win32') && '') || ':'
+  }
+
+  installUnhandledGuard () {
+    if (globalThis.__qqbotUnhandledGuardInstalled) return
+    globalThis.__qqbotUnhandledGuardInstalled = true
+    const originalEmit = process.emit.bind(process)
+
+    process.emit = function (eventName, reason, ...args) {
+      if ((eventName === 'unhandledRejection' || eventName === 'uncaughtException') && isQQBotSdkError(reason)) {
+        Bot.makeLog?.('error', ['QQBot SDK 未知错误已捕获，不中断进程', reason?.stack || reason?.message || reason], 'QQBot-Plugin')
+        return true
+      }
+      return originalEmit(eventName, reason, ...args)
+    }
   }
 
   normalizeSdkMessage (segments) {
@@ -3344,13 +3373,42 @@ async connect (token) {
     }
   }
 
+  const enterRateLimitedGatewayMode = (detail) => {
+    Bot[id].gatewayRateLimitedMode = true
+    Bot.makeLog('warn', [`[${id}] 获取 websocket 地址连续触发频率限制，使用默认 websocket 地址继续处理消息`, detail], id)
+    return {
+      status: 200,
+      data: {
+        url: 'wss://api.sgroup.qq.com/websocket',
+        shards: 1
+      }
+    }
+  }
+
+  const requestGatewayBotWithRetry = async (...args) => {
+    const retryDelays = [3000, 5000, 8000]
+    for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+      try {
+        return await originalRequestGet('/gateway/bot', ...args)
+      } catch (err) {
+        if (!isQQBotRateLimitError(err) || attempt >= retryDelays.length) throw err
+        Bot.makeLog('warn', [`[${id}] 获取 websocket 地址触发频率限制，${Math.round(retryDelays[attempt] / 1000)}秒后重试 (${attempt + 1}/${retryDelays.length})`, err.message], id)
+        await sleep(retryDelays[attempt])
+      }
+    }
+  }
+
   const originalRequestGet = sdk.request.get.bind(sdk.request)
   sdk.request.get = async function (url, ...args) {
     try {
+      if (url === '/gateway/bot') return await requestGatewayBotWithRetry(...args)
       return await originalRequestGet(url, ...args)
     } catch (err) {
       if (url === '/gateway/bot' && isQQBotCanceledError(err)) {
         return enterDefaultWsMode(err.message)
+      }
+      if (url === '/gateway/bot' && isQQBotRateLimitError(err)) {
+        return enterRateLimitedGatewayMode(err.message)
       }
       if (url === '/gateway/bot' && isQQBotReadOnlyError(err)) {
         return enterReadOnlyMode(err.message)
@@ -3376,6 +3434,12 @@ async connect (token) {
         this.shards = 1
         return this.wsUrl
       }
+      if (isQQBotRateLimitError(err)) {
+        enterRateLimitedGatewayMode(err.message)
+        this.wsUrl = 'wss://api.sgroup.qq.com/websocket'
+        this.shards = 1
+        return this.wsUrl
+      }
       if (!isQQBotReadOnlyError(err)) throw err
       enterReadOnlyMode(err.message)
       this.wsUrl = 'wss://api.sgroup.qq.com/websocket'
@@ -3395,8 +3459,11 @@ async connect (token) {
     Object.assign(SessionManager.prototype, {
       getWsUrl: async function () {
         return new Promise((resolve) => {
-          this.bot.request
-            .get('/gateway/bot', {
+          const requestBusGateway = async () => {
+            const retryDelays = [3000, 5000, 8000]
+            for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+              try {
+                return await this.bot.request.get('/gateway/bot', {
               headers: {
                 Accept: '*/*',
                 'Accept-Encoding': 'utf-8',
@@ -3406,14 +3473,35 @@ async connect (token) {
                 Authorization: ''
               }
             })
-            .then((res) => {
-              if (!res.data) throw new Error('获取ws连接信息异常')
-              this.wsUrl = keys.some(i => i == this.bot.config.real_self_id) 
-                ? `wss://${config.bus[id]}/ws?url=${res.data.url}&appid=${appid}` 
-                : res.data.url
-              logger.info(`WebSocket URL 已更新: ${this.wsUrl}`)
+              } catch (err) {
+                if (!isQQBotRateLimitError(err) || attempt >= retryDelays.length) throw err
+                Bot.makeLog('warn', [`[${id}] 获取 websocket 地址触发频率限制，bus 分支 ${Math.round(retryDelays[attempt] / 1000)}秒后重试 (${attempt + 1}/${retryDelays.length})`, err.message], id)
+                await sleep(retryDelays[attempt])
+              }
+            }
+          }
+
+          requestBusGateway().then((res) => {
+            if (!res.data) throw new Error('获取ws连接信息异常')
+            this.wsUrl = keys.some(i => i == this.bot.config.real_self_id) 
+              ? `wss://${config.bus[id]}/ws?url=${res.data.url}&appid=${appid}` 
+              : res.data.url
+            logger.info(`WebSocket URL 已更新: ${this.wsUrl}`)
+            resolve(this.wsUrl)
+          }).catch((err) => {
+            if (isQQBotRateLimitError(err)) {
+              const fallbackWsUrl = 'wss://api.sgroup.qq.com/websocket'
+              Bot[id].gatewayRateLimitedMode = true
+              Bot.makeLog('warn', [`[${id}] 获取 websocket 地址连续触发频率限制，bus 分支使用默认 websocket 地址继续处理消息`, err.message], id)
+              this.wsUrl = keys.some(i => i == this.bot.config.real_self_id)
+                ? `wss://${config.bus[id]}/ws?url=${fallbackWsUrl}&appid=${appid}`
+                : fallbackWsUrl
               resolve(this.wsUrl)
-            })
+              return
+            }
+            Bot.makeLog('error', [`[${id}] 获取 websocket 地址失败`, err.message], id)
+            resolve('')
+          })
         })
       }
     })
