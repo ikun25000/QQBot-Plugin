@@ -94,13 +94,141 @@ function stripSelfMentionTags (text, mentions = []) {
   const hasSelfMention = block => selfMentionIds.some(id => new RegExp(`<@${id}>`).test(block))
 
   return text
-    .replace(new RegExp(`^(${mentionBlock})( {1,2})(?=\\S)`), (match, block) => hasSelfMention(block) ? '' : match)
+    .replace(new RegExp(`^\\s*(${mentionBlock})( {1,2})(?=\\S)`), (match, block) => hasSelfMention(block) ? '' : match)
     .replace(new RegExp(`(?<=\\S)( {1,2})(${mentionBlock})$`), (match, space, block) => hasSelfMention(block) ? '' : match)
     .trim()
 }
 
 function normalizeIncomingCommandText (text, botNames = []) {
   return stripBotNameMentionText(stripAttachmentPlaceholders(text), botNames)
+}
+
+function normalizeQQBotMessageText (text, botNames = [], mentions = []) {
+  return normalizeIncomingCommandText(stripSelfMentionTags(text, mentions), botNames)
+}
+
+function mergeAdjacentTextSegments (segments = []) {
+  const result = []
+  for (const seg of segments) {
+    if (seg?.type === 'text' && result[result.length - 1]?.type === 'text') {
+      result[result.length - 1].text += seg.text || ''
+    } else {
+      result.push(seg)
+    }
+  }
+  return result.filter(seg => !(seg?.type === 'text' && !seg.text))
+}
+
+function isLocalhostUrl (url = '') {
+  try {
+    const hostname = new URL(String(url)).hostname.toLowerCase()
+    return hostname === 'localhost' || hostname === '::1' || hostname === '0.0.0.0' || hostname.startsWith('127.')
+  } catch {
+    return false
+  }
+}
+
+function getConfiguredServerUrls () {
+  const files = [
+    join(process.cwd(), 'config', 'config', 'server.yaml'),
+    '/root/TRSS_AllBot/TRSS-Yunzai/config/config/server.yaml'
+  ]
+  const urls = []
+  for (const file of files) {
+    try {
+      const text = fs.readFileSync(file, 'utf-8')
+      for (const match of text.matchAll(/^\s*(?:url|host):\s*(https?:\/\/[^\s#]+|[^\s#]+)\s*$/gmi)) {
+        urls.push(match[1])
+      }
+    } catch {}
+  }
+  return urls
+}
+
+function isConfiguredServerLocalhost () {
+  return getConfiguredServerUrls().some(url => isLocalhostUrl(url) || /^localhost(?::\d+)?$/i.test(String(url)) || /^127\./.test(String(url)))
+}
+
+function detectCosImageType (buffer) {
+  if (buffer?.length >= 12 && buffer[0] === 0x89 && buffer[1] === 0x50) return { ext: 'png', mime: 'image/png' }
+  if (buffer?.length >= 3 && buffer[0] === 0xFF && buffer[1] === 0xD8) return { ext: 'jpg', mime: 'image/jpeg' }
+  if (buffer?.length >= 6 && buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) return { ext: 'gif', mime: 'image/gif' }
+  if (buffer?.length >= 12 && buffer.toString('ascii', 8, 12) === 'WEBP') return { ext: 'webp', mime: 'image/webp' }
+  if (buffer?.length >= 2 && buffer[0] === 0x42 && buffer[1] === 0x4D) return { ext: 'bmp', mime: 'image/bmp' }
+  return { ext: 'png', mime: 'image/png' }
+}
+
+async function uploadToTencentCosFallback (buffer, selfId = '') {
+  const { ext, mime } = detectCosImageType(buffer)
+  const userAgent = 'Mozilla/5.0 (Linux; Android 13; 22041216C Build/TP1A.220624.014) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7204.179 Mobile Safari/537.36'
+  const headers = {
+      'User-Agent': userAgent,
+      'sec-ch-ua-platform': '"Android"',
+      origin: 'https://cloud.tencent.com',
+      'x-requested-with': 'mark.via',
+      'sec-fetch-site': 'same-site',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-dest': 'empty',
+      referer: 'https://cloud.tencent.com/act/pro/ciExhibition?from=15775&tab=contentReview&sub=pictureReview'
+  }
+  const keyRes = await axios.get('https://ci-exhibition.cloud.tencent.com/samples/createUploadKey', {
+    headers,
+    params: {
+      ext,
+      ciProcess: 'sensitive-content-recognition'
+    },
+    timeout: 15000
+  })
+  const uploadData = keyRes.data
+  const key = uploadData?.data?.key
+  const auth = uploadData?.data?.uploadAuthorization
+  if (!key || !auth) throw new Error('获取腾讯COS上传凭证失败')
+  const url = `https://ci-h5-demo-1258125638.cos.ap-chengdu.myqcloud.com/${key}`
+  const uploadRes = await axios.put(url, buffer, {
+    headers: {
+      ...headers,
+      Authorization: auth,
+      'Content-Length': String(buffer.length),
+      'Content-Type': mime
+    },
+    maxBodyLength: Infinity,
+    timeout: 30000
+  })
+  if (uploadRes.status !== 200) throw new Error(`腾讯COS上传返回状态码: ${uploadRes.status}`)
+  Bot.makeLog?.('warn', ['默认图床为本地地址，已使用腾讯COS图床兜底', url], selfId)
+  return url
+}
+
+function shouldUseCosFallback (url = '') {
+  return !Handler.has('QQBot.makeMarkdownImage') && (!url || isLocalhostUrl(url) || (isConfiguredServerLocalhost() && isLocalhostUrl(url)))
+}
+
+function getButtonJsonHelpMsg (selfId, scope = '') {
+  const prefix = scope ? `${scope}破冰按钮` : '按钮'
+  return [
+    `[${selfId}] ${prefix}配置不是合法 JSON`,
+    '',
+    '>请使用按钮生成器生成 JSON 后再粘贴到命令后面',
+    '',
+    '>国内: https://tools.b23.kim/qqbot/button',
+    '',
+    '>国外: https://www.qunzhuisrobot.qzz.io/button.html',
+    '',
+    `><qqbot-cmd-input text="#QQBot破冰设置 ${scope || '群聊'} button " show="粘贴按钮JSON"/>`
+  ].join('\n')
+}
+
+function getButtonJsonHelpButtons (scope = '群聊') {
+  return segment.button(
+    [
+      { text: '国内生成器', link: 'https://tools.b23.kim/qqbot/button' },
+      { text: '国外生成器', link: 'https://www.qunzhuisrobot.qzz.io/button.html' }
+    ],
+    [
+      { text: '粘贴JSON', input: `#QQBot破冰设置 ${scope} button ` },
+      { text: '破冰菜单', callback: '#QQBot破冰菜单' }
+    ]
+  )
 }
 
 const PER_BOT_CONFIG_KEYS = [
@@ -347,16 +475,15 @@ function patchGroupMessageCreateEvent () {
       const originalParse = messageModule.MessageEvent.parse.bind(messageModule.MessageEvent)
       const GroupMessageEvent = messageModule.GroupMessageEvent
       const parseGroupMessageFallback = function (payload, isFullGroupMessage = false) {
-        if (typeof payload?.content === 'string') payload.content = stripSelfMentionTags(payload.content, payload.mentions)
         if (typeof payload?.content === 'string') {
           payload._rawContent = payload.content
-          payload.content = normalizeIncomingCommandText(payload.content, [this.nickname, this._qqbotNickname])
+          payload.content = normalizeQQBotMessageText(payload.content, [this.nickname, this._qqbotNickname], payload.mentions)
         }
         if (payload?.timestamp) payload._rawTimestamp = payload.timestamp
         if (Array.isArray(payload?.mentions)) payload._mentions = payload.mentions.map(item => ({ ...item }))
         if (isFullGroupMessage) payload._qqbotFullMessageCreate = true
 
-        let text = normalizeIncomingCommandText((payload.content || '').trim(), [this.nickname, this._qqbotNickname])
+        let text = normalizeQQBotMessageText((payload.content || '').trim(), [this.nickname, this._qqbotNickname], payload.mentions)
         if (isFullGroupMessage) {
           text = text.replace(/<@all>\s*/ig, '').trim()
           text = text.replace(/^\/\s*/, '#')
@@ -382,10 +509,9 @@ function patchGroupMessageCreateEvent () {
       const patchedParse = function (event, payload) {
         const isFullGroupMessage = payload?._qqbotRawEvent === 'GROUP_MESSAGE_CREATE'
         if (isFullGroupMessage) return parseGroupMessageFallback.call(this, payload, true)
-        if (typeof payload?.content === 'string') payload.content = stripSelfMentionTags(payload.content, payload.mentions)
         if (typeof payload?.content === 'string') {
           payload._rawContent = payload.content
-          payload.content = normalizeIncomingCommandText(payload.content, [this.nickname, this._qqbotNickname])
+          payload.content = normalizeQQBotMessageText(payload.content, [this.nickname, this._qqbotNickname], payload.mentions)
         }
         if (payload?.timestamp) payload._rawTimestamp = payload.timestamp
         if (Array.isArray(payload?.mentions)) {
@@ -630,23 +756,22 @@ const adapter = new class QQBotAdapter {
     }
   }
 
-  normalizeSdkMessage (segments) {
+  normalizeSdkMessage (segments, mentions = []) {
     if (!Array.isArray(segments)) return []
     const botNames = [getBotNicknameFromConfigOrStore(config, this.sdk?.config?.real_self_id || this.sdk?.self_id), this.sdk?.nickname, this.sdk?._qqbotNickname]
-    return segments.map(seg => {
+    return mergeAdjacentTextSegments(segments.map(seg => {
       if (seg == null || typeof seg !== 'object') return seg
       const inner = seg.data
       if (inner != null && typeof inner === 'object' && !Array.isArray(inner)) {
         const { data: _, ...rest } = seg
         const normalized = { ...rest, ...inner }
-        if (normalized.type === 'text') normalized.text = normalizeIncomingCommandText(normalized.text, botNames)
+        if (normalized.type === 'text') normalized.text = normalizeQQBotMessageText(normalized.text, botNames, mentions)
         return normalized
       }
       const normalized = { ...seg }
-      if (normalized.type === 'text') normalized.text = normalizeIncomingCommandText(normalized.text, botNames)
+      if (normalized.type === 'text') normalized.text = normalizeQQBotMessageText(normalized.text, botNames, mentions)
       return normalized
-    })
-      .filter(seg => !(seg?.type === 'text' && !seg.text))
+    }))
   }
 
   async makeRecord (file, selfId = '', forceSilk = false) {
@@ -706,7 +831,12 @@ const adapter = new class QQBotAdapter {
 
   async uploadImage (file, selfId = '', opts = {}) {
     const buffer = await Bot.Buffer(file)
-    const image = { url: await Bot.fileToUrl(file) }
+    const image = { url: '' }
+    try {
+      image.url = await Bot.fileToUrl(file)
+    } catch (err) {
+      Bot.makeLog('debug', ['默认图床转换失败', err.message], selfId)
+    }
 
     try {
       const size = imageSize(buffer)
@@ -731,6 +861,14 @@ const adapter = new class QQBotAdapter {
       if (res) typeof res == 'object' ? Object.assign(image, res) : image.url = res
     }
 
+    if (shouldUseCosFallback(image.url)) {
+      try {
+        image.url = await uploadToTencentCosFallback(buffer, selfId)
+      } catch (err) {
+        Bot.makeLog('error', ['腾讯COS图床兜底失败', err.message], selfId)
+      }
+    }
+
     return image
   }
 
@@ -748,6 +886,7 @@ const adapter = new class QQBotAdapter {
   }
 
   async makeBotImage (file, selfId = '') {
+    if (Handler.has('QQBot.makeMarkdownImage')) return false
     if (getBotConfigValue(selfId, 'toBotUpload')) {
       for (const i of Bot.uin) {
         if (!Bot[i].uploadImage) continue
@@ -764,7 +903,14 @@ const adapter = new class QQBotAdapter {
 
   async makeMarkdownImage (data, file, summary = '图片') {
     const buffer = await Bot.Buffer(file)
-    const image = await this.makeBotImage(buffer, data.self_id) || { url: await Bot.fileToUrl(file) }
+    const image = await this.makeBotImage(buffer, data.self_id) || { url: '' }
+    if (!image.url) {
+      try {
+        image.url = await Bot.fileToUrl(file)
+      } catch (err) {
+        Bot.makeLog('debug', ['默认图床转换失败', err.message], data.self_id)
+      }
+    }
 
     if (!image.width || !image.height) {
       try {
@@ -773,6 +919,14 @@ const adapter = new class QQBotAdapter {
         image.height = size.height
       } catch (err) {
         Bot.makeLog('error', ['图片分辨率检测错误', file, err], data.self_id)
+      }
+    }
+
+    if (shouldUseCosFallback(image.url)) {
+      try {
+        image.url = await uploadToTencentCosFallback(buffer, data.self_id)
+      } catch (err) {
+        Bot.makeLog('error', ['腾讯COS图床兜底失败', err.message], data.self_id)
       }
     }
 
@@ -2399,6 +2553,11 @@ const adapter = new class QQBotAdapter {
     }, msg, { id: data.message_id })
     await this.setGroupMap(data)
 
+    const rawUserOpenid = event.author?.id || event.author?.member_openid || event.sender?.user_id || ''
+    if (rawUserOpenid) {
+      data.raw.invite = this._makeInviteRaw(data.self_id, rawUserOpenid)
+    }
+
     const fullMessage = ensureFullMessageConfig(config, data.self_id)
     if (shouldLimitBotAuthorMessage(config, event, data.self_id)) {
       Bot.makeLog('debug', ['机器人消息限流触发', {
@@ -2584,8 +2743,8 @@ const adapter = new class QQBotAdapter {
     }
 
     const botNames = [event.bot?.nickname, event.bot?._qqbotNickname]
-    const normalizedMessage = this.normalizeSdkMessage(event.message).map(seg => {
-      if (seg?.type === 'text') return { ...seg, text: normalizeIncomingCommandText(seg.text, botNames) }
+    const normalizedMessage = this.normalizeSdkMessage(event.message, event._mentions || event.mentions).map(seg => {
+      if (seg?.type === 'text') return { ...seg, text: normalizeQQBotMessageText(seg.text, botNames, event._mentions || event.mentions) }
       return seg
     }).filter(seg => !(seg?.type === 'text' && !seg.text))
 
@@ -2599,7 +2758,7 @@ const adapter = new class QQBotAdapter {
       message_id: event.message_id,
       get user_id () { return this.sender.user_id },
       message: normalizedMessage,
-      raw_message: normalizeIncomingCommandText(event.raw_message, botNames)
+      raw_message: normalizeQQBotMessageText(event.raw_message, botNames, event._mentions || event.mentions)
     }
 
     for (const i of data.message) {
@@ -4783,7 +4942,7 @@ export class QQBotAdapter extends plugin {
   // ========== 破冰设置 ==========
   async icebreakerSetting () {
     if (!this.guardOfficialBot()) return true
-    const match = /^#q+bot破冰(菜单|设置)(?:\s+([\s\S]+))?$/i.exec(this.e.msg)
+    const match = /^#q+bot破冰(菜单|设置)\s*([\s\S]*)?$/i.exec(this.e.msg)
     const action = match?.[1]
     const argsRaw = (match?.[2] || '').trim()
     const selfId = this.e.self_id
@@ -4859,7 +5018,11 @@ export class QQBotAdapter extends plugin {
         return
       }
       if (state && !ib[btnDataKey]) {
-        this.reply(`[${selfId}] 请先配置${m[1]}按钮数据，再开启`, true)
+        this.reply([
+          `[${selfId}] 请先配置${m[1]}按钮数据，再开启`,
+          getButtonJsonHelpMsg(selfId, m[1]),
+          getButtonJsonHelpButtons(m[1])
+        ], true)
         return
       }
       ib[btnKey] = state
@@ -4886,8 +5049,21 @@ export class QQBotAdapter extends plugin {
         await configSave()
         this.reply(`[${selfId}] ${m[1]}破冰按钮已设置并开启`, true)
       } catch (err) {
-        this.reply(`[${selfId}] JSON解析失败: ${err.message}`, true)
+        this.reply([
+          `[${selfId}] JSON解析失败: ${err.message}`,
+          getButtonJsonHelpMsg(selfId, m[1]),
+          getButtonJsonHelpButtons(m[1])
+        ], true)
       }
+      return
+    }
+
+    m = /^(群聊|私聊)\s*button\s+([\s\S]+)$/i.exec(argsRaw)
+    if (m) {
+      this.reply([
+        getButtonJsonHelpMsg(selfId, m[1]),
+        getButtonJsonHelpButtons(m[1])
+      ], true)
       return
     }
 
@@ -4913,7 +5089,19 @@ export class QQBotAdapter extends plugin {
       return
     }
 
-    this.reply(`[${selfId}] 未知破冰设置参数，请使用 #QQBot破冰菜单 查看可用命令`, true)
+    this.reply([
+      `[${selfId}] 未知破冰设置参数，请使用 #QQBot破冰菜单 查看可用命令`,
+      segment.button(
+        [
+          { text: '破冰菜单', callback: '#QQBot破冰菜单' },
+          { text: '设群按钮', input: '#QQBot破冰设置 群聊 button ' }
+        ],
+        [
+          { text: '国内按钮生成器', link: 'https://tools.b23.kim/qqbot/button' },
+          { text: '国外按钮生成器', link: 'https://www.qunzhuisrobot.qzz.io/button.html' }
+        ]
+      )
+    ], true)
   }
 
   // ========== 召回菜单 ==========
