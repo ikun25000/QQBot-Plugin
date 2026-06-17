@@ -42,7 +42,8 @@ const FULL_MESSAGE_EXTRA_DEFAULTS = {
   botLimitEnabled: true,
   botLimitCount: 5,
   botLimitMinutes: 1,
-  ignoreBotAuthorAt: false
+  ignoreBotAuthorAt: false,
+  ignoreAllAt: false
 }
 
 const FULL_MESSAGE_OPTION_ALIASES = {
@@ -72,6 +73,14 @@ function getBotNamesFromEvent (event) {
 function getBotNicknameFromConfigOrStore (config, selfId = '') {
   const stored = fullMessageStore.getBotNickname(selfId)
   return stored || config?.fullMessage?.botNicknames?.[selfId] || ''
+}
+
+function getMemberNicknameFromStore (selfId = '', memberOpenid = '') {
+  return fullMessageStore.getMemberNickname(selfId, memberOpenid)
+}
+
+async function recordMemberNickname (selfId = '', memberOpenid = '', nickname = '', extra = {}) {
+  return fullMessageStore.setMemberNickname(selfId, memberOpenid, nickname, extra)
 }
 
 async function fetchBotNickname (bot, retry = 3, delayMs = 3000) {
@@ -165,6 +174,11 @@ function ensureFullMessageConfig (config, selfId = '') {
   fullMessage.botLimitCount = Math.max(1, Number(fullMessage.botLimitCount) || FULL_MESSAGE_EXTRA_DEFAULTS.botLimitCount)
   fullMessage.botLimitMinutes = Math.max(1, Number(fullMessage.botLimitMinutes) || FULL_MESSAGE_EXTRA_DEFAULTS.botLimitMinutes)
   if (typeof fullMessage.ignoreBotAuthorAt !== 'boolean') fullMessage.ignoreBotAuthorAt = FULL_MESSAGE_EXTRA_DEFAULTS.ignoreBotAuthorAt
+  if (typeof fullMessage.ignoreAllAt !== 'boolean') fullMessage.ignoreAllAt = FULL_MESSAGE_EXTRA_DEFAULTS.ignoreAllAt
+  if (fullMessage.ignoreAllAt) {
+    fullMessage.replyOnlyIsYou = false
+    fullMessage.handleMissingIsYou = true
+  }
 
   if (fullMessage.handleMissingIsYou) {
     fullMessage.replyOnlyIsYou = false
@@ -200,6 +214,7 @@ function migrateLegacyFullMessageOptions (config) {
 function getFullMessageStatusMsg (config, selfId = '', receiveEnabled = true) {
   const fullMessage = ensureFullMessageConfig(config, selfId)
   const total = fullMessageStore.getRecordCount(selfId)
+  const blackTotal = fullMessageStore.getBlackGroups(selfId).length
   const title = selfId ? `#[${selfId}]全量消息设置菜单` : '#全量消息设置菜单'
   const lines = [title]
 
@@ -216,12 +231,13 @@ function getFullMessageStatusMsg (config, selfId = '', receiveEnabled = true) {
 
   lines.push('', `>WebSocket全量解析: ${receiveEnabled ? '已接入' : '未接入'}`)
   lines.push('', `>已记录群数: ${total}`)
+  lines.push('', `>已拉黑群数: ${blackTotal}`)
   lines.push('', `>存储方式: ${config.fullMessageDB || 'json'}`)
   lines.push('', `><qqbot-cmd-input text="#QQBot全量存储 json" show="切换JSON存储"/>`)
   lines.push('', `><qqbot-cmd-input text="#QQBot全量存储 level" show="切换LevelDB存储"/>`)
+  lines.push('', '><qqbot-cmd-input text="#QQBot全量消息设置 更多设置" show="更多设置"/>')
   lines.push('', `>记录开启时间: ${fullMessageStore.getStartTime(selfId) || '-'}`)
-  lines.push('', '><qqbot-cmd-input text="#QQBot全量查看" show="查看全量记录"/>')
-  lines.push('', '><qqbot-cmd-input text="#QQBot全量清空" show="清空全量记录"/>')
+  lines.push('', '><qqbot-cmd-input text="#QQBot全量清/查记录" show="清/查记录"/>')
   lines.push('', '>可用命令: #QQBot全量消息设置 <仅回复@机器人|处理非@消息|忽略@全体的指令|全体通知|忽略其他机器人|@机器人严判|记录群> <开启|关闭>')
   lines.push('', '>限制菜单: #QQBot全量消息设置 配置限制')
   lines.push('', '>存储设置: #QQBot全量存储 <json|level>')
@@ -244,12 +260,12 @@ function getFullMessageStatusButtons (config, selfId = '') {
     [getButton('仅回复@机器人', '仅回复'), getButton('处理非@消息', '处理非@')],
     [getButton('忽略@全体的指令', '忽略全体'), getButton('全体通知', '全体通知')],
     [{ text: '配置限制', callback: '#QQBot全量消息设置 配置限制' }, getButton('@机器人严判', '严判')],
-    [getButton('记录群', '记录群'), { text: '查看记录', callback: '#QQBot全量查看' }],
+    [getButton('记录群', '记录群'), { text: '全量拉黑', callback: '#QQBot全量拉黑菜单' }],
     [
       dbType === 'level'
         ? { text: '切JSON存储', callback: '#QQBot全量存储 json' }
         : { text: '切LevelDB存储', callback: '#QQBot全量存储 level' },
-      { text: '清空记录', callback: '#QQBot全量清空' }
+      { text: '更多设置', callback: '#QQBot全量消息设置 更多设置' }
     ]
   ])
 }
@@ -258,7 +274,7 @@ function getFullMessageBotLimitMsg (config, selfId = '') {
   const fullMessage = ensureFullMessageConfig(config, selfId)
   const atDisabled = !fullMessage.ignoreBotAuthor
   return [
-    `#[${selfId || '-'}] 配置限制菜单 `,
+    `#[${selfId || '-'}] 配置限制/更多设置菜单 `,
     '',
     `>配置bot限制: ${fullMessage.botLimitEnabled ? '开启' : '关闭'}`,
     '',
@@ -276,6 +292,10 @@ function getFullMessageBotLimitMsg (config, selfId = '') {
     '',
     `><qqbot-cmd-input text="#QQBot全量消息设置 忽略其他机器人正常@ ${fullMessage.ignoreBotAuthorAt ? '关闭' : '开启'}" show="${fullMessage.ignoreBotAuthorAt ? '关闭' : '开启'}正常@"/>`,
     '',
+    `>无条件忽略所有@: ${fullMessage.ignoreAllAt ? '开启' : '关闭'}`,
+    '',
+    `><qqbot-cmd-input text="#QQBot全量消息设置 无条件忽略所有@ ${fullMessage.ignoreAllAt ? '关闭' : '开启'}" show="${fullMessage.ignoreAllAt ? '关闭' : '开启'}忽略所有@"/>`,
+    '',
     '```text',
     'bot限制: 当其他机器人在群内发消息超过设定条数/时间窗口后',
     '后续消息将不再触发任何插件命令处理',
@@ -284,6 +304,7 @@ function getFullMessageBotLimitMsg (config, selfId = '') {
     '总开关: 控制全量消息(GROUP_MESSAGE_CREATE)是否直接忽略机器人',
     '正常@: 控制普通@消息(GROUP_AT_MESSAGE_CREATE)是否忽略机器人',
     '正常@依赖总开关，总开关关闭时正常@不可用',
+    '无条件忽略所有@时会关闭仅回复@机器人和开启处理非@消息',
     '```'
   ].join('\n')
 }
@@ -298,6 +319,9 @@ function getFullMessageBotLimitButtons (config, selfId = '') {
     [
       { text: `${fullMessage.ignoreBotAuthor ? '关' : '开'}总开关`, callback: `#QQBot全量消息设置 忽略其他机器人总开关 ${fullMessage.ignoreBotAuthor ? '关闭' : '开启'}` },
       { text: `${fullMessage.ignoreBotAuthorAt ? '关' : '开'}正常@`, callback: `#QQBot全量消息设置 忽略其他机器人正常@ ${fullMessage.ignoreBotAuthorAt ? '关闭' : '开启'}` }
+    ],
+    [
+      { text: `${fullMessage.ignoreAllAt ? '关' : '开'}忽略@`, callback: `#QQBot全量消息设置 无条件忽略所有@ ${fullMessage.ignoreAllAt ? '关闭' : '开启'}` }
     ],
     [
       { text: '返回', callback: '#QQBot全量消息设置' },
@@ -334,6 +358,15 @@ async function recordFullMessageGroup (config, data, event) {
   return true
 }
 
+function isFullMessageGroupRecorded (selfId = '', groupOpenid = '') {
+  if (!selfId || !groupOpenid) return false
+  return Boolean(fullMessageStore.getRecord(`${selfId}:${groupOpenid}`))
+}
+
+function isFullMessageGroupBlacklisted (selfId = '', groupOpenid = '') {
+  return fullMessageStore.isBlackGroup(selfId, groupOpenid)
+}
+
 function getFullMessageMentionState (config, event, selfId = '') {
   const botSelfId = selfId || event.self_id || event.bot?.uin || event.bot?.config?.real_self_id || event.raw?.self_id || ''
   const fullMessage = ensureFullMessageConfig(config, botSelfId)
@@ -341,12 +374,14 @@ function getFullMessageMentionState (config, event, selfId = '') {
   const content = event._rawContent || event.raw?._rawContent || event.raw?.content || event.content || ''
   const isAllMention = mentions.some(item => item.scope === 'all') && content.includes('<@all>')
   const author = event.author || event.raw?.author || {}
+  const groupOpenid = event.group_openid || event.raw?.group_openid || event.group_id || ''
+  const blackGroup = fullMessageStore.isBlackGroup(botSelfId, groupOpenid)
   const ignoredBotAuthor = fullMessage.ignoreBotAuthor && author.bot === true
   const ignoredAllMention = isAllMention && fullMessage.ignoreAllIsYou
   const nickname = getBotNicknameFromConfigOrStore(config, botSelfId)
   const strictNameMention = fullMessage.strictBotMention && nickname ? hasStrictBotNameMention({ ...event, bot: { nickname } }, content) : false
   const isYou = strictNameMention || mentions.some(item => item.is_you === true || (fullMessage.handleMissingIsYou && typeof item.is_you === 'undefined' && item.bot === true))
-  const shouldDispatch = !ignoredBotAuthor && !ignoredAllMention && (fullMessage.handleMissingIsYou || !fullMessage.replyOnlyIsYou || (isAllMention && fullMessage.notifyAllMention) || isYou)
+  const shouldDispatch = !ignoredBotAuthor && !ignoredAllMention && (blackGroup ? ((isAllMention && fullMessage.notifyAllMention) || isYou) : (fullMessage.handleMissingIsYou || !fullMessage.replyOnlyIsYou || (isAllMention && fullMessage.notifyAllMention) || isYou))
 
   return {
     isAllMention,
@@ -354,6 +389,7 @@ function getFullMessageMentionState (config, event, selfId = '') {
     ignoredBotAuthor,
     strictNickname: nickname || '',
     strictNameMention,
+    blackGroup,
     isYou: isAllMention && fullMessage.ignoreAllIsYou ? false : isYou,
     shouldDispatch,
     shouldNotifyAll: isAllMention && fullMessage.notifyAllMention
@@ -372,6 +408,7 @@ function getFullMessageAllNotifyMsg (data) {
 }
 
 function getFullMessageRecordsMsg (config, page = 1, pageSize = 20, selfId = '') {
+  const blackGroups = new Set(fullMessageStore.getBlackGroups(selfId).map(item => item.group_openid))
   const records = Object.values(fullMessageStore.getRecords())
     .filter(item => !selfId || item.self_id === selfId)
     .sort((a, b) => String(b.last_time || '').localeCompare(String(a.last_time || '')))
@@ -390,6 +427,7 @@ function getFullMessageRecordsMsg (config, page = 1, pageSize = 20, selfId = '')
       lines.push(`${start + index + 1}. ${item.group_openid}`)
       lines.push(`账号: ${item.self_id}`)
       lines.push(`原群ID: ${item.raw_group_id || '-'}`)
+      lines.push(`状态: ${blackGroups.has(item.group_openid) ? '已拉黑' : '正常'}`)
       lines.push(`首次: ${formatRecordTime(item.first_time)}`)
       lines.push(`最近: ${formatRecordTime(item.last_time)}`)
       if (index < list.length - 1) lines.push('')
@@ -399,6 +437,7 @@ function getFullMessageRecordsMsg (config, page = 1, pageSize = 20, selfId = '')
   lines.push('```')
   if (page > 1) lines.push('', `><qqbot-cmd-input text="#QQBot全量查看 ${page - 1}" show="上一页"/>`)
   if (page < maxPage) lines.push('', `><qqbot-cmd-input text="#QQBot全量查看 ${page + 1}" show="下一页"/>`)
+  lines.push('', '><qqbot-cmd-input text="#QQBot全量拉黑菜单" show="全量拉黑"/>')
   lines.push('', '><qqbot-cmd-input text="#QQBot全量清空" show="清空记录"/>')
   return lines.join('\n')
 }
@@ -415,6 +454,9 @@ function getFullMessageRecordsButtons (config, page = 1, pageSize = 20, selfId =
   if (pageRow.length) rows.push(pageRow)
   rows.push([
     { text: '刷新', callback: `#QQBot全量查看 ${page}` },
+    { text: '全量拉黑', callback: '#QQBot全量拉黑菜单' }
+  ])
+  rows.push([
     { text: '清空记录', callback: '#QQBot全量清空' }
   ])
 
@@ -450,17 +492,75 @@ async function clearFullMessageRecords (config, configSave, selfId = '') {
   return `#${selfId ? `[${selfId}]` : ''}清空完成\n\n>已清空 QQBot 全量消息记录，共 ${total} 个。`
 }
 
+function getFullMessageBlackMenuMsg (config, selfId = '') {
+  const blackGroups = fullMessageStore.getBlackGroups(selfId).sort((a, b) => String(b.time || '').localeCompare(String(a.time || '')))
+  const lines = [`#[${selfId || '-'}] 全量拉黑菜单`, '', `>已拉黑群数: ${blackGroups.length}`, '', '><qqbot-cmd-input text="#QQBot全量拉黑 " show="拉黑群openid"/>', '', '><qqbot-cmd-input text="#QQBot全量删黑 " show="解除群openid"/>', '', '```QbotAllMsgBlack']
+  if (!blackGroups.length) {
+    lines.push('暂无拉黑群。')
+  } else {
+    blackGroups.slice(0, 20).forEach((item, index) => {
+      lines.push(`${index + 1}. ${item.group_openid}`)
+      lines.push(`状态: 已拉黑`)
+      lines.push(`时间: ${formatRecordTime(item.time)}`)
+      if (index < Math.min(blackGroups.length, 20) - 1) lines.push('')
+    })
+  }
+  lines.push('```')
+  return lines.join('\n')
+}
+
+function getFullMessageBlackMenuButtons () {
+  return limitButtonRows([
+    [
+      { text: '拉黑', input: '#QQBot全量拉黑 ' },
+      { text: '删黑', input: '#QQBot全量删黑 ' }
+    ],
+    [
+      { text: '查看记录', callback: '#QQBot全量查看' },
+      { text: '返回', callback: '#QQBot全量消息设置' }
+    ]
+  ])
+}
+
+function getFullMessageBlackResultButtons (groupOpenid = '') {
+  return limitButtonRows([
+    [
+      { text: '全量拉黑', callback: '#QQBot全量拉黑菜单' },
+      { text: '解除拉黑', callback: groupOpenid ? `#QQBot全量删黑 ${groupOpenid}` : '#QQBot全量删黑 ' }
+    ]
+  ])
+}
+
+async function setFullMessageBlackGroup (config, configSave, selfId = '', groupOpenid = '', state = true) {
+  groupOpenid = String(groupOpenid || '').trim()
+  if (!selfId || !groupOpenid) return { msg: '请提供群openid', buttons: getFullMessageBlackMenuButtons() }
+  const recorded = isFullMessageGroupRecorded(selfId, groupOpenid)
+  const blacklisted = fullMessageStore.isBlackGroup(selfId, groupOpenid)
+  if (state) {
+    if (blacklisted) return { msg: `[${selfId}] 群 ${groupOpenid} 已经提前拉黑`, buttons: getFullMessageBlackResultButtons(groupOpenid) }
+    await fullMessageStore.addBlackGroup(selfId, groupOpenid)
+    return { msg: `[${selfId}] ${recorded ? '已拉黑' : '该群不在全量记录列表，已提前拉黑'}: ${groupOpenid}`, buttons: getFullMessageBlackResultButtons(groupOpenid) }
+  }
+  if (!blacklisted) return { msg: `[${selfId}] 删除失败，未检测到拉黑: ${groupOpenid}`, buttons: getFullMessageBlackMenuButtons() }
+  await fullMessageStore.removeBlackGroup(selfId, groupOpenid)
+  return { msg: `[${selfId}] 已解除拉黑: ${groupOpenid}`, buttons: getFullMessageBlackMenuButtons() }
+}
+
 async function setFullMessageOption (config, configSave, name, state, selfId = '') {
   name = resolveFullMessageOptionName(name)
   const option = FULL_MESSAGE_OPTIONS[name]
   if (!option) return false
 
   const fullMessage = ensureFullMessageConfig(config, selfId)
+  const wasIgnoreAllAt = fullMessage.ignoreAllAt
   if (option.key === 'handleMissingIsYou' && state) {
     fullMessage.replyOnlyIsYou = false
   }
   if (option.key === 'replyOnlyIsYou' && state && fullMessage.handleMissingIsYou) {
     fullMessage.handleMissingIsYou = false
+  }
+  if ((option.key === 'replyOnlyIsYou' && state) || (option.key === 'handleMissingIsYou' && !state)) {
+    fullMessage.ignoreAllAt = false
   }
   if (option.key === 'recordGroup') {
     if (state) await fullMessageStore.ensureStartTime(selfId)
@@ -491,7 +591,8 @@ async function setFullMessageOption (config, configSave, name, state, selfId = '
     return `\n${option.label}已关闭\n\n>当前机器人名：${nickname}`
   }
 
-  return `${option.label}已${state ? '开启' : '关闭'}`
+  const suffix = wasIgnoreAllAt && !fullMessage.ignoreAllAt ? '，已自动关闭无条件忽略所有@' : ''
+  return `${option.label}已${state ? '开启' : '关闭'}${suffix}`
 }
 
 async function setFullMessageBotLimitEnabled (config, configSave, state, selfId = '') {
@@ -523,6 +624,17 @@ async function setFullMessageIgnoreBotMaster (config, configSave, state, selfId 
   if (!state) fullMessage.ignoreBotAuthorAt = false
   await configSave()
   return `忽略其他机器人总开关已${state ? '开启' : '关闭'}`
+}
+
+async function setFullMessageIgnoreAllAt (config, configSave, state, selfId = '') {
+  const fullMessage = ensureFullMessageConfig(config, selfId)
+  fullMessage.ignoreAllAt = state
+  if (state) {
+    fullMessage.replyOnlyIsYou = false
+    fullMessage.handleMissingIsYou = true
+  }
+  await configSave()
+  return `无条件忽略所有@已${state ? '开启' : '关闭'}${state ? '，已自动关闭仅回复@机器人并开启处理非@消息' : ''}`
 }
 
 async function initFullMessageStore (config) {
@@ -596,16 +708,25 @@ export {
   getFullMessageBotLimitMsg,
   getFullMessageBotLimitButtons,
   getBotNicknameFromConfigOrStore,
+  getMemberNicknameFromStore,
+  recordMemberNickname,
   getFullMessageRecordsMsg,
   getFullMessageRecordsButtons,
   getFullMessageClearConfirmButtons,
+  getFullMessageBlackMenuMsg,
+  getFullMessageBlackMenuButtons,
+  getFullMessageBlackResultButtons,
   getFullMessageMentionState,
   recordFullMessageGroup,
+  isFullMessageGroupRecorded,
+  isFullMessageGroupBlacklisted,
+  setFullMessageBlackGroup,
   setFullMessageOption,
   setFullMessageBotLimitEnabled,
   setFullMessageBotLimitConfig,
   setFullMessageIgnoreBotAt,
   setFullMessageIgnoreBotMaster,
+  setFullMessageIgnoreAllAt,
   initFullMessageStore,
   switchFullMessageDB
 }

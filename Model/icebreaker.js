@@ -42,7 +42,11 @@ function ensureRecallConfig (config, selfId = '') {
   if (typeof rc.buttonEnabled !== 'boolean') rc.buttonEnabled = false
   if (!rc.button || typeof rc.button !== 'object') rc.button = null
   if (typeof rc.batchCount !== 'number') rc.batchCount = 0
-  if (typeof rc.displayTimeOffset8 !== 'boolean') rc.displayTimeOffset8 = false
+  if (typeof rc.displayTimeOffsetHours !== 'number') {
+    rc.displayTimeOffsetHours = rc.displayTimeOffset8 === true ? 8 : 0
+  }
+  rc.displayTimeOffsetHours = Math.max(0, Math.min(23, Number(rc.displayTimeOffsetHours) || 0))
+  if (Object.prototype.hasOwnProperty.call(rc, 'displayTimeOffset8')) delete rc.displayTimeOffset8
   return rc
 }
 
@@ -127,7 +131,11 @@ function getRecallMenuMsg (config, selfId = '') {
     '',
     `>召回Button: ${rc.buttonEnabled ? '开启' : '关闭'}${rc.button ? '' : '(未配置)'}`,
     '',
-    `>列表时间+8小时: ${rc.displayTimeOffset8 ? '开启' : '关闭'}`,
+    `>列表时间偏移: ${rc.displayTimeOffsetHours}小时${rc.displayTimeOffsetHours === 0 ? '(默认)' : ''}`,
+    '',
+    `><qqbot-cmd-input text="#QQBot召回设置 时间偏移 ${rc.displayTimeOffsetHours || 8}小时" show="设置时间偏移"/>`,
+    '',
+    '><qqbot-cmd-input text="#QQBot召回设置 时间偏移 恢复默认" show="恢复默认偏移"/>',
     '',
     `>存储方式: ${dbType}`,
     '',
@@ -151,20 +159,21 @@ function getRecallMenuButtons (config, selfId = '') {
     ],
     [
       { text: '召回查看', callback: '#QQBot召回查看' },
-      { text: '召回预览', callback: '#QQBot召回预览' }
+      { text: '召回删除', callback: '#QQBot召回删除' }
     ],
     [
-      { text: '设置MD', input: '#QQBot召回设置 Markdown ' },
-      { text: '设置按钮', input: '#QQBot召回设置 button ' }
+      { text: '召回预览', callback: '#QQBot召回预览' },
+      { text: '设置MD', input: '#QQBot召回设置 Markdown ' }
     ],
     [
       dbType === 'level'
         ? { text: '切JSON存储', callback: '#QQBot召回设置 存储 json' }
         : { text: '切LevelDB存储', callback: '#QQBot召回设置 存储 level' },
-      { text: `${rc.displayTimeOffset8 ? '关' : '开'}时间+8`, callback: `#QQBot召回设置 时间加8小时 ${rc.displayTimeOffset8 ? '关闭' : '开启'}` }
+      { text: '设置按钮', input: '#QQBot召回设置 button ' }
     ],
     [
-      { text: '返回', callback: '#QQBot普通设置' }
+      { text: '设时间', input: '#QQBot召回设置 时间偏移 8小时' },
+      { text: '恢复默认', callback: '#QQBot召回设置 时间偏移 恢复默认' }
     ]
   ])
 }
@@ -219,11 +228,11 @@ function getRecallPeriodLabel (period) {
   return map[String(period)] || '-'
 }
 
-function formatRecallTime (time, add8Hours = false) {
+function formatRecallTime (time, offsetHours = 0) {
   if (!time) return '-'
   const timestamp = typeof time === 'number' ? time : Date.parse(time)
   if (!Number.isFinite(timestamp)) return String(time)
-  return new Date(timestamp + (add8Hours ? 8 * 60 * 60 * 1000 : 0)).toISOString().replace('T', ' ').slice(0, 19)
+  return new Date(timestamp + offsetHours * 60 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19)
 }
 
 function getRecallListMsg (config, selfId = '', type = 'can', page = 1, pageSize = 20, triggerOpenid = '') {
@@ -243,7 +252,7 @@ function getRecallListMsg (config, selfId = '', type = 'can', page = 1, pageSize
     '',
     `>共 ${total} 个，第 ${page}/${maxPage} 页`,
     '',
-    `>列表时间+8小时: ${rc.displayTimeOffset8 ? '开启' : '关闭'}`,
+    `>列表时间偏移: ${rc.displayTimeOffsetHours}小时${rc.displayTimeOffsetHours === 0 ? '(默认)' : ''}`,
     ''
   ]
 
@@ -255,7 +264,7 @@ function getRecallListMsg (config, selfId = '', type = 'can', page = 1, pageSize
       const idx = start + index + 1
       const isTrigger = triggerOpenid && String(item.openid).toUpperCase() === String(triggerOpenid).toUpperCase()
       lines.push(`${idx}. ${item.openid}${isTrigger ? ' （本人）' : ''}`)
-      lines.push(`   最后活跃: ${formatRecallTime(item.lastActive, rc.displayTimeOffset8)}`)
+      lines.push(`   最后活跃: ${formatRecallTime(item.lastActive, rc.displayTimeOffsetHours)}`)
       lines.push(`   周期: ${getRecallPeriodLabel(item.period)}`)
       if (item.reason) lines.push(`   原因: ${item.reason}`)
     })

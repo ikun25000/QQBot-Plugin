@@ -10,17 +10,21 @@ class InviteStore {
     this.type = 'json'
     this._data = {}
     this._c2c = {}
+    this._atId = {}
     this._db = null
     this._saveTimer = null
     this._c2cSaveTimer = null
+    this._atIdSaveTimer = null
     this._writeQueue = Promise.resolve()
     this._c2cWriteQueue = Promise.resolve()
+    this._atIdWriteQueue = Promise.resolve()
     this._writeSeq = 0
     this._ready = false
   }
 
   _dataJsonPath () { return join(JSON_DATA_DIR, 'invite.json') }
   _c2cJsonPath () { return join(JSON_DATA_DIR, 'c2c_openids.json') }
+  _atIdJsonPath () { return join(JSON_DATA_DIR, 'at_id.json') }
 
   async init (type = 'json') {
     if (this._ready && this.type === type) return
@@ -29,6 +33,7 @@ class InviteStore {
     this.type = type
     this._data = {}
     this._c2c = {}
+    this._atId = {}
 
     if (type === 'level') {
       try {
@@ -40,6 +45,9 @@ class InviteStore {
           if (String(key).startsWith('__c2c__')) {
             const selfId = String(key).replace('__c2c__', '')
             this._c2c[selfId] = value
+          } else if (String(key).startsWith('__at_id__')) {
+            const selfId = String(key).replace('__at_id__', '')
+            this._atId[selfId] = value
           } else {
             this._data[key] = value
           }
@@ -55,6 +63,7 @@ class InviteStore {
       fs.mkdirSync(JSON_DATA_DIR, { recursive: true })
       this._loadJson(this._dataJsonPath(), '_data')
       this._loadJson(this._c2cJsonPath(), '_c2c')
+      this._loadJson(this._atIdJsonPath(), '_atId')
     }
 
     this._ready = true
@@ -84,6 +93,15 @@ class InviteStore {
     this._c2cSaveTimer = setTimeout(() => {
       this._writeJsonAtomic(this._c2cJsonPath(), this._c2c, '_c2cWriteQueue')
       this._c2cSaveTimer = null
+    }, 1000)
+  }
+
+  _scheduleAtIdSave () {
+    if (this.type === 'level' && this._db) return
+    if (this._atIdSaveTimer) clearTimeout(this._atIdSaveTimer)
+    this._atIdSaveTimer = setTimeout(() => {
+      this._writeJsonAtomic(this._atIdJsonPath(), this._atId, '_atIdWriteQueue')
+      this._atIdSaveTimer = null
     }, 1000)
   }
 
@@ -118,20 +136,36 @@ class InviteStore {
     }
   }
 
+  async _saveAtIdData (selfId) {
+    if (this.type === 'level' && this._db) {
+      await this._db.set(`__at_id__${selfId}`, this._atId[selfId] || {}, 0)
+    } else {
+      this._scheduleAtIdSave()
+    }
+  }
+
   // ========== invite 数据 ==========
   _ensureInvite (selfId, userOpenid) {
     const key = `${selfId}:${userOpenid}`
     if (!this._data[key]) {
-      this._data[key] = { number: 0, kick: 0, time: '', kicktime: '' }
+      this._data[key] = { number: 0, kick: 0, time: '', kicktime: '', groups: {}, kickGroups: {} }
     }
+    if (!this._data[key].groups || typeof this._data[key].groups !== 'object') this._data[key].groups = {}
+    if (!this._data[key].kickGroups || typeof this._data[key].kickGroups !== 'object') this._data[key].kickGroups = {}
     return this._data[key]
   }
 
   recordGroupAdd (selfId, userOpenid, groupOpenid, timestamp = '') {
     const key = `${selfId}:${userOpenid}`
     const inv = this._ensureInvite(selfId, userOpenid)
-    inv.number = (inv.number || 0) + 1
+    if (groupOpenid && inv.groups[groupOpenid]) return inv
     inv.time = this._resolveTime(timestamp)
+    if (groupOpenid) {
+      inv.groups[groupOpenid] = inv.time
+      inv.number = Object.keys(inv.groups).length
+    } else {
+      inv.number = (inv.number || 0) + 1
+    }
     this._saveInviteData(key)
     return inv
   }
@@ -139,15 +173,75 @@ class InviteStore {
   recordGroupDel (selfId, userOpenid, groupOpenid, timestamp = '') {
     const key = `${selfId}:${userOpenid}`
     const inv = this._ensureInvite(selfId, userOpenid)
-    inv.kick = (inv.kick || 0) + 1
+    if (groupOpenid && inv.kickGroups[groupOpenid]) return inv
     inv.kicktime = this._resolveTime(timestamp)
+    if (groupOpenid) {
+      inv.kickGroups[groupOpenid] = inv.kicktime
+      inv.kick = Object.keys(inv.kickGroups).length
+    } else {
+      inv.kick = (inv.kick || 0) + 1
+    }
     this._saveInviteData(key)
     return inv
   }
 
   getInvite (selfId, userOpenid) {
     const key = `${selfId}:${userOpenid}`
-    return this._data[key] || { number: 0, kick: 0, time: '', kicktime: '' }
+    const inv = this._ensureInvite(selfId, userOpenid)
+    return {
+      ...inv,
+      number: Object.keys(inv.groups || {}).length || Number(inv.number) || 0,
+      kick: Object.keys(inv.kickGroups || {}).length || Number(inv.kick) || 0
+    }
+  }
+
+  _getInviteCount (value, field = 'number') {
+    const groupKey = field === 'kick' ? 'kickGroups' : 'groups'
+    const groupCount = Object.keys(value?.[groupKey] || {}).length
+    return groupCount || Number(value?.[field]) || 0
+  }
+
+  getInviteRank (selfId, field = 'number', limit = 20) {
+    const countKey = field === 'kick' ? 'kick' : 'number'
+    const timeKey = field === 'kick' ? 'kicktime' : 'time'
+    return Object.entries(this._data)
+      .filter(([key]) => key.startsWith(`${selfId}:`))
+      .map(([key, value]) => ({
+        openid: key.slice(String(selfId).length + 1),
+        count: this._getInviteCount(value, countKey),
+        time: value?.[timeKey] || ''
+      }))
+      .filter(item => item.count > 0)
+      .sort((a, b) => b.count - a.count || String(b.time).localeCompare(String(a.time)))
+      .slice(0, Math.max(1, Number(limit) || 20))
+  }
+
+  getInviteRankCount (selfId, field = 'number') {
+    const countKey = field === 'kick' ? 'kick' : 'number'
+    return Object.entries(this._data)
+      .filter(([key]) => key.startsWith(`${selfId}:`))
+      .filter(([, value]) => this._getInviteCount(value, countKey) > 0)
+      .length
+  }
+
+  getInviteRankPage (selfId, field = 'number', page = 1, pageSize = 20) {
+    const countKey = field === 'kick' ? 'kick' : 'number'
+    const timeKey = field === 'kick' ? 'kicktime' : 'time'
+    const total = this.getInviteRankCount(selfId, field)
+    const maxPage = Math.max(1, Math.ceil(total / pageSize))
+    page = Math.max(1, Math.min(maxPage, Number(page) || 1))
+    const start = (page - 1) * pageSize
+    const list = Object.entries(this._data)
+      .filter(([key]) => key.startsWith(`${selfId}:`))
+      .map(([key, value]) => ({
+        openid: key.slice(String(selfId).length + 1),
+        count: this._getInviteCount(value, countKey),
+        time: value?.[timeKey] || ''
+      }))
+      .filter(item => item.count > 0)
+      .sort((a, b) => b.count - a.count || String(b.time).localeCompare(String(a.time)))
+      .slice(start, start + pageSize)
+    return { list, total, page, maxPage, pageSize, start }
   }
 
   // ========== C2C openid 记录 (用于召回) ==========
@@ -156,10 +250,25 @@ class InviteStore {
     const existing = this._c2c[selfId][userOpenid]
     const now = this._resolveTime(timestamp)
     if (!existing) {
-      this._c2c[selfId][userOpenid] = { firstTime: now, lastActive: now, eventId }
+      this._c2c[selfId][userOpenid] = { firstTime: now, lastActive: now, eventId, friendDeleted: false }
     } else {
       existing.lastActive = now
       if (eventId) existing.eventId = eventId
+      existing.friendDeleted = false
+      delete existing.friendDeletedTime
+    }
+    this._saveC2cData(selfId)
+  }
+
+  markC2cFriendDeleted (selfId, userOpenid, timestamp = '') {
+    if (!selfId || !userOpenid) return
+    if (!this._c2c[selfId]) this._c2c[selfId] = {}
+    const now = this._resolveTime(timestamp)
+    if (!this._c2c[selfId][userOpenid]) {
+      this._c2c[selfId][userOpenid] = { firstTime: now, lastActive: now, eventId: '', friendDeleted: true, friendDeletedTime: now }
+    } else {
+      this._c2c[selfId][userOpenid].friendDeleted = true
+      this._c2c[selfId][userOpenid].friendDeletedTime = now
     }
     this._saveC2cData(selfId)
   }
@@ -187,6 +296,20 @@ class InviteStore {
     return this._c2c[selfId]?.[userOpenid] || null
   }
 
+  getAtVirtualId (selfId, openid) {
+    return this._atId[selfId]?.[openid] || ''
+  }
+
+  setAtVirtualId (selfId, openid, virtualId, version = 0) {
+    if (!selfId || !openid || !virtualId) return
+    if (!this._atId[selfId]) this._atId[selfId] = {}
+    const next = version ? { id: virtualId, version } : virtualId
+    const current = this._atId[selfId][openid]
+    if (current === virtualId || (current?.id === virtualId && current?.version === version)) return
+    this._atId[selfId][openid] = next
+    this._saveAtIdData(selfId)
+  }
+
   getRecallableList (selfId) {
     const users = this._c2c[selfId] || {}
     const now = Date.now()
@@ -194,6 +317,10 @@ class InviteStore {
     const canRecall = []
     const cannotRecall = []
     for (const [openid, info] of Object.entries(users)) {
+      if (info.friendDeleted) {
+        cannotRecall.push({ openid, ...info, reason: '已删除好友' })
+        continue
+      }
       const lastActive = new Date(info.lastActive).getTime()
       if (now - lastActive > thirtyDays) {
         cannotRecall.push({ openid, ...info, reason: '超过30天' })
@@ -214,6 +341,26 @@ class InviteStore {
     canRecall.sort((a, b) => new Date(b.lastActive) - new Date(a.lastActive))
     cannotRecall.sort((a, b) => new Date(b.lastActive) - new Date(a.lastActive))
     return { canRecall, cannotRecall }
+  }
+
+  async deleteRecallList (selfId, type = 'all') {
+    const { canRecall, cannotRecall } = this.getRecallableList(selfId)
+    const targets = type === 'can'
+      ? canRecall
+      : type === 'cannot'
+        ? cannotRecall
+        : [...canRecall, ...cannotRecall]
+    const users = this._c2c[selfId] || {}
+    let count = 0
+    for (const item of targets) {
+      if (users[item.openid]) {
+        delete users[item.openid]
+        count++
+      }
+    }
+    this._c2c[selfId] = users
+    await this._saveC2cData(selfId)
+    return count
   }
 
   _calcPeriod (lastActiveMs, nowMs) {
@@ -329,7 +476,7 @@ class InviteStore {
 
   // ========== 存储切换/迁移 ==========
   getAllData () {
-    return { data: { ...this._data }, c2c: JSON.parse(JSON.stringify(this._c2c)) }
+    return { data: { ...this._data }, c2c: JSON.parse(JSON.stringify(this._c2c)), atId: JSON.parse(JSON.stringify(this._atId)) }
   }
 
   async migrateFrom (oldData) {
@@ -349,9 +496,18 @@ class InviteStore {
         }
       }
     }
+    if (oldData.atId && typeof oldData.atId === 'object') {
+      for (const [selfId, users] of Object.entries(oldData.atId)) {
+        this._atId[selfId] = users
+        if (this.type === 'level' && this._db) {
+          await this._db.set(`__at_id__${selfId}`, users, 0)
+        }
+      }
+    }
     if (this.type === 'json') {
       this._scheduleDataSave()
       this._scheduleC2cSave()
+      this._scheduleAtIdSave()
     }
     const inviteCount = Object.keys(oldData.data || {}).length
     const c2cCount = Object.values(oldData.c2c || {}).reduce((sum, users) => sum + Object.keys(users).length, 0)
@@ -361,10 +517,12 @@ class InviteStore {
   async close () {
     if (this._saveTimer) { clearTimeout(this._saveTimer); this._saveTimer = null }
     if (this._c2cSaveTimer) { clearTimeout(this._c2cSaveTimer); this._c2cSaveTimer = null }
+    if (this._atIdSaveTimer) { clearTimeout(this._atIdSaveTimer); this._atIdSaveTimer = null }
     if (this.type === 'json' && this._ready) {
       this._writeJsonAtomic(this._dataJsonPath(), this._data, '_writeQueue')
       this._writeJsonAtomic(this._c2cJsonPath(), this._c2c, '_c2cWriteQueue')
-      await Promise.allSettled([this._writeQueue, this._c2cWriteQueue])
+      this._writeJsonAtomic(this._atIdJsonPath(), this._atId, '_atIdWriteQueue')
+      await Promise.allSettled([this._writeQueue, this._c2cWriteQueue, this._atIdWriteQueue])
     }
     if (this._db) {
       try { this._db.close() } catch {}

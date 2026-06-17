@@ -4,9 +4,10 @@ import { getTime, importJS, splitMarkDownTemplate, getMustacheTemplating } from 
 import Runtime from '../../../lib/plugins/runtime.js'
 import Handler from '../../../lib/plugins/handler.js'
 import { config, configSave, refConfig } from './config.js'
-import { clearFullMessageRecords, ensureFullMessageConfig, getBotNicknameFromConfigOrStore, getFullMessageAllNotifyMsg, getFullMessageBotLimitButtons, getFullMessageBotLimitMsg, getFullMessageClearConfirmButtons, getFullMessageClearConfirmMsg, getFullMessageMentionState, getFullMessageRecordsButtons, getFullMessageRecordsMsg, getFullMessageStatusButtons, getFullMessageStatusMsg, initFullMessageStore, recordFullMessageGroup, setFullMessageBotLimitConfig, setFullMessageBotLimitEnabled, setFullMessageIgnoreBotAt, setFullMessageIgnoreBotMaster, setFullMessageOption, switchFullMessageDB } from './fullMessage.js'
+import { clearFullMessageRecords, ensureFullMessageConfig, getBotNicknameFromConfigOrStore, getMemberNicknameFromStore, getFullMessageAllNotifyMsg, getFullMessageBlackMenuButtons, getFullMessageBlackMenuMsg, getFullMessageBlackResultButtons, getFullMessageBotLimitButtons, getFullMessageBotLimitMsg, getFullMessageClearConfirmButtons, getFullMessageClearConfirmMsg, getFullMessageMentionState, getFullMessageRecordsButtons, getFullMessageRecordsMsg, getFullMessageStatusButtons, getFullMessageStatusMsg, initFullMessageStore, isFullMessageGroupBlacklisted, isFullMessageGroupRecorded, recordFullMessageGroup, recordMemberNickname, setFullMessageBlackGroup, setFullMessageBotLimitConfig, setFullMessageBotLimitEnabled, setFullMessageIgnoreAllAt, setFullMessageIgnoreBotAt, setFullMessageIgnoreBotMaster, setFullMessageOption, switchFullMessageDB } from './fullMessage.js'
 import { ensureIcebreakerConfig, ensureRecallConfig, getIcebreakerMenuMsg, getIcebreakerMenuButtons, getRecallMenuMsg, getRecallMenuButtons, getRecallOverviewMsg, getRecallOverviewButtons, getRecallListMsg, getRecallListButtons, initInviteStore, switchInviteDB } from './icebreaker.js'
 import inviteStore from './inviteStore.js'
+import chatStore from './chatStore.js'
 
 export {
   Dau,
@@ -23,7 +24,11 @@ export {
   clearFullMessageRecords,
   ensureFullMessageConfig,
   getBotNicknameFromConfigOrStore,
+  getMemberNicknameFromStore,
   getFullMessageAllNotifyMsg,
+  getFullMessageBlackMenuButtons,
+  getFullMessageBlackMenuMsg,
+  getFullMessageBlackResultButtons,
   getFullMessageBotLimitButtons,
   getFullMessageBotLimitMsg,
   getFullMessageClearConfirmButtons,
@@ -34,9 +39,14 @@ export {
   getFullMessageStatusButtons,
   getFullMessageStatusMsg,
   initFullMessageStore,
+  isFullMessageGroupBlacklisted,
+  isFullMessageGroupRecorded,
   recordFullMessageGroup,
+  recordMemberNickname,
+  setFullMessageBlackGroup,
   setFullMessageBotLimitConfig,
   setFullMessageBotLimitEnabled,
+  setFullMessageIgnoreAllAt,
   setFullMessageIgnoreBotAt,
   setFullMessageIgnoreBotMaster,
   setFullMessageOption,
@@ -53,5 +63,6 @@ export {
   getRecallListButtons,
   initInviteStore,
   switchInviteDB,
-  inviteStore
+  inviteStore,
+  chatStore
 }

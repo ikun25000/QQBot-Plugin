@@ -12,7 +12,9 @@ class FullMessageStore {
     this.meta = {
       recordStartTime: '',
       recordStartTimes: {},
-      botNicknames: {}
+      botNicknames: {},
+      memberNicknames: {},
+      blackGroups: {}
     }
     this._db = null
     this._saveTimer = null
@@ -32,7 +34,9 @@ class FullMessageStore {
     this.meta = {
       recordStartTime: '',
       recordStartTimes: {},
-      botNicknames: {}
+      botNicknames: {},
+      memberNicknames: {},
+      blackGroups: {}
     }
 
     if (type === 'level') {
@@ -86,13 +90,17 @@ class FullMessageStore {
         recordStartTime: '',
         recordStartTimes: {},
         botNicknames: {},
+        memberNicknames: {},
+        blackGroups: {},
         ...JSON.parse(data)
       }
     } catch {
       this.meta = {
         recordStartTime: '',
         recordStartTimes: {},
-        botNicknames: {}
+        botNicknames: {},
+        memberNicknames: {},
+        blackGroups: {}
       }
     }
   }
@@ -185,7 +193,9 @@ class FullMessageStore {
     return {
       recordStartTime: this.meta.recordStartTime || '',
       recordStartTimes: { ...(this.meta.recordStartTimes || {}) },
-      botNicknames: { ...(this.meta.botNicknames || {}) }
+      botNicknames: { ...(this.meta.botNicknames || {}) },
+      memberNicknames: { ...(this.meta.memberNicknames || {}) },
+      blackGroups: { ...(this.meta.blackGroups || {}) }
     }
   }
 
@@ -198,6 +208,60 @@ class FullMessageStore {
     if (!this.meta.botNicknames || typeof this.meta.botNicknames !== 'object') this.meta.botNicknames = {}
     if (this.meta.botNicknames[selfId] === nickname) return false
     this.meta.botNicknames[selfId] = nickname
+    await this.saveMeta()
+    return true
+  }
+
+  getMemberNickname (selfId = '', memberOpenid = '') {
+    if (!selfId || !memberOpenid) return ''
+    return this.meta.memberNicknames?.[`${selfId}:${memberOpenid}`]?.nickname || ''
+  }
+
+  async setMemberNickname (selfId = '', memberOpenid = '', nickname = '', extra = {}) {
+    if (!selfId || !memberOpenid || !nickname) return false
+    if (!this.meta.memberNicknames || typeof this.meta.memberNicknames !== 'object') this.meta.memberNicknames = {}
+    const key = `${selfId}:${memberOpenid}`
+    const current = this.meta.memberNicknames[key]
+    if (current?.nickname === nickname && current?.role === extra.role && current?.group_openid === extra.group_openid) return false
+    this.meta.memberNicknames[key] = {
+      nickname,
+      role: extra.role || current?.role || '',
+      group_openid: extra.group_openid || current?.group_openid || '',
+      updated_at: new Date().toISOString()
+    }
+    await this.saveMeta()
+    return true
+  }
+
+  getBlackGroups (selfId = '') {
+    if (!this.meta.blackGroups || typeof this.meta.blackGroups !== 'object') this.meta.blackGroups = {}
+    return Object.entries(this.meta.blackGroups)
+      .filter(([key]) => !selfId || key.startsWith(`${selfId}:`))
+      .map(([key, value]) => ({
+        self_id: value.self_id || key.split(':')[0],
+        group_openid: value.group_openid || key.slice(String(value.self_id || key.split(':')[0]).length + 1),
+        time: value.time || ''
+      }))
+  }
+
+  isBlackGroup (selfId = '', groupOpenid = '') {
+    if (!selfId || !groupOpenid) return false
+    return Boolean(this.meta.blackGroups?.[`${selfId}:${groupOpenid}`])
+  }
+
+  async addBlackGroup (selfId = '', groupOpenid = '') {
+    if (!selfId || !groupOpenid) return false
+    if (!this.meta.blackGroups || typeof this.meta.blackGroups !== 'object') this.meta.blackGroups = {}
+    const key = `${selfId}:${groupOpenid}`
+    if (this.meta.blackGroups[key]) return false
+    this.meta.blackGroups[key] = { self_id: selfId, group_openid: groupOpenid, time: new Date().toISOString() }
+    await this.saveMeta()
+    return true
+  }
+
+  async removeBlackGroup (selfId = '', groupOpenid = '') {
+    if (!selfId || !groupOpenid || !this.meta.blackGroups?.[`${selfId}:${groupOpenid}`]) return false
+    delete this.meta.blackGroups[`${selfId}:${groupOpenid}`]
     await this.saveMeta()
     return true
   }
@@ -297,6 +361,24 @@ class FullMessageStore {
       for (const [key, value] of Object.entries(fullMessage.botNicknames)) {
         if (!this.meta.botNicknames[key] && value) {
           this.meta.botNicknames[key] = value
+          changed = true
+        }
+      }
+    }
+    if (fullMessage.memberNicknames && typeof fullMessage.memberNicknames === 'object' && !Array.isArray(fullMessage.memberNicknames)) {
+      if (!this.meta.memberNicknames || typeof this.meta.memberNicknames !== 'object') this.meta.memberNicknames = {}
+      for (const [key, value] of Object.entries(fullMessage.memberNicknames)) {
+        if (!this.meta.memberNicknames[key] && value) {
+          this.meta.memberNicknames[key] = value
+          changed = true
+        }
+      }
+    }
+    if (fullMessage.blackGroups && typeof fullMessage.blackGroups === 'object' && !Array.isArray(fullMessage.blackGroups)) {
+      if (!this.meta.blackGroups || typeof this.meta.blackGroups !== 'object') this.meta.blackGroups = {}
+      for (const [key, value] of Object.entries(fullMessage.blackGroups)) {
+        if (!this.meta.blackGroups[key] && value) {
+          this.meta.blackGroups[key] = value
           changed = true
         }
       }

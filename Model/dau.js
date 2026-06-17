@@ -14,7 +14,9 @@ const dauAttr = {
   user_count: '上行消息人数',
   group_count: '上行消息群数',
   group_increase_count: '新增群数',
-  group_decrease_count: '减少群数'
+  group_decrease_count: '减少群数',
+  friend_add_count: '新增好友数',
+  friend_delete_count: '删除好友数'
 }
 
 const numToChinese = {
@@ -73,6 +75,8 @@ export default class Dau {
               case 'call_stats':
               case 'group_decrease':
               case 'group_increase':
+              case 'friend_add':
+              case 'friend_delete':
                 redis.set(`${prefix}${key}`, JSON.stringify(data), expire ? { EX: expire * 24 * 60 * 60 } : undefined)
                 break
               case 'dau_stats':
@@ -122,7 +126,9 @@ export default class Dau {
         user_count: (await this.scan(`Yz:count:receive:msg:user:${this.self_id}*:${moment(time).format('YYYY:MM:DD')}`)).length,
         group_count: (await this.scan(`Yz:count:receive:msg:group:${this.self_id}*:${moment(time).format('YYYY:MM:DD')}`)).length,
         group_increase_count: Object.keys(this.group_increase || {}).length,
-        group_decrease_count: Object.keys(this.group_decrease || {}).length
+        group_decrease_count: Object.keys(this.group_decrease || {}).length,
+        friend_add_count: Object.keys(this.friend_add || {}).length,
+        friend_delete_count: Object.keys(this.friend_delete || {}).length
       }
     }
   }
@@ -143,8 +149,13 @@ export default class Dau {
  * @param {*} pro
  * @returns
  */
-async getDauStatsMsg (e, pro) {
-  let msg = [this.today, ...this.toDauMsg(await this.getStats(), 6), '']
+  async getDauStatsMsg (e, pro) {
+  const normalizeDauRow = (row = {}) => _.reduce(_.keys(dauAttr), (acc, key) => {
+    acc[key] = Number(row?.[key]) || 0
+    return acc
+  }, {})
+
+  let msg = [this.today, ...this.toDauMsg(normalizeDauRow(await this.getStats())), '']
 
   const path = join(_path, 'data', 'QQBotDAU', this.self_id)
   const yearMonth = moment(this.today).format('YYYY-MM')
@@ -156,7 +167,7 @@ async getDauStatsMsg (e, pro) {
     const yestodayMonth = day == '01' ? moment(this.today).subtract(1, 'days').format('YYYY-MM') : yearMonth
     yesterdayDau = JSON.parse(fs.readFileSync(join(path, `${yestodayMonth}.json`), 'utf8'))
     yesterdayDau = _.find(yesterdayDau, v => moment(v.time).isSame(moment(this.today).subtract(1, 'd')))
-    msg.push(...[yesterdayDau.time, ...this.toDauMsg(yesterdayDau, 6), ''])
+    if (yesterdayDau) msg.push(...[yesterdayDau.time, ...this.toDauMsg(normalizeDauRow(yesterdayDau)), ''])
   } catch (error) { }
 
   // 最近30天平均
@@ -181,14 +192,14 @@ async getDauStatsMsg (e, pro) {
     days30 = days30.slice(0, 30)
     days = days30.length
     if (days > 0) {
-      totalDAU = _.mapValues(totalDAU, (v, k) => _.floor(_.meanBy(days30, k)))
+      totalDAU = _.mapValues(totalDAU, (v, k) => _.floor(_.meanBy(days30, item => Number(item?.[k]) || 0)))
     }
   } catch (error) {
     logger.error('[QQBot-Plugin] getDauStatsMsg 读取历史DAU数据出错:', error)
   }
 
   const daysText = numToChinese[days] || days
-  msg.push(...[`最近${daysText}天平均`, ...this.toDauMsg(totalDAU, 4)])
+  msg.push(...[`最近${daysText}天平均`, ...this.toDauMsg(totalDAU)])
   msg = msg.join('\n')
 
   if (pro) {
@@ -411,6 +422,7 @@ async getDauStatsMsg (e, pro) {
         acc[key] = 0
         return acc
       }, {})
+      for (const key of _.keys(dauAttr)) if (typeof this.stats[key] !== 'number') this.stats[key] = 0
 
       // 调用统计
       this.call_stats = await this.getDB('call_stats') || {}
@@ -418,6 +430,8 @@ async getDauStatsMsg (e, pro) {
       // 新增群, 减少群, 新增用户 列表
       this.group_increase = await this.getDB('group_increase') || {}
       this.group_decrease = await this.getDB('group_decrease') || {}
+      this.friend_add = await this.getDB('friend_add') || {}
+      this.friend_delete = await this.getDB('friend_delete') || {}
       this.user_increase = await this.getDB('user_increase') || []
 
       // 所有用户, 群聊, 群员统计
@@ -427,6 +441,8 @@ async getDauStatsMsg (e, pro) {
     } else {
       this.group_decrease = await this.getDB('group_decrease') || {}
       this.group_increase = await this.getDB('group_increase') || {}
+      this.friend_add = await this.getDB('friend_add') || {}
+      this.friend_delete = await this.getDB('friend_delete') || {}
       this.call_stats = await this.getDB('call_stats') || {}
     }
     this.message_id_cache = {}
@@ -435,13 +451,13 @@ async getDauStatsMsg (e, pro) {
   toDauMsg (data, num = 0) {
     const msg = []
     _.each(dauAttr, (v, k) => {
-      msg.push(`${v}：${data[k]}`)
+      msg.push(`${v}：${Number(data?.[k]) || 0}`)
     })
     return num ? _.take(msg, num) : msg
   }
 
   /**
-   * @param {'send_msg'|'receive_msg'|'group_increase'|'group_decrease'} type
+   * @param {'send_msg'|'receive_msg'|'group_increase'|'group_decrease'|'friend_add'|'friend_delete'} type
    */
   async setDau (type, data) {
     if (!this.dauDB) return
@@ -491,6 +507,30 @@ async getDauStatsMsg (e, pro) {
           }
           this.group_increase[group_id]++
           await this.setDB('group_increase', this.group_increase, 2)
+        }
+        break
+      case 'friend_add':
+        if (this.dauDB === 'level') {
+          this.stats[key]++
+          if (!this.friend_add[user_id]) this.friend_add[user_id] = 0
+          this.friend_add[user_id]++
+          await this.setDB('friend_add', this.friend_add, 2)
+        } else {
+          if (!this.friend_add[user_id]) this.friend_add[user_id] = 0
+          this.friend_add[user_id]++
+          await this.setDB('friend_add', this.friend_add, 2)
+        }
+        break
+      case 'friend_delete':
+        if (this.dauDB === 'level') {
+          this.stats[key]++
+          if (!this.friend_delete[user_id]) this.friend_delete[user_id] = 0
+          this.friend_delete[user_id]++
+          await this.setDB('friend_delete', this.friend_delete, 2)
+        } else {
+          if (!this.friend_delete[user_id]) this.friend_delete[user_id] = 0
+          this.friend_delete[user_id]++
+          await this.setDB('friend_delete', this.friend_delete, 2)
         }
         break
     }
