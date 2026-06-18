@@ -3467,6 +3467,7 @@ const adapter = new class QQBotAdapter {
         }
         break
       case 'member.increase':
+        if (event.notice_type !== 'group') break
         if (event.notice_type === 'group') {
           const groupOpenid = event.group_openid || event.raw?.group_openid || ''
           if (!getBotConfigValue(data.self_id, 'groupEvent')) {
@@ -3486,6 +3487,7 @@ const adapter = new class QQBotAdapter {
         Bot.em(`${data.post_type}.${data.notice_type}.increase`, { ...data, sub_type: 'increase' })
         break
       case 'member.decrease':
+        if (event.notice_type !== 'group') break
         if (event.notice_type === 'group') {
           const groupOpenid = event.group_openid || event.raw?.group_openid || ''
           if (!getBotConfigValue(data.self_id, 'groupEvent')) {
