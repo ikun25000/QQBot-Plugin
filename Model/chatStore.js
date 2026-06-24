@@ -77,7 +77,34 @@ class ChatStore {
     return `${selfId}:${userOpenid}:${scope}:${targetOpenid || '-'}:${day}`
   }
 
-  async recordUserMessage (selfId = '', userOpenid = '', scope = '', targetOpenid = '', timestamp = '') {
+  _makeRankKey (selfId, groupOpenid, userOpenid, day) {
+    return `rank:${selfId}:${groupOpenid}:${userOpenid}:${day}`
+  }
+
+  _makeLeftMemberKey (selfId, groupOpenid, userOpenid) {
+    return `left:${selfId}:${groupOpenid}:${userOpenid}`
+  }
+
+  async setGroupMemberLeft (selfId = '', groupOpenid = '', userOpenid = '', left = false) {
+    if (!selfId || !groupOpenid || !userOpenid) return false
+    const key = this._makeLeftMemberKey(selfId, groupOpenid, userOpenid)
+    if (left) {
+      const item = { self_id: selfId, group_openid: groupOpenid, user_openid: userOpenid, left: true, updated_at: new Date().toISOString() }
+      this._data[key] = item
+      if (this.type === 'level' && this._db) await this._db.set(key, item, 31)
+      else this._scheduleSave()
+    } else {
+      delete this._data[key]
+      if (this.type === 'level' && this._db) { try { await this._db.db.del(key) } catch {} } else this._scheduleSave()
+    }
+    return true
+  }
+
+  isGroupMemberLeft (selfId = '', groupOpenid = '', userOpenid = '') {
+    return !!this._data[this._makeLeftMemberKey(selfId, groupOpenid, userOpenid)]?.left
+  }
+
+  async recordUserMessage (selfId = '', userOpenid = '', scope = '', targetOpenid = '', timestamp = '', extra = {}) {
     if (!selfId || !userOpenid || !['group', 'private'].includes(scope)) return null
     const date = timestamp ? new Date(timestamp) : new Date()
     const day = Number.isNaN(date.getTime()) ? dayKey() : date.toISOString().slice(0, 10)
@@ -90,12 +117,43 @@ class ChatStore {
     this._data[key] = item
     if (this.type === 'level' && this._db) await this._db.set(key, item, 31)
     else this._scheduleSave()
+
+    if (scope === 'group' && targetOpenid) {
+      const rankKey = this._makeRankKey(selfId, targetOpenid, userOpenid, day)
+      const rankItem = this._data[rankKey] || { self_id: selfId, group_openid: targetOpenid, user_openid: userOpenid, day, count: 0, nickname: '', bot: false }
+      rankItem.count = Number(rankItem.count) + 1
+      rankItem.nickname = extra.nickname || rankItem.nickname || ''
+      rankItem.bot = extra.bot === true || rankItem.bot === true
+      rankItem.updated_at = now
+      this._data[rankKey] = rankItem
+      if (this.type === 'level' && this._db) await this._db.set(rankKey, rankItem, 31)
+      else this._scheduleSave()
+    }
     return this.getUserStats(selfId, userOpenid, scope, targetOpenid)
+  }
+
+  async recordGroupRank (selfId = '', groupOpenid = '', userOpenid = '', timestamp = '', extra = {}) {
+    if (!selfId || !groupOpenid || !userOpenid) return false
+    await this.setGroupMemberLeft(selfId, groupOpenid, userOpenid, false)
+    const date = timestamp ? new Date(timestamp) : new Date()
+    const day = Number.isNaN(date.getTime()) ? dayKey() : date.toISOString().slice(0, 10)
+    const now = new Date().toISOString()
+    const rankKey = this._makeRankKey(selfId, groupOpenid, userOpenid, day)
+    const rankItem = this._data[rankKey] || { self_id: selfId, group_openid: groupOpenid, user_openid: userOpenid, day, count: 0, nickname: '', bot: false }
+    rankItem.count = Number(rankItem.count) + 1
+    rankItem.nickname = extra.nickname || rankItem.nickname || ''
+    rankItem.bot = extra.bot === true || rankItem.bot === true
+    rankItem.updated_at = now
+    this._data[rankKey] = rankItem
+    if (this.type === 'level' && this._db) await this._db.set(rankKey, rankItem, 31)
+    else this._scheduleSave()
+    return true
   }
 
   _sum (selfId, userOpenid, days, scope = '', targetOpenid = '') {
     let total = 0
     for (const item of Object.values(this._data)) {
+      if (!['group', 'private'].includes(item.scope)) continue
       if (item.self_id !== selfId || item.user_openid !== userOpenid || !days.includes(item.day)) continue
       if (scope && item.scope !== scope) continue
       if (targetOpenid && item.target_openid !== targetOpenid) continue
@@ -137,6 +195,28 @@ class ChatStore {
         week: { group: build('week').group, private: build('week').private },
         month: { group: build('month').group, private: build('month').private }
       }
+    }
+  }
+
+  getGroupRank (selfId = '', groupOpenid = '', includeBot = false, excludeOpenid = '') {
+    if (!selfId || !groupOpenid) return undefined
+    const build = day => Object.values(this._data)
+      .filter(item => item && item.self_id === selfId && item.group_openid === groupOpenid && item.day === day)
+      .filter(item => includeBot || item.bot !== true)
+      .filter(item => !excludeOpenid || item.user_openid !== excludeOpenid)
+      .filter(item => !this.isGroupMemberLeft(selfId, groupOpenid, item.user_openid))
+      .sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0))
+      .slice(0, 10)
+      .map(item => ({
+        openid: item.user_openid,
+        user_id: item.user_openid,
+        nickname: item.nickname || item.user_openid,
+        count: Number(item.count) || 0,
+        bot: item.bot === true
+      }))
+    return {
+      today: build(dayKey()),
+      yesterday: build(dayKey(-1))
     }
   }
 

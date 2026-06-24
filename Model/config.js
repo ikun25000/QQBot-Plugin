@@ -40,6 +40,9 @@ let { config, configSave } = await makeConfig('QQBot', {
   recall: {
     bots: {}
   },
+  advancedWelcome: {
+    bots: {}
+  },
   fullMessageDB: 'level',
   inviteDB: 'level',
   dauDB: 'redis',

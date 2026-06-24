@@ -8,6 +8,7 @@ import { clearFullMessageRecords, ensureFullMessageConfig, getBotNicknameFromCon
 import { ensureIcebreakerConfig, ensureRecallConfig, getIcebreakerMenuMsg, getIcebreakerMenuButtons, getRecallMenuMsg, getRecallMenuButtons, getRecallOverviewMsg, getRecallOverviewButtons, getRecallListMsg, getRecallListButtons, initInviteStore, switchInviteDB } from './icebreaker.js'
 import inviteStore from './inviteStore.js'
 import chatStore from './chatStore.js'
+import { advancedWelcomeStore, buttonTextWarnings, checkAdvancedWelcomeSend, ensureAdvancedWelcomeConfig, getAdvancedWelcomeListButtons, getAdvancedWelcomeListMsg, getAdvancedWelcomeLimitMenuButtons, getAdvancedWelcomeLimitMenuMsg, getAdvancedWelcomeMenuButtons, getAdvancedWelcomeMenuMsg, getAdvancedWelcomeRecommendButtonJson, replaceWelcomeVariables } from './advancedWelcome.js'
 
 export {
   Dau,
@@ -64,5 +65,17 @@ export {
   initInviteStore,
   switchInviteDB,
   inviteStore,
-  chatStore
+  chatStore,
+  advancedWelcomeStore,
+  buttonTextWarnings,
+  checkAdvancedWelcomeSend,
+  ensureAdvancedWelcomeConfig,
+  getAdvancedWelcomeListButtons,
+  getAdvancedWelcomeListMsg,
+  getAdvancedWelcomeLimitMenuButtons,
+  getAdvancedWelcomeLimitMenuMsg,
+  getAdvancedWelcomeMenuButtons,
+  getAdvancedWelcomeMenuMsg,
+  getAdvancedWelcomeRecommendButtonJson,
+  replaceWelcomeVariables
 }
