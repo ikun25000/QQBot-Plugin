@@ -183,6 +183,7 @@ qbotcmd：`高级群欢迎菜单`
 #QQBot高级群欢迎查看 1
 #QQBot高级群欢迎查看关闭 1
 #QQBot高级群欢迎查看投诉 1
+#QQBot高级群欢迎查看错误 1
 #QQBot高级群欢迎查看详情 群openid
 #QQBot高级群欢迎关闭 群openid
 #QQBot高级群欢迎开启 群openid

@@ -5253,6 +5253,11 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
+          reg: /^#q+bot高级群欢迎查看错误(?:\s+(\d+))?$/i,
+          fnc: 'advancedWelcomeFailedList',
+          permission: config.permission
+        },
+        {
           reg: /^#q+bot高级群欢迎查看详情\s+\S+$/i,
           fnc: 'advancedWelcomeDetail',
           permission: config.permission
@@ -6391,7 +6396,7 @@ export class QQBotAdapter extends plugin {
 
   _replyAdvancedWelcomeList (type = 'all') {
     if (!this.guardOfficialBot()) return true
-    const reg = type === 'disabled' ? /^#q+bot高级群欢迎查看关闭(?:\s+(\d+))?$/i : type === 'complaint' ? /^#q+bot高级群欢迎查看投诉(?:\s+(\d+))?$/i : /^#q+bot高级群欢迎查看(?:\s+(\d+))?$/i
+    const reg = type === 'disabled' ? /^#q+bot高级群欢迎查看关闭(?:\s+(\d+))?$/i : type === 'complaint' ? /^#q+bot高级群欢迎查看投诉(?:\s+(\d+))?$/i : type === 'failed' ? /^#q+bot高级群欢迎查看错误(?:\s+(\d+))?$/i : /^#q+bot高级群欢迎查看(?:\s+(\d+))?$/i
     const page = Number(reg.exec(this.e.msg)?.[1]) || 1
     const data = getAdvancedWelcomeListMsg(config, this.e.self_id, type, page, 5)
     this.reply([data.msg, segment.button(...getAdvancedWelcomeListButtons(type, data.page, data.maxPage))], true)
@@ -6400,6 +6405,7 @@ export class QQBotAdapter extends plugin {
   advancedWelcomeList () { return this._replyAdvancedWelcomeList('all') }
   advancedWelcomeDisabledList () { return this._replyAdvancedWelcomeList('disabled') }
   advancedWelcomeComplaintList () { return this._replyAdvancedWelcomeList('complaint') }
+  advancedWelcomeFailedList () { return this._replyAdvancedWelcomeList('failed') }
 
   async advancedWelcomeForceSwitchGroup () {
     if (!this.guardOfficialBot()) return true

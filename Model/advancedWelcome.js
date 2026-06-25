@@ -239,13 +239,14 @@ function getAdvancedWelcomeListMsg (config, selfId = '', type = 'all', page = 1,
   let groups = advancedWelcomeStore.getGroups(selfId)
   if (type === 'disabled') groups = groups.filter(item => item.disabled)
   if (type === 'complaint') groups = groups.filter(item => Object.keys(item.complaints || {}).length || Object.keys(item.withdrawn_complaints || {}).length)
+  if (type === 'failed') groups = groups.filter(item => Number(item.failed_count) > 0 || item.last_failed_reason)
   groups.sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
   const total = groups.length
   const maxPage = Math.max(1, Math.ceil(total / pageSize))
   page = Math.max(1, Math.min(maxPage, Number(page) || 1))
   const list = groups.slice((page - 1) * pageSize, page * pageSize)
   const summary = advancedWelcomeStore.getSummary(selfId)
-  const titleMap = { all: '高级群欢迎查看', disabled: '高级群欢迎关闭群', complaint: '高级群欢迎投诉群' }
+  const titleMap = { all: '高级群欢迎查看', disabled: '高级群欢迎关闭群', complaint: '高级群欢迎投诉群', failed: '高级群欢迎错误群' }
   const lines = [
     `#[${selfId}] ${titleMap[type] || titleMap.all}`,
     '',
@@ -282,14 +283,14 @@ function getAdvancedWelcomeListMsg (config, selfId = '', type = 'all', page = 1,
 }
 
 function getAdvancedWelcomeListButtons (type = 'all', page = 1, maxPage = 1) {
-  const cmdMap = { all: '#QQBot高级群欢迎查看', disabled: '#QQBot高级群欢迎查看关闭', complaint: '#QQBot高级群欢迎查看投诉' }
+  const cmdMap = { all: '#QQBot高级群欢迎查看', disabled: '#QQBot高级群欢迎查看关闭', complaint: '#QQBot高级群欢迎查看投诉', failed: '#QQBot高级群欢迎查看错误' }
   const cmd = cmdMap[type] || cmdMap.all
   const rows = []
   const pageRow = []
   if (page > 1) pageRow.push({ text: '上一页', callback: `${cmd} ${page - 1}` })
   if (page < maxPage) pageRow.push({ text: '下一页', callback: `${cmd} ${page + 1}` })
   if (pageRow.length) rows.push(pageRow)
-  rows.push([{ text: '全部群', callback: '#QQBot高级群欢迎查看 1' }, { text: '关闭群', callback: '#QQBot高级群欢迎查看关闭 1' }])
+  rows.push([{ text: '错误群', callback: '#QQBot高级群欢迎查看错误 1' }, { text: '关闭群', callback: '#QQBot高级群欢迎查看关闭 1' }])
   rows.push([{ text: '投诉群', callback: '#QQBot高级群欢迎查看投诉 1' }, { text: '返回', callback: '#QQBot高级群欢迎菜单' }])
   return limitButtonRows(rows)
 }
