@@ -200,23 +200,35 @@ class ChatStore {
 
   getGroupRank (selfId = '', groupOpenid = '', includeBot = false, excludeOpenid = '') {
     if (!selfId || !groupOpenid) return undefined
-    const build = day => Object.values(this._data)
-      .filter(item => item && item.self_id === selfId && item.group_openid === groupOpenid && item.day === day)
-      .filter(item => includeBot || item.bot !== true)
-      .filter(item => !excludeOpenid || item.user_openid !== excludeOpenid)
-      .filter(item => !this.isGroupMemberLeft(selfId, groupOpenid, item.user_openid))
-      .sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0))
-      .slice(0, 10)
-      .map(item => ({
+    const build = days => {
+      const map = new Map()
+      for (const item of Object.values(this._data)) {
+        if (!item || item.self_id !== selfId || item.group_openid !== groupOpenid || !days.includes(item.day)) continue
+        if (!includeBot && item.bot === true) continue
+        if (excludeOpenid && item.user_openid === excludeOpenid) continue
+        if (this.isGroupMemberLeft(selfId, groupOpenid, item.user_openid)) continue
+        const current = map.get(item.user_openid) || { ...item, count: 0 }
+        current.count = (Number(current.count) || 0) + (Number(item.count) || 0)
+        current.nickname = item.nickname || current.nickname || ''
+        current.bot = item.bot === true || current.bot === true
+        map.set(item.user_openid, current)
+      }
+      return [...map.values()]
+        .sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0))
+        .slice(0, 10)
+        .map(item => ({
         openid: item.user_openid,
         user_id: item.user_openid,
         nickname: item.nickname || item.user_openid,
         count: Number(item.count) || 0,
         bot: item.bot === true
-      }))
+        }))
+    }
     return {
-      today: build(dayKey()),
-      yesterday: build(dayKey(-1))
+      today: build(periodDays('today')),
+      yesterday: build(periodDays('yesterday')),
+      week: build(periodDays('week')),
+      month: build(periodDays('month'))
     }
   }
 

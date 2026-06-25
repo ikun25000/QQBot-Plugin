@@ -3333,9 +3333,19 @@ const adapter = new class QQBotAdapter {
       return {
         today: withoutBot?.today || [],
         yesterday: withoutBot?.yesterday || [],
+        week: withoutBot?.week || [],
+        month: withoutBot?.month || [],
         todayWithBot: withBot?.today || [],
-        yesterdayWithBot: withBot?.yesterday || []
+        yesterdayWithBot: withBot?.yesterday || [],
+        weekWithBot: withBot?.week || [],
+        monthWithBot: withBot?.month || []
       }
+    }
+    data.otherchat = (userOpenid, groupOpenid) => {
+      const user = String(userOpenid || '').trim()
+      const target = String(groupOpenid || data.group_openid || event.group_openid || event.raw?.group_openid || '').trim()
+      if (!user) return null
+      return chatStore.getUserStats(data.self_id, user, target ? 'group' : '', target)
     }
 
     data.reply_id = event.reply_id || getReplyMessageIdFromPayload(event)

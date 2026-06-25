@@ -74,6 +74,12 @@ TRSS-Yunzai QQBot 嘿群主壳 插件
 - 顶层的 `today / yesterday / week / month` 是当前 `scope` 对应会话的统计值。
 - `total` 是不区分会话类型的合计值。
 - `scope` 为空时，通常表示只拿到了汇总统计，没有指定当前会话。
+
+外部插件可通过 `this.e.otherchat(userOpenid, groupOpenid)` 查询指定用户发言统计：
+
+- `userOpenid` 必填，传用户 openid。
+- `groupOpenid` 可选，传群 openid 时返回该用户在指定群的统计。
+- 返回结构与 `this.e.raw.chat` 一致，包含 `today / yesterday / week / month`。
 # QQBot 高级群欢迎
 
 高级群欢迎用于在用户入群事件触发时发送官方 Markdown 欢迎通知，主要解决群聊遗忘机器人后无法主动触达的问题。功能按机器人 QQ 分开配置，数据独立存储在 LevelDB，不依赖普通群事件开关。
