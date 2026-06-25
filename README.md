@@ -38,6 +38,42 @@ TRSS-Yunzai QQBot 嘿群主壳 插件
 | 发言记录 | `this.e.raw.chat` 按用户区分群/私聊，含今日/昨日/7天/30天 |
 | DAU 好友统计 | 新增好友数、删除好友数，兼容旧数据缺字段按 0 显示 |
 | 高级群欢迎 | 入群事件欢迎通知、单群额度、投诉关闭、详情查看，详见 `advanced_welcome.md` |
+
+### `this.e.raw.chat`
+
+`this.e.raw.chat` 来自发言统计，常见结构如下：
+
+```js
+{
+  user_openid: '...',
+  scope: 'group' | 'private' | '',
+  target_openid: '...',
+  today: 0,
+  yesterday: 0,
+  week: 0,
+  month: 0,
+  total: {
+    today: 0,
+    yesterday: 0,
+    week: 0,
+    month: 0
+  },
+  breakdown: {
+    today: { group: 0, private: 0 },
+    yesterday: { group: 0, private: 0 },
+    week: { group: 0, private: 0 },
+    month: { group: 0, private: 0 }
+  }
+}
+```
+
+说明：
+
+- `Breakdown` 表示按会话类型拆分后的明细统计。
+- `group` 是群聊发言数，`private` 是私聊发言数。
+- 顶层的 `today / yesterday / week / month` 是当前 `scope` 对应会话的统计值。
+- `total` 是不区分会话类型的合计值。
+- `scope` 为空时，通常表示只拿到了汇总统计，没有指定当前会话。
 # QQBot 高级群欢迎
 
 高级群欢迎用于在用户入群事件触发时发送官方 Markdown 欢迎通知，主要解决群聊遗忘机器人后无法主动触达的问题。功能按机器人 QQ 分开配置，数据独立存储在 LevelDB，不依赖普通群事件开关。

@@ -3320,7 +3320,10 @@ const adapter = new class QQBotAdapter {
       raw_message: normalizeQQBotContentByConfig(event.raw_message, id, botNames, event._mentions || event.mentions)
     }
 
-    if (data.raw) data.raw._qqbotFullMessageCreate = isFullMessageGroupRecorded(id, event.group_openid || event.raw?.group_openid || '') || event._qqbotFullMessageCreate === true
+    if (data.raw) {
+      data.raw._qqbotFullMessageCreate = event._qqbotFullMessageCreate === true
+      data.raw._qqbotFullMessageRecorded = isFullMessageGroupRecorded(id, event.group_openid || event.raw?.group_openid || '')
+    }
     data.recallMsg = (messageId, targetId, targetType) => this.simpleRecallMsg(data, messageId, targetId, targetType)
     data.chatrank = groupOpenid => {
       const target = groupOpenid || data.group_openid || event.group_openid || event.raw?.group_openid || ''
@@ -3343,11 +3346,10 @@ const adapter = new class QQBotAdapter {
     if (data.message_type === 'group' || (data.message_type === 'private' && data.sub_type === 'friend')) {
       const atId = getVirtualAtIdFromEvent(id, event)
       if (atId) {
-        const virtualAtId = stripSelfIdPrefix(id, atId)
-        data.at = virtualAtId
-        if (data.raw) data.raw.at_id = virtualAtId
-        if (!data.message.some(seg => seg?.type === 'at' && stripSelfIdPrefix(id, seg.qq || seg.user_id) === virtualAtId)) {
-          data.message.unshift({ type: 'at', qq: virtualAtId, user_id: virtualAtId, _qqbotVirtualAt: true })
+        data.at = atId
+        if (data.raw) data.raw.at_id = atId
+        if (!data.message.some(seg => seg?.type === 'at' && stripSelfIdPrefix(id, seg.qq || seg.user_id) === atId)) {
+          data.message.unshift({ type: 'at', qq: data.self_id, user_id: atId, _qqbotVirtualAt: true, _qqbotAtOpenid: atId })
         }
       }
     }
@@ -3356,8 +3358,8 @@ const adapter = new class QQBotAdapter {
       switch (i.type) {
         case 'at':
           if (i._qqbotVirtualAt) {
-            i.qq = stripSelfIdPrefix(data.self_id, i.qq || i.user_id)
-            i.user_id = i.qq
+            i.qq = data.self_id
+            i.user_id = i._qqbotAtOpenid || i.user_id || ''
           }
           else if (data.message_type == 'group') i.qq = `${data.self_id}${this.sep}${i.user_id}`
           else i.qq = `qg_${i.user_id}`
@@ -3769,6 +3771,8 @@ const adapter = new class QQBotAdapter {
         if (event.notice_type === 'group') {
           // GROUP_ADD_ROBOT: 记录 invite + 破冰
           const inviterOpenid = event.operator_id || ''
+          const groupOpenid = event.group_id || event.group_openid || event.raw?.group_openid || ''
+          if (data.raw && groupOpenid) data.raw._qqbotFullMessageRecorded = isFullMessageGroupRecorded(data.self_id, groupOpenid)
           if (inviterOpenid) {
             inviteStore.recordGroupAdd(data.self_id, inviterOpenid, event.group_id, event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '')
           }
