@@ -6514,7 +6514,7 @@ export class QQBotAdapter extends plugin {
     }
   }
 
-  _isGroupManagerEvent () { return this.e?.member?.is_owner || this.e?.member?.is_admin || this.e?.sender?.role === 'owner' || this.e?.sender?.role === 'admin' }
+  _isGroupManagerEvent () { return this.e?.isMaster || this.e?.member?.is_owner || this.e?.member?.is_admin || this.e?.sender?.role === 'owner' || this.e?.sender?.role === 'admin' }
 
   _isTargetingThisBot (targetSelfId = '') {
     if (String(targetSelfId || '') === String(this.e.self_id || '')) return true

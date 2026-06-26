@@ -10,9 +10,15 @@ import puppeteer from '../../../lib/puppeteer/puppeteer.js'
 //! 需顺序
 const dauAttr = {
   receive_msg_count: '上行消息量',
+  receive_msg_full_count: '上行消息量(全量)',
+  receive_msg_at_count: '上行消息量(非全量)',
   send_msg_count: '下行消息量',
   user_count: '上行消息人数',
+  user_full_count: '上行消息人数(全量)',
+  user_at_count: '上行消息人数(非全量)',
   group_count: '上行消息群数',
+  group_full_count: '上行消息群数(全量)',
+  group_at_count: '上行消息群数(非全量)',
   group_increase_count: '新增群数',
   group_decrease_count: '减少群数',
   friend_add_count: '新增好友数',
@@ -122,9 +128,15 @@ export default class Dau {
     } else {
       return {
         receive_msg_count: await this.db.get(`receive_msg_count:${time}`) || 0,
+        receive_msg_full_count: await this.db.get(`receive_msg_full_count:${time}`) || 0,
+        receive_msg_at_count: await this.db.get(`receive_msg_at_count:${time}`) || 0,
         send_msg_count: await this.db.get(`send_msg_count:${time}`) || 0,
         user_count: (await this.scan(`Yz:count:receive:msg:user:${this.self_id}*:${moment(time).format('YYYY:MM:DD')}`)).length,
+        user_full_count: 0,
+        user_at_count: 0,
         group_count: (await this.scan(`Yz:count:receive:msg:group:${this.self_id}*:${moment(time).format('YYYY:MM:DD')}`)).length,
+        group_full_count: 0,
+        group_at_count: 0,
         group_increase_count: Object.keys(this.group_increase || {}).length,
         group_decrease_count: Object.keys(this.group_decrease || {}).length,
         friend_add_count: Object.keys(this.friend_add || {}).length,
@@ -307,9 +319,13 @@ export default class Dau {
     let yesterday_user_count
     let userCount
     let groupCount
+    let allUserScope = { full: 0, at: 0 }
+    let allGroupScope = { full: 0, at: 0 }
     if (this.dauDB === 'level') {
       userCount = this.all_user.total
       groupCount = this.all_group.total
+      allUserScope = this.getReceiveScopeCounts(this.all_user)
+      allGroupScope = this.getReceiveScopeCounts(this.all_group)
       yesterday_user_count = _.size(this.yestoday_user_data.user)
       user_same_count = _.intersection(_.keys(this.today_user_data.user), _.keys(this.yestoday_user_data.user)).length
     } else {
@@ -336,7 +352,9 @@ export default class Dau {
     const msg = [
       '总计数据:',
       '总用户量: ' + userCount,
+      `总用户量(全量/非全量): ${allUserScope.full}/${allUserScope.at}`,
       '总群聊量: ' + groupCount,
+      `总群聊量(全量/非全量): ${allGroupScope.full}/${allGroupScope.at}`,
       '',
       '新增数据:',
       `新增用户: ${this.user_increase.length}`,
@@ -456,6 +474,24 @@ export default class Dau {
     return num ? _.take(msg, num) : msg
   }
 
+  getReceiveMsgScope (data = {}) {
+    return data.raw?._qqbotRawEvent === 'GROUP_MESSAGE_CREATE' ? 'full' : 'at'
+  }
+
+  ensureReceiveScopeStats (target) {
+    if (!target) return
+    if (typeof target.receive_msg_full_count !== 'number') target.receive_msg_full_count = 0
+    if (typeof target.receive_msg_at_count !== 'number') target.receive_msg_at_count = 0
+  }
+
+  getReceiveScopeCounts (items = {}) {
+    const values = Object.entries(items || {}).filter(([key, item]) => key !== 'total' && item && typeof item === 'object')
+    return {
+      full: values.filter(([, item]) => Number(item.receive_msg_full_count) > 0).length,
+      at: values.filter(([, item]) => Number(item.receive_msg_at_count) > 0).length
+    }
+  }
+
   /**
    * @param {'send_msg'|'receive_msg'|'group_increase'|'group_decrease'|'friend_add'|'friend_delete'} type
    */
@@ -474,11 +510,14 @@ export default class Dau {
         await this.setLogFnc(user_id, group_id, data.logFnc, data.message_id)
         break
       case 'receive_msg':
+        const scope = this.getReceiveMsgScope(data)
         if (this.dauDB === 'redis') {
           this.db.set('receive_msg_count')
+          this.db.set(scope === 'full' ? 'receive_msg_full_count' : 'receive_msg_at_count')
         } else {
           this.stats[key]++
-          await this.setUserOrGroupStats(user_id, group_id)
+          this.stats[scope === 'full' ? 'receive_msg_full_count' : 'receive_msg_at_count']++
+          await this.setUserOrGroupStats(user_id, group_id, scope)
         }
         break
       case 'group_decrease':
@@ -618,7 +657,13 @@ export default class Dau {
     }
   }
 
-  async setUserOrGroupStats (user_id, group_id) {
+  async setUserOrGroupStats (user_id, group_id, scope = 'at') {
+    const isFull = scope === 'full'
+    this.today_user_data.user_full ||= {}
+    this.today_user_data.user_at ||= {}
+    this.today_user_data.group_full ||= {}
+    this.today_user_data.group_at ||= {}
+
     if (user_id) {
       const user = this.today_user_data.user
       if (!user[user_id]) {
@@ -627,11 +672,21 @@ export default class Dau {
       }
       user[user_id]++
 
+      const scopeUser = isFull ? this.today_user_data.user_full : this.today_user_data.user_at
+      const scopeUserKey = isFull ? 'user_full_count' : 'user_at_count'
+      if (!scopeUser[user_id]) {
+        scopeUser[user_id] = 0
+        this.stats[scopeUserKey]++
+      }
+      scopeUser[user_id]++
+
       if (!this.all_user[user_id]) {
         this.all_user.total++
         this.user_increase.push(user_id)
         this.all_user[user_id] = {
           receive_msg_count: 0,
+          receive_msg_full_count: 0,
+          receive_msg_at_count: 0,
           send_msg_count: 0,
           call_stats: {
             total: 0
@@ -639,7 +694,9 @@ export default class Dau {
         }
         await this.setDB('user_increase', this.user_increase, 1)
       }
+      this.ensureReceiveScopeStats(this.all_user[user_id])
       this.all_user[user_id].receive_msg_count++
+      this.all_user[user_id][isFull ? 'receive_msg_full_count' : 'receive_msg_at_count']++
       await this.setDB('all_user', this.all_user, 0)
     }
 
@@ -651,17 +708,29 @@ export default class Dau {
       }
       group[group_id]++
 
+      const scopeGroup = isFull ? this.today_user_data.group_full : this.today_user_data.group_at
+      const scopeGroupKey = isFull ? 'group_full_count' : 'group_at_count'
+      if (!scopeGroup[group_id]) {
+        scopeGroup[group_id] = 0
+        this.stats[scopeGroupKey]++
+      }
+      scopeGroup[group_id]++
+
       if (!this.all_group[group_id]) {
         this.all_group.total++
         this.all_group[group_id] = {
           receive_msg_count: 0,
+          receive_msg_full_count: 0,
+          receive_msg_at_count: 0,
           send_msg_count: 0,
           call_stats: {
             total: 0
           }
         }
       }
+      this.ensureReceiveScopeStats(this.all_group[group_id])
       this.all_group[group_id].receive_msg_count++
+      this.all_group[group_id][isFull ? 'receive_msg_full_count' : 'receive_msg_at_count']++
       await this.setDB('all_group', this.all_group, 0)
     }
 
@@ -671,17 +740,21 @@ export default class Dau {
           total: 0
         }
       }
-      if (!this.all_group_member[group_id][user_id]) {
-        this.all_group_member[group_id].total++
-        this.all_group_member[group_id][user_id] = {
-          receive_msg_count: 0,
-          send_msg_count: 0,
-          call_stats: {
-            total: 0
+        if (!this.all_group_member[group_id][user_id]) {
+          this.all_group_member[group_id].total++
+          this.all_group_member[group_id][user_id] = {
+            receive_msg_count: 0,
+            receive_msg_full_count: 0,
+            receive_msg_at_count: 0,
+            send_msg_count: 0,
+            call_stats: {
+              total: 0
+            }
           }
         }
-      }
+      this.ensureReceiveScopeStats(this.all_group_member[group_id][user_id])
       this.all_group_member[group_id][user_id].receive_msg_count++
+      this.all_group_member[group_id][user_id][isFull ? 'receive_msg_full_count' : 'receive_msg_at_count']++
       await this.setDB('all_group_member', this.all_group_member, 0)
     }
 
