@@ -611,6 +611,15 @@ function isQQBotRateLimitError (data) {
   return Number(data?.code || data?.err_code) === 100017 || message.includes('code(100017)') || message.includes('接口调用超过频率限制')
 }
 
+function isQQBotGatewayBusyError (data) {
+  const message = String(data?.response?.data?.message || data?.message || data?.msg || data || '')
+  const body = data?.response?.data || data?.data || data || {}
+  const code = Number(data?.response?.data?.code || data?.response?.data?.err_code || data?.code || data?.err_code)
+  const status = Number(data?.response?.status || data?.status)
+  const recoverableGateway400 = status === 400 && !isQQBotIpWhitelistError(data) && !isQQBotReadOnlyError(body) && !isQQBotCanceledError(body) && !getQQBotAuthError(body)
+  return recoverableGateway400 || (status >= 500 && status < 600) || /^5\d+$/.test(String(code || '')) || /code\(5\d+\)/.test(message) || /系统繁忙|稍后重试|服务异常|服务繁忙|内部错误|internal server error/i.test(message)
+}
+
 function isQQBotNetworkTimeoutError (data) {
   const message = String(data?.message || data?.msg || data || '')
   return data?.code === 'ECONNABORTED' || data?.code === 'ETIMEDOUT' || message.includes('timeout') || message.includes('超时')
@@ -627,9 +636,29 @@ function isQQBotSdkError (data) {
   return message.includes('request "') || message.includes('qq-official-bot') || message.includes('/gateway/bot')
 }
 
+function getQQBotErrorTraceInfo (error = {}) {
+  const data = error?.response?.data || error?.data || {}
+  const headers = error?.response?.headers || error?.headers || {}
+  const traceId = data.trace_id || data.traceId || headers['x-tps-trace-id'] || headers['X-Tps-Trace-Id'] || headers['x-trace-id'] || ''
+  return {
+    status: error?.response?.status || error?.status || '',
+    code: data.code || error?.code || '',
+    err_code: data.err_code || error?.err_code || '',
+    trace_id: traceId,
+    message: data.message || data.msg || error?.message || String(error || '')
+  }
+}
+
 function getQQBotSdkErrorSummary (reason) {
+  const trace = getQQBotErrorTraceInfo(reason)
+  const suffix = Object.entries(trace)
+    .filter(([, value]) => value !== '' && value !== undefined && value !== null)
+    .map(([key, value]) => `${key}=${value}`)
+    .join(' ')
   if (isQQBotNetworkTimeoutError(reason)) return 'QQBot SDK 网络请求超时，请检查服务器到 QQBot API 的网络连通性，插件会继续重试'
-  return reason?.message || reason?.stack || String(reason)
+  if (isQQBotRateLimitError(reason)) return `QQBot 网关频率限制，插件会重试并在连续失败后 fallback${suffix ? ` (${suffix})` : ''}`
+  if (isQQBotGatewayBusyError(reason)) return `QQBot 网关临时错误，插件会触发重连恢复业务${suffix ? ` (${suffix})` : ''}`
+  return `${reason?.message || reason?.stack || String(reason)}${suffix ? ` (${suffix})` : ''}`
 }
 
 function sleep (ms) {
@@ -3953,7 +3982,7 @@ const adapter = new class QQBotAdapter {
       if (!data || !data.session_start_limit) return null
       return data.session_start_limit
     } catch (err) {
-      Bot.makeLog('debug', [`[${id}] 获取 Session 信息失败`, err.message], id)
+      Bot.makeLog('warn', [`[${id}] 获取 Session 信息失败`, getQQBotSdkErrorSummary(err)], id)
       return null
     }
   }
@@ -4053,7 +4082,8 @@ const adapter = new class QQBotAdapter {
   const sessionInfo = await this._getSessionInfo(id)
 
   if (!sessionInfo) {
-    Bot.makeLog('debug', [`[${id}] 无法获取 Session 信息，跳过本次检测`], id)
+    Bot.makeLog('warn', [`[${id}] 无法获取 Session 信息，判定网关状态异常`], id)
+    if (offlineDetect.autoReconnect) await this._doReconnect(id)
     return
   }
 
@@ -4407,6 +4437,18 @@ async connect (token) {
     }
   }
 
+  const enterGatewayBusyFallbackMode = (detail) => {
+    if (Bot[id]) Bot[id].gatewayBusyFallbackMode = true
+    Bot.makeLog('warn', [`[${id}] 获取 websocket 地址系统繁忙，使用默认 websocket 地址继续连接并等待自动重连恢复`, detail], id)
+    return {
+      status: 200,
+      data: {
+        url: 'wss://api.sgroup.qq.com/websocket',
+        shards: 1
+      }
+    }
+  }
+
   const requestGatewayBotWithRetry = async (...args) => {
     const retryDelays = [3000, 5000, 8000]
     for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
@@ -4414,8 +4456,8 @@ async connect (token) {
         return await originalRequestGet('/gateway/bot', ...args)
       } catch (err) {
         if (isQQBotIpWhitelistError(err)) throw err
-        if ((!isQQBotRateLimitError(err) && !isQQBotNetworkTimeoutError(err)) || attempt >= retryDelays.length) throw err
-        const reason = isQQBotNetworkTimeoutError(err) ? '网络超时' : '频率限制'
+        if ((!isQQBotRateLimitError(err) && !isQQBotNetworkTimeoutError(err) && !isQQBotGatewayBusyError(err)) || attempt >= retryDelays.length) throw err
+        const reason = isQQBotNetworkTimeoutError(err) ? '网络超时' : isQQBotGatewayBusyError(err) ? '系统繁忙' : '频率限制'
         Bot.makeLog('warn', [`[${id}] 获取 websocket 地址${reason}，${Math.round(retryDelays[attempt] / 1000)}秒后重试 (${attempt + 1}/${retryDelays.length})`, err.message], id)
         await sleep(retryDelays[attempt])
       }
@@ -4439,6 +4481,9 @@ async connect (token) {
       }
       if (url === '/gateway/bot' && isQQBotNetworkTimeoutError(err)) {
         return enterGatewayNetworkFallbackMode(err.message)
+      }
+      if (url === '/gateway/bot' && isQQBotGatewayBusyError(err)) {
+        return enterGatewayBusyFallbackMode(err.message)
       }
       if (url === '/gateway/bot' && isQQBotReadOnlyError(err)) {
         return enterReadOnlyMode(err.message)
@@ -4519,8 +4564,8 @@ async connect (token) {
             })
               } catch (err) {
                 if (isQQBotIpWhitelistError(err)) throw err
-                if ((!isQQBotRateLimitError(err) && !isQQBotNetworkTimeoutError(err)) || attempt >= retryDelays.length) throw err
-                const reason = isQQBotNetworkTimeoutError(err) ? '网络超时' : '频率限制'
+                if ((!isQQBotRateLimitError(err) && !isQQBotNetworkTimeoutError(err) && !isQQBotGatewayBusyError(err)) || attempt >= retryDelays.length) throw err
+                const reason = isQQBotNetworkTimeoutError(err) ? '网络超时' : isQQBotGatewayBusyError(err) ? '系统繁忙' : '频率限制'
                 Bot.makeLog('warn', [`[${id}] 获取 websocket 地址${reason}，bus 分支 ${Math.round(retryDelays[attempt] / 1000)}秒后重试 (${attempt + 1}/${retryDelays.length})`, err.message], id)
                 await sleep(retryDelays[attempt])
               }
@@ -4557,6 +4602,16 @@ async connect (token) {
               const fallbackWsUrl = 'wss://api.sgroup.qq.com/websocket'
               Bot[id].gatewayNetworkFallbackMode = true
               Bot.makeLog('warn', [`[${id}] 获取 websocket 地址网络超时，bus 分支使用默认 websocket 地址继续连接；请检查网络连通性`, err.message], id)
+              this.wsUrl = keys.some(i => i == this.bot.config.real_self_id)
+                ? `wss://${config.bus[id]}/ws?url=${fallbackWsUrl}&appid=${appid}`
+                : fallbackWsUrl
+              resolve(this.wsUrl)
+              return
+            }
+            if (isQQBotGatewayBusyError(err)) {
+              const fallbackWsUrl = 'wss://api.sgroup.qq.com/websocket'
+              Bot[id].gatewayBusyFallbackMode = true
+              Bot.makeLog('warn', [`[${id}] 获取 websocket 地址系统繁忙，bus 分支使用默认 websocket 地址继续连接并等待自动重连恢复`, err.message], id)
               this.wsUrl = keys.some(i => i == this.bot.config.real_self_id)
                 ? `wss://${config.bus[id]}/ws?url=${fallbackWsUrl}&appid=${appid}`
                 : fallbackWsUrl
