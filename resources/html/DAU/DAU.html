@@ -38,6 +38,10 @@
           <div class="text">上行消息量：{{totalDAU.receive_msg_count}}</div>
         </div>
         <div class="primogems">
+          <div class="icon-msg"></div>
+          <div class="text">全量/非全量：{{totalDAU.receive_msg_full_count}}/{{totalDAU.receive_msg_at_count}}</div>
+        </div>
+        <div class="primogems">
           <div class="icon-send"></div>
           <div class="text">下行消息量：{{totalDAU.send_msg_count}}</div>
         </div>
@@ -65,6 +69,10 @@
           <div class="text">上行消息量：{{todayDAU.receive_msg_count}}</div>
         </div>
         <div class="primogems">
+          <div class="icon-msg"></div>
+          <div class="text">全量/非全量：{{todayDAU.receive_msg_full_count}}/{{todayDAU.receive_msg_at_count}}</div>
+        </div>
+        <div class="primogems">
           <div class="icon-send"></div>
           <div class="text">下行消息量：{{todayDAU.send_msg_count}}</div>
         </div>
@@ -90,6 +98,10 @@
         <div class="primogems">
           <div class="icon-msg"></div>
           <div class="text">上行消息量：{{yesterdayDau.receive_msg_count||"-"}}</div>
+        </div>
+        <div class="primogems">
+          <div class="icon-msg"></div>
+          <div class="text">全量/非全量：{{yesterdayDau.receive_msg_full_count||"-"}}/{{yesterdayDau.receive_msg_at_count||"-"}}</div>
         </div>
         <div class="primogems">
           <div class="icon-send"></div>
