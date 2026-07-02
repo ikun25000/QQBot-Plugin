@@ -4408,7 +4408,7 @@ const adapter = new class QQBotAdapter {
     Bot.makeLog('warn', [`[${id}] 重新登录成功`], id)
 
     // login 成功后重新拦截 sendWs 和绑定 ws 监听（sessionManager 和 ws 可能被重建）
-    const heartbeatTimeoutMs = Number(getOfflineDetectConfig(id).heartbeatTimeout) || 30000
+    const heartbeatTimeoutMs = Number(getOfflineDetectConfig(id).heartbeatTimeout) || 60000
     const sessionManager = bot.sdk.sessionManager
     
     // 重新绑定 ws message 监听
@@ -6591,7 +6591,7 @@ export class QQBotAdapter extends plugin {
       const body = list.length
         ? list.map(i => [
           '```text',
-          `#${i.seq} [${this._formatUserManageTime(i.time)}] ${i.bot ? '[BOT] ' : ''}${i.nickname || i.user_openid}: ${i.raw_message}`,
+          `#${i.seq} [${this._formatUserManageTime(i.time)}] ${i.bot ? '[BOT] ' : ''}${i.nickname || i.user_openid}: ${String(i.raw_message || '').replace(/```/g, '`\u200b``')}`,
           '```'
         ].join('\n')).join('\n\n')
         : '>暂无记录'
@@ -6647,7 +6647,7 @@ export class QQBotAdapter extends plugin {
     const groupLines = page.list.map(i => {
       const blacked = userManageStore.isBlackGroup(this.e.self_id, i.openid)
       return [
-        `>${i.remark_name || i.name || '-'} ${i.openid}${i.real_group_id ? ` (${i.real_group_id})` : ''}`,
+        `>${i.remark_name || i.name || '-'} ${i.openid}${i.real_group_id ? ` (${i.real_group_id})` : ''}(${userManageStore.isFullGroupEventSeen(this.e.self_id, i.openid) || isFullMessageGroupRecorded(this.e.self_id, i.openid) ? '全量群' : '非全量群'})`,
         `>最近记录: ${this._formatUserManageTime(i.last_seen_at)}`,
         '',
         `><qqbot-cmd-input text="#QQBot查看群最近发言 ${i.openid} 20" show="最近发言"/>`,
@@ -6748,11 +6748,11 @@ export class QQBotAdapter extends plugin {
     const troopUin = m?.[1] || ''
     if (!troopUin) {
       const text = [
-        '#没有输入群号',
+        '#没有输入群号，你可以点击机器人头像，然后手动开启',
         '',
         '>💡 **开启方法：**',
         '><qqbot-cmd-input text="我要开启全量 " show="我要开启全量 群号"/>',
-        '> 1. 群主 👆 点击上方指令或下方按钮并补全群号',
+        '> 1. 群主 👆 点击上方指令或下方按钮并补全群号(由于未输入群号，只能点击头像打开界面)',
         '> 2. 选择 👉 获取群内全部消息',
         '> 3. 开启 👉 机器人主动在群聊内发言',
         '',
