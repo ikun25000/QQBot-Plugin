@@ -95,6 +95,7 @@ class AdvancedWelcomeStore {
       leave_count: 0,
       sent_count: 0,
       failed_count: 0,
+      consecutive_failed_count: 0,
       last_failed_at: '',
       last_failed_reason: '',
       last_sent_at: '',
@@ -200,6 +201,7 @@ class AdvancedWelcomeStore {
     const item = this.getGroup(selfId, groupOpenid, true)
     const now = Date.now()
     item.sent_count = (Number(item.sent_count) || 0) + 1
+    item.consecutive_failed_count = 0
     item.last_sent_at = nowIso()
     item.last_sent_event_id = eventId || ''
     item.speech_since_sent = 0
@@ -211,9 +213,22 @@ class AdvancedWelcomeStore {
 
   async recordSendFailure (selfId = '', groupOpenid = '', reason = '', count = true) {
     const item = this.getGroup(selfId, groupOpenid, true)
-    if (count) item.failed_count = (Number(item.failed_count) || 0) + 1
+    if (count) {
+      item.failed_count = (Number(item.failed_count) || 0) + 1
+      item.consecutive_failed_count = (Number(item.consecutive_failed_count) || 0) + 1
+    }
     item.last_failed_at = nowIso()
     item.last_failed_reason = String(reason || '发送失败').slice(0, 300)
+    await this.saveGroup(item)
+    return item
+  }
+
+  async autoDisableGroup (selfId = '', groupOpenid = '', reason = '') {
+    const item = this.getGroup(selfId, groupOpenid, true)
+    if (item.disabled) return item
+    item.disabled = true
+    item.switch_time = nowIso()
+    item.auto_disabled_reason = String(reason || '自动关闭').slice(0, 300)
     await this.saveGroup(item)
     return item
   }
@@ -233,6 +248,15 @@ class AdvancedWelcomeStore {
     const item = this._data.pendingComplaints[key]
     if (!item || Number(item.expire_at) < Date.now()) return null
     return item
+  }
+
+  findPendingComplaintByCode (selfId = '', groupOpenid = '', code = '') {
+    const target = String(code || '')
+    if (!target) return null
+    for (const item of Object.values(this._data.pendingComplaints)) {
+      if (item?.self_id === selfId && item?.group_openid === groupOpenid && item?.code === target && Number(item.expire_at) >= Date.now()) return item
+    }
+    return null
   }
 
   async clearPendingComplaint (selfId = '', groupOpenid = '', userOpenid = '') {

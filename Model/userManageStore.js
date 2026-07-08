@@ -183,6 +183,26 @@ class UserManageStore {
     return list.slice(-n).reverse()
   }
 
+  getRecentHistoryPage (selfId = '', targetOpenid = '', page = 1, size = 20, type = 'group') {
+    const list = Array.isArray(this._data.histories[this._historyKey(selfId, targetOpenid, type)]) ? this._data.histories[this._historyKey(selfId, targetOpenid, type)] : []
+    return pageSlice([...list].reverse(), page, size)
+  }
+
+  listRecentGroupHistories (selfId = '', page = 1, size = 20) {
+    const rows = []
+    for (const [key, list] of Object.entries(this._data.histories)) {
+      if (key.startsWith('user:') || !key.startsWith(`${selfId}:`) || !Array.isArray(list)) continue
+      const groupOpenid = key.slice(String(selfId).length + 1)
+      for (const item of list) rows.push({ ...item, group_openid: groupOpenid })
+    }
+    rows.sort((a, b) => {
+      const ta = Date.parse(a.time || '') || Number(a.time) || 0
+      const tb = Date.parse(b.time || '') || Number(b.time) || 0
+      return tb - ta || String(b.group_openid || '').localeCompare(String(a.group_openid || '')) || (Number(b.seq) || 0) - (Number(a.seq) || 0)
+    })
+    return pageSlice(rows, page, size)
+  }
+
   async deleteRecentHistory (selfId = '', targetOpenid = '', count = 20, type = 'group') {
     const key = this._historyKey(selfId, targetOpenid, type)
     const list = Array.isArray(this._data.histories[key]) ? this._data.histories[key] : []
@@ -245,7 +265,22 @@ class UserManageStore {
 
   listUsers (selfId = '', page = 1, size = 10) { return pageSlice(Object.values(this._data.users).filter(i => i.self_id === selfId), page, size) }
   listGroups (selfId = '', page = 1, size = 10) { return pageSlice(Object.values(this._data.groups).filter(i => i.self_id === selfId), page, size) }
-  searchUsers (selfId = '', keyword = '') { return Object.values(this._data.users).filter(i => i.self_id === selfId && String(i.nickname || '').includes(keyword)).slice(0, 20) }
+  searchUsers (selfId = '', keyword = '') {
+    const kw = String(keyword || '').trim().toLowerCase()
+    if (!kw) return []
+    return Object.values(this._data.users).filter(i => {
+      if (i.self_id !== selfId) return false
+      const haystack = [i.openid, i.nickname, ...Object.keys(i.groups || {})].filter(Boolean).join('\n').toLowerCase()
+      return haystack.includes(kw)
+    })
+  }
+  searchUsersPage (selfId = '', keyword = '', page = 1, size = 50) { return pageSlice(this.searchUsers(selfId, keyword), page, size) }
+  searchUsersByNicknamePage (selfId = '', keyword = '', page = 1, size = 50) {
+    const kw = String(keyword || '').trim().toLowerCase()
+    if (!kw) return pageSlice([], page, size)
+    const list = Object.values(this._data.users).filter(i => i.self_id === selfId && String(i.nickname || '').toLowerCase().includes(kw))
+    return pageSlice(list, page, size)
+  }
   getUser (selfId = '', openid = '') { return this._data.users[this._key(selfId, openid)] || null }
   getGroup (selfId = '', openid = '') { return this._data.groups[this._key(selfId, openid)] || null }
   getGroupMembers (selfId = '', groupOpenid = '', page = 1, size = 10) { return pageSlice(Object.values(this._data.users).filter(i => i.self_id === selfId && i.groups?.[groupOpenid]), page, size) }

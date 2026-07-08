@@ -65,6 +65,8 @@ import {
   buttonTextWarnings,
   checkAdvancedWelcomeSend,
   ensureAdvancedWelcomeConfig,
+  getAdvancedWelcomeAutoCloseMenuButtons,
+  getAdvancedWelcomeAutoCloseMenuMsg,
   getAdvancedWelcomeListButtons,
   getAdvancedWelcomeListMsg,
   getAdvancedWelcomeLimitMenuButtons,
@@ -3820,9 +3822,9 @@ const adapter = new class QQBotAdapter {
       return
     }
 
-    const eventId = event.event_id || event.notice_id || event.raw?.event_id || ''
+    const eventId = event.event_id || event.raw?.event_id || event.raw?.id || event.id || ''
     if (!eventId) {
-      await advancedWelcomeStore.recordSendFailure(selfId, groupOpenid, '入群事件缺少event_id', false)
+      await this._recordAdvancedWelcomeFailure(selfId, groupOpenid, '无event_id')
       return
     }
 
@@ -3843,9 +3845,18 @@ const adapter = new class QQBotAdapter {
       Bot.makeLog('info', [`[${selfId}] 高级群欢迎发送成功`, { groupOpenid, id: result?.id }], selfId)
     } catch (err) {
       const reason = err.response?.data?.message || err.message || '发送失败'
-      await advancedWelcomeStore.recordSendFailure(selfId, groupOpenid, reason)
+      await this._recordAdvancedWelcomeFailure(selfId, groupOpenid, reason)
       Bot.makeLog('warn', [`[${selfId}] 高级群欢迎发送失败`, groupOpenid, reason, err.response?.data], selfId)
     }
+  }
+
+  async _recordAdvancedWelcomeFailure (selfId = '', groupOpenid = '', reason = '') {
+    const item = await advancedWelcomeStore.recordSendFailure(selfId, groupOpenid, reason)
+    const aw = ensureAdvancedWelcomeConfig(config, selfId)
+    if (aw.errorAutoCloseEnabled && Number(aw.errorAutoClose) > 0 && Number(item?.consecutive_failed_count || 0) >= Number(aw.errorAutoClose)) {
+      await advancedWelcomeStore.autoDisableGroup(selfId, groupOpenid, `连续错误${item.consecutive_failed_count}次自动关闭: ${reason || '-'}`)
+    }
+    return item
   }
 
   async _sendWakeupMessage (selfId, userOpenid, mdOverride, buttonOverride, buttonEnabledOverride, force = false) {
@@ -5580,7 +5591,7 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
-          reg: /^#q+bot(?:查看所有用户|搜索用户\s+.+|查看用户所在群\s+\S+|查看所有群|查看群成员\s+\S+|查看群最近发言\s+\S+(?:\s+(?:\d+|#\d+))?|备注群名称\s+\S+\s+.+|备注真实群号\s+\S+\s+.+)(?:\s+\d+)?$/i,
+          reg: /^#q+bot(?:查看所有用户|搜索用户(?:\s+.+)?|查看用户所在群\s+\S+|查看所有群|查看所有群最近发言|查看群成员(?:\s+\S+)?|查看群最近发言(?:\s+\S+(?:\s+(?:\d+|#\d+))?)?|备注群名称\s+\S+\s+.+|备注真实群号\s+\S+\s+.+)(?:\s+\d+)?$/i,
           fnc: 'userQueryCommand',
           permission: config.permission
         },
@@ -6402,7 +6413,7 @@ export class QQBotAdapter extends plugin {
           '><qqbot-cmd-input text="#QQBot查看用户所在群 openid" show="用户群"/>', '',
           '><qqbot-cmd-input text="#QQBot查看所有群 1" show="所有群"/>', '',
           '><qqbot-cmd-input text="#QQBot查看群成员 群openid 1" show="群成员"/>', '',
-          '><qqbot-cmd-input text="#QQBot查看群最近发言 群openid 20" show="最近发言"/>', '',
+          '><qqbot-cmd-input text="#QQBot查看群最近发言 群openid 1" show="最近发言"/>', '',
           '><qqbot-cmd-input text="#QQBot备注群名称 群openid 群名" show="备注群名"/>', '',
           '><qqbot-cmd-input text="#QQBot备注真实群号 群openid 群号" show="备注群号"/>', '',
           '><qqbot-cmd-input text="#QQBot查看用户绑定全量 1" show="查绑定全量"/>'
@@ -6569,55 +6580,90 @@ export class QQBotAdapter extends plugin {
     if (m) return this._replyUserPage(userManageStore.listUsers(this.e.self_id, m[1] || 1, 10), '所有用户')
     m = /^#q+bot查看所有群(?:\s+(\d+))?$/i.exec(msg)
     if (m) return this._replyGroupPage(userManageStore.listGroups(this.e.self_id, m[1] || 1, 10), '所有群')
+    if (/^#q+bot搜索用户\s*$/i.test(msg)) return this.reply('缺少参数: 用户名/openid/群openid', true)
     m = /^#q+bot搜索用户\s+(.+)$/i.exec(msg)
-    if (m) return this.reply(['搜索结果:\n' + (userManageStore.searchUsers(this.e.self_id, m[1].trim()).map(i => `>${i.nickname || '-'} ${i.openid}`).join('\n') || '>无')], true)
+    if (m) {
+      let keyword = m[1].trim()
+      let pageNo = 1
+      const pageMatch = /^([\s\S]*\S)\s+(\d+)$/.exec(keyword)
+      if (pageMatch) {
+        keyword = pageMatch[1].trim()
+        pageNo = Number(pageMatch[2]) || 1
+      }
+      const page = /^\d+$/.test(keyword)
+        ? userManageStore.searchUsersByNicknamePage(this.e.self_id, keyword, pageNo, 50)
+        : userManageStore.searchUsersPage(this.e.self_id, keyword, pageNo, 50)
+      if (/^\d+$/.test(keyword) && !page.total) return this.reply('数字关键词未匹配到昵称，请输入更具体的昵称或openid片段', true)
+      const body = page.list.map((i, idx) => [
+        `${(page.page - 1) * 50 + idx + 1}. ${i.nickname || '-'}`,
+        `openid: ${i.openid}`,
+        '群:',
+        ...(Object.keys(i.groups || {}).length ? Object.keys(i.groups || {}).map(groupOpenid => `- ${groupOpenid}`) : ['- -'])
+      ].join('\n')).join('\n\n') || '无匹配用户'
+      const rows = [
+        ...this._pageButtonRows(`#QQBot搜索用户 ${keyword}`, page),
+        [{ text: '查询菜单', callback: '#QQBot用户管理菜单 查询菜单' }]
+      ].slice(0, 5)
+      return this.reply([`#[${this.e.self_id}] 搜索用户: ${keyword} ${page.page}/${page.pageCount}\n\n\`\`\`text\n${body}\n\`\`\``, segment.button(...rows)], true)
+    }
     m = /^#q+bot查看用户所在群\s+(\S+)$/i.exec(msg)
     if (m) { const u = userManageStore.getUser(this.e.self_id, m[1]); return this.reply((u ? Object.keys(u.groups || {}).join('\n') : '') || '暂无记录', true) }
+    m = /^#q+bot查看所有群最近发言(?:\s+(\d+))?$/i.exec(msg)
+    if (m) return this._replyAllGroupRecentHistory(userManageStore.listRecentGroupHistories(this.e.self_id, m[1] || 1, 20))
+    if (/^#q+bot查看群成员\s*$/i.test(msg)) return this.reply('缺少参数: 群openid', true)
     m = /^#q+bot查看群成员\s+(\S+)(?:\s+(\d+))?$/i.exec(msg)
-    if (m) return this._replyUserPage(userManageStore.getGroupMembers(this.e.self_id, m[1], m[2] || 1, 10), `群成员 ${m[1]}`)
+    if (m) {
+      if (!this._isValidGroupOpenid(m[1])) return this.reply('缺少参数: 有效群openid', true)
+      return this._replyUserPage(userManageStore.getGroupMembers(this.e.self_id, m[1], m[2] || 1, 10), `群成员 ${m[1]}`)
+    }
+    if (/^#q+bot查看群最近发言\s*$/i.test(msg)) return this.reply('缺少参数: 群openid', true)
     m = /^#q+bot查看群最近发言\s+(\S+)(?:\s+(\d+|#\d+))?$/i.exec(msg)
     if (m) {
       const groupOpenid = m[1]
+      if (!this._isValidGroupOpenid(groupOpenid)) return this.reply('缺少参数: 有效群openid', true)
       if (String(m[2] || '').startsWith('#')) {
         const item = userManageStore.findHistoryBySeq(this.e.self_id, groupOpenid, m[2])
         const rawText = item?.raw ? JSON.stringify(item.raw, null, 2) : ''
         return this.reply([
           rawText ? `#[${this.e.self_id}] 群发言 raw #${item.seq}\n\n\`\`\`json\n${rawText}\n\`\`\`` : `#[${this.e.self_id}] 群发言 raw\n\n>暂无记录或该记录未保存 raw`,
-          segment.button([{ text: '返回发言', callback: `#QQBot查看群最近发言 ${groupOpenid} 20` }, { text: '返回群列', callback: '#QQBot查看所有群 1' }])
+          segment.button([{ text: '返回发言', callback: `#QQBot查看群最近发言 ${groupOpenid} 1` }, { text: '返回群列', callback: '#QQBot查看所有群 1' }])
         ], true)
       }
-      const list = userManageStore.getRecentHistory(this.e.self_id, groupOpenid, Math.min(100, Number(m[2]) || 20))
-      const maxSeq = list.reduce((max, item) => Math.max(max, Number(item.seq) || 0), 0)
-      const body = list.length
-        ? list.map(i => [
+      const page = userManageStore.getRecentHistoryPage(this.e.self_id, groupOpenid, m[2] || 1, 20)
+      const maxSeq = page.list.reduce((max, item) => Math.max(max, Number(item.seq) || 0), 0)
+      const body = page.list.length
+        ? page.list.map(i => [
           '```text',
           `#${i.seq} [${this._formatUserManageTime(i.time)}] ${i.bot ? '[BOT] ' : ''}${i.nickname || i.user_openid}: ${String(i.raw_message || '').replace(/```/g, '`\u200b``')}`,
           '```'
         ].join('\n')).join('\n\n')
         : '>暂无记录'
+      const pageRows = this._pageButtonRows(`#QQBot查看群最近发言 ${groupOpenid}`, page)
       return this.reply([
-        `#[${this.e.self_id}] 群最近发言\n\n>${groupOpenid}\n\n${body}`,
+        `#[${this.e.self_id}] 群最近发言 ${page.page}/${page.pageCount}\n\n>${groupOpenid}\n\n${body}`,
         segment.button(
+          ...pageRows,
           [{ text: '返回群列', callback: '#QQBot查看所有群 1' }, { text: '群成员', input: `#QQBot查看群成员 ${groupOpenid} 1` }],
           [{ text: '备注群名', input: `#QQBot备注群名称 ${groupOpenid} ` }, { text: '备注群号', input: `#QQBot备注真实群号 ${groupOpenid} ` }],
-          ...(maxSeq ? [[{ text: '查看raw', callback: `#QQBot查看群最近发言 ${groupOpenid} #${maxSeq}` }, { text: '删除发言', callback: `#QQBot删除群最近发言 ${groupOpenid} ${Math.min(100, Number(m[2]) || 20)}` }]] : [])
+          ...(maxSeq ? [[{ text: '查看raw', callback: `#QQBot查看群最近发言 ${groupOpenid} #${maxSeq}` }, { text: '删除发言', callback: `#QQBot删除群最近发言 ${groupOpenid} 20` }]] : [])
         )
       ], true)
     }
     m = /^#q+bot备注群名称\s+(\S+)\s+(.+)$/i.exec(msg)
-    if (m) { const ret = await userManageStore.setGroupRemark(this.e.self_id, m[1], 'remark_name', m[2]); return this.reply(ret ? '群名称备注已保存' : '频道或无效群不支持备注', true) }
+    if (m) { if (!this._isValidGroupOpenid(m[1])) return this.reply('缺少参数: 有效群openid', true); const ret = await userManageStore.setGroupRemark(this.e.self_id, m[1], 'remark_name', m[2]); return this.reply(ret ? '群名称备注已保存' : '频道或无效群不支持备注', true) }
     m = /^#q+bot备注真实群号\s+(\S+)\s+(.+)$/i.exec(msg)
-    if (m) { const ret = await userManageStore.setGroupRemark(this.e.self_id, m[1], 'real_group_id', m[2]); return this.reply(ret ? '真实群号备注已保存' : '频道或无效群不支持备注', true) }
+    if (m) { if (!this._isValidGroupOpenid(m[1])) return this.reply('缺少参数: 有效群openid', true); const ret = await userManageStore.setGroupRemark(this.e.self_id, m[1], 'real_group_id', m[2]); return this.reply(ret ? '真实群号备注已保存' : '频道或无效群不支持备注', true) }
   }
 
   async deleteGroupRecentHistory () {
     if (!this.guardOfficialBot()) return true
     const m = /^#q+bot删除群最近发言\s+(\S+)\s+(\d+|全部)$/i.exec(String(this.e.msg || ''))
     if (!m) return
+    if (!this._isValidGroupOpenid(m[1])) return this.reply('缺少参数: 有效群openid', true)
     const count = await userManageStore.deleteRecentHistory(this.e.self_id, m[1], m[2], 'group')
     this.reply([
       `#[${this.e.self_id}] 删除群最近发言\n\n>${m[1]}\n\n>已删除 ${count} 条`,
-      segment.button([{ text: '最近发言', callback: `#QQBot查看群最近发言 ${m[1]} 20` }, { text: '返回群列', callback: '#QQBot查看所有群 1' }])
+      segment.button([{ text: '最近发言', callback: `#QQBot查看群最近发言 ${m[1]} 1` }, { text: '返回群列', callback: '#QQBot查看所有群 1' }])
     ], true)
   }
 
@@ -6650,7 +6696,7 @@ export class QQBotAdapter extends plugin {
         `>${i.remark_name || i.name || '-'} ${i.openid}${i.real_group_id ? ` (${i.real_group_id})` : ''}(${userManageStore.isFullGroupEventSeen(this.e.self_id, i.openid) || isFullMessageGroupRecorded(this.e.self_id, i.openid) ? '全量群' : '非全量群'})`,
         `>最近记录: ${this._formatUserManageTime(i.last_seen_at)}`,
         '',
-        `><qqbot-cmd-input text="#QQBot查看群最近发言 ${i.openid} 20" show="最近发言"/>`,
+        `><qqbot-cmd-input text="#QQBot查看群最近发言 ${i.openid} 1" show="最近发言"/>`,
         '',
         `><qqbot-cmd-input text="#QQBot备注群名称 ${i.openid} " show="备注群名"/>`,
         '',
@@ -6665,11 +6711,31 @@ export class QQBotAdapter extends plugin {
     const first = page.list[0]
     const firstBlacked = first ? userManageStore.isBlackGroup(this.e.self_id, first.openid) : false
     const actionRows = first
-      ? [[{ text: '最近发言', input: `#QQBot查看群最近发言 ${first.openid} 20` }, { text: '备注群名', input: `#QQBot备注群名称 ${first.openid} ` }], [{ text: '备注群号', input: `#QQBot备注真实群号 ${first.openid} ` }, firstBlacked ? { text: '删黑群', input: `#QQBot删黑群 ${first.openid}` } : { text: '拉黑群', input: `#QQBot拉黑群 ${first.openid}` }]]
+      ? [[{ text: '最近发言', input: `#QQBot查看群最近发言 ${first.openid} 1` }, { text: '备注群名', input: `#QQBot备注群名称 ${first.openid} ` }], [{ text: '备注群号', input: `#QQBot备注真实群号 ${first.openid} ` }, firstBlacked ? { text: '删黑群', input: `#QQBot删黑群 ${first.openid}` } : { text: '拉黑群', input: `#QQBot拉黑群 ${first.openid}` }]]
       : []
-    const msg = `#[${this.e.self_id}] ${title} ${page.page}/${page.pageCount}\n\n${groupLines || '>暂无记录'}`
-    const allRows = [...rows, ...actionRows].slice(0, 5)
+    const extra = title === '所有群' ? '\n\n><qqbot-cmd-input text="#QQBot查看所有群最近发言 1" show="所有群发言"/>' : ''
+    const msg = `#[${this.e.self_id}] ${title} ${page.page}/${page.pageCount}${extra}\n\n${groupLines || '>暂无记录'}`
+    const allRows = [...rows, ...(title === '所有群' ? [[{ text: '群发言', callback: '#QQBot查看所有群最近发言 1' }]] : []), ...actionRows].slice(0, 5)
     this.reply(allRows.length ? [msg, segment.button(...allRows)] : msg, true)
+  }
+
+  _replyAllGroupRecentHistory (page) {
+    const body = page.list.map(i => [
+      '```text',
+      `${i.group_openid} #${i.seq} [${this._formatUserManageTime(i.time)}] ${i.bot ? '[BOT] ' : ''}${i.nickname || i.user_openid}: ${String(i.raw_message || '').replace(/```/g, '`\u200b``')}`,
+      '```',
+      `><qqbot-cmd-input text="#QQBot查看群最近发言 ${i.group_openid} #${i.seq}" show="查看raw"/>`
+    ].join('\n')).join('\n\n') || '>暂无记录'
+    const rows = [
+      ...this._pageButtonRows('#QQBot查看所有群最近发言', page),
+      [{ text: '所有群', callback: '#QQBot查看所有群 1' }, { text: '查询菜单', callback: '#QQBot用户管理菜单 查询菜单' }]
+    ].slice(0, 5)
+    this.reply([`#[${this.e.self_id}] 所有群最近发言 ${page.page}/${page.pageCount}\n\n${body}`, segment.button(...rows)], true)
+  }
+
+  _isValidGroupOpenid (value = '') {
+    const text = String(value || '').trim()
+    return /^[A-F0-9]{32}$/i.test(text)
   }
 
   _pageButtonRows (base, page) {
@@ -6775,25 +6841,26 @@ export class QQBotAdapter extends plugin {
     if (this.e.message_type !== 'group' || String(this.e.group_id || '').startsWith('qg_')) return this.reply('该命令只能在QQ群内使用', true)
 
     const role = this.e.raw?.author?.member_role || this.e.member?.role || this.e.sender?.role || ''
-    if (normalizeQQBotMemberRole(role, this.e.raw?.author?.bot === true) !== 'owner') {
+    if (!this.e.isMaster && normalizeQQBotMemberRole(role, this.e.raw?.author?.bot === true) !== 'owner') {
       return this.reply(`你不是群主，你是${this._roleText(role)}，你可以联系群主来设置`, true)
     }
 
     const userOpenid = this._userOpenidFromEvent()
     const groupOpenid = this._groupOpenidFromEvent()
     const nickname = this.e.raw?.author?.username || this.e.sender?.nickname || this.e.member?.nickname || ''
+    const masterForce = this.e.isMaster && normalizeQQBotMemberRole(role, this.e.raw?.author?.bot === true) !== 'owner'
     await userManageStore.recordFullBinding(this.e.self_id, userOpenid, groupOpenid, { troop_uin: troopUin, nickname })
     const authUrl = this._fullMessageAuthUrl(troopUin)
     const fullEnabled = this.e.raw?._qqbotFullMessageCreate === true || userManageStore.isFullGroupEventSeen(this.e.self_id, groupOpenid)
     const text = fullEnabled
       ? [
-          '>💡 **开启方法：**',
+          masterForce ? '>💡 **开启方法：(你不是群主，不一定能开启)**' : '>💡 **开启方法：**',
           `[点击给机器人授权](${authUrl})`,
           '>当前群已经开启全量，再次访问链接可以关闭',
           '> 5. 开启后在群内发言无需艾特机器人,而且可以使用更多高级功能。'
         ].join('\n')
       : [
-          '>💡 **开启方法：**',
+          masterForce ? '>💡 **开启方法：(你不是群主，不一定能开启)**' : '>💡 **开启方法：**',
           `[点击给机器人授权](${authUrl})`,
           '> 1. 群主 👆 点击上方链接或下方按钮',
           '> 2. 选择 👉 获取群内全部消息',
@@ -7071,7 +7138,7 @@ export class QQBotAdapter extends plugin {
         return
       }
       if (state && !ib[btnDataKey]) {
-        this.reply([
+        await this._replyAndRecall([
           `[${selfId}] 请先配置${m[1]}按钮数据，再开启`,
           getButtonJsonHelpMsg(selfId, m[1]),
           getButtonJsonHelpButtons(m[1])
@@ -7172,6 +7239,11 @@ export class QQBotAdapter extends plugin {
 
     if (/^限制菜单$/i.test(args)) {
       this.reply([getAdvancedWelcomeLimitMenuMsg(config, selfId), segment.button(...getAdvancedWelcomeLimitMenuButtons())], true)
+      return
+    }
+
+    if (/^自动关闭菜单$/i.test(args)) {
+      this.reply([getAdvancedWelcomeAutoCloseMenuMsg(config, selfId), segment.button(...getAdvancedWelcomeAutoCloseMenuButtons())], true)
       return
     }
 
@@ -7299,6 +7371,24 @@ export class QQBotAdapter extends plugin {
       aw.speechLimit = Math.max(0, Number(m[1]) || 0)
       await configSave()
       this.reply(`[${selfId}] 发言限制已设置为 ${aw.speechLimit ? `上次欢迎后收到全量群消息 ${aw.speechLimit} 次才发送` : '关闭(不要求发言数)'}`, true)
+      return
+    }
+
+    m = /^投诉自动关闭\s+(\d+)$/i.exec(args)
+    if (m) {
+      aw.complaintAutoClose = Math.max(0, Number(m[1]) || 0)
+      await configSave()
+      this.reply(`[${selfId}] 投诉自动关闭已${aw.complaintAutoClose ? `设置为单群 ${aw.complaintAutoClose} 次` : '关闭'}`, true)
+      return
+    }
+
+    m = /^单群错误自动关闭\s+(\d+)$/i.exec(args)
+    if (m) {
+      aw.errorAutoClose = Math.max(0, Number(m[1]) || 0)
+      aw.errorAutoCloseEnabled = aw.errorAutoClose > 0
+      if (!aw.errorAutoClose) aw.errorAutoClose = 50
+      await configSave()
+      this.reply(`[${selfId}] 连续错误自动关闭已${aw.errorAutoCloseEnabled ? `设置为单群 ${aw.errorAutoClose} 次` : '关闭'}`, true)
       return
     }
 
@@ -7447,15 +7537,21 @@ export class QQBotAdapter extends plugin {
     if (m) {
       const pending = advancedWelcomeStore.getPendingComplaint(this.e.self_id, groupOpenid, userOpenid)
       if (!pending || pending.code !== m[1]) {
-        this.reply('确认码无效或已过期，请重新提交投诉', true)
+        const otherPending = advancedWelcomeStore.findPendingComplaintByCode(this.e.self_id, groupOpenid, m[1])
+        await this._replyAndRecall(otherPending ? '请不要使用别人的投诉确认，请明确自己有投诉需求' : '确认码无效或已过期，请重新提交投诉')
         return
       }
       const result = await advancedWelcomeStore.addComplaint(this.e.self_id, groupOpenid, userOpenid)
       if (!result.added) {
-        this.reply('你已经投诉过当前群推送，无需重复提交', true)
+        await this._replyAndRecall('你已经投诉过当前群推送，无需重复提交')
         return
       }
-      this.reply(['成功提交投诉，5个工作日内会核实，如果过多人反馈将会关闭当前群推送。', segment.button([{ text: '撤回投诉', callback: `#我要撤回投诉 ${this.e.self_id}` }])], true)
+      const aw = ensureAdvancedWelcomeConfig(config, this.e.self_id)
+      const complaints = Object.keys(result.item?.complaints || {}).length
+      if (aw.complaintAutoClose > 0 && complaints >= aw.complaintAutoClose) {
+        await advancedWelcomeStore.autoDisableGroup(this.e.self_id, groupOpenid, `被投诉${complaints}次自动关闭`)
+      }
+      await this._replyAndRecall(['成功提交投诉，5个工作日内会核实，如果过多人反馈将会关闭当前群推送。', segment.button([{ text: '撤回投诉', callback: `#我要撤回投诉 ${this.e.self_id}` }])])
       return
     }
 
@@ -7480,7 +7576,7 @@ export class QQBotAdapter extends plugin {
             `><qqbot-cmd-input text="${complaintCmd}" show="投诉通知"/>`
           ].join('\n'),
           segment.button([{ text: '投诉通知', callback: complaintCmd }])
-        ], true)
+        ])
         return
       }
       const currentGroup = advancedWelcomeStore.getGroup(this.e.self_id, groupOpenid, true)
@@ -7497,21 +7593,32 @@ export class QQBotAdapter extends plugin {
     if (action === '投诉') {
       if (this._isGroupManagerEvent()) {
         const cmd = `#我要关闭通知 ${this.e.self_id}`
-        this.reply([`你可以直接使用${cmd}，无需投诉`, segment.button([{ text: '关闭通知', callback: cmd }])], true)
+        await this._replyAndRecall([`你可以直接使用下面的指令，无需投诉\n\n><qqbot-cmd-input text="${cmd}" show="关闭通知"/>`, segment.button([{ text: '关闭通知', callback: cmd }])])
         return
       }
       const group = advancedWelcomeStore.getGroup(this.e.self_id, groupOpenid, true)
       const complaintCount = Object.keys(group.complaints || {}).length
       const code = String(Math.floor(1000000 + Math.random() * 9000000))
       await advancedWelcomeStore.setPendingComplaint(this.e.self_id, groupOpenid, userOpenid, code)
-      this.reply([`当前已有 ${complaintCount} 人投诉。抱歉影响了群聊氛围，QQ平台核实后自动关闭当前群的通知。\n请发送 #我要投诉通知 确认 ${code}`, segment.button([{ text: '确认投诉', callback: `#我要投诉通知 确认 ${code}` }])], true)
+      await this._replyAndRecall([`当前已有 ${complaintCount} 人投诉。抱歉影响了群聊氛围，QQ平台核实后自动关闭当前群的通知。\n请发送 #我要投诉通知 确认 ${code}`, segment.button([{ text: '确认投诉', callback: `#我要投诉通知 确认 ${code}` }])])
       return
     }
 
     if (action === '撤回投诉') {
       const result = await advancedWelcomeStore.withdrawComplaint(this.e.self_id, groupOpenid, userOpenid)
-      this.reply(result.withdrawn ? '撤回成功，感谢您支持本机器人!' : '当前没有可撤回的投诉', true)
+      await this._replyAndRecall(result.withdrawn ? '撤回成功，感谢您支持本机器人!' : '当前没有可撤回的投诉')
     }
+  }
+
+  async _replyAndRecall (msg, seconds = 60) {
+    const ret = await this.reply(msg, true)
+    const finalIds = Array.isArray(ret?.message_id) ? ret.message_id : (ret?.message_id ? [ret.message_id] : [])
+    if (finalIds.length && this.e.recallMsg) {
+      setTimeout(() => {
+        for (const id of finalIds) this.e.recallMsg(id).catch?.(() => {})
+      }, seconds * 1000)
+    }
+    return ret
   }
 
   // ========== 召回菜单 ==========

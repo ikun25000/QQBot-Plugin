@@ -9,7 +9,7 @@ import { ensureIcebreakerConfig, ensureRecallConfig, getIcebreakerMenuMsg, getIc
 import inviteStore from './inviteStore.js'
 import chatStore from './chatStore.js'
 import userManageStore from './userManageStore.js'
-import { advancedWelcomeStore, buttonTextWarnings, checkAdvancedWelcomeSend, ensureAdvancedWelcomeConfig, getAdvancedWelcomeListButtons, getAdvancedWelcomeListMsg, getAdvancedWelcomeLimitMenuButtons, getAdvancedWelcomeLimitMenuMsg, getAdvancedWelcomeMenuButtons, getAdvancedWelcomeMenuMsg, getAdvancedWelcomeRecommendButtonJson, replaceWelcomeVariables } from './advancedWelcome.js'
+import { advancedWelcomeStore, buttonTextWarnings, checkAdvancedWelcomeSend, ensureAdvancedWelcomeConfig, getAdvancedWelcomeAutoCloseMenuButtons, getAdvancedWelcomeAutoCloseMenuMsg, getAdvancedWelcomeListButtons, getAdvancedWelcomeListMsg, getAdvancedWelcomeLimitMenuButtons, getAdvancedWelcomeLimitMenuMsg, getAdvancedWelcomeMenuButtons, getAdvancedWelcomeMenuMsg, getAdvancedWelcomeRecommendButtonJson, replaceWelcomeVariables } from './advancedWelcome.js'
 
 export {
   Dau,
@@ -72,6 +72,8 @@ export {
   buttonTextWarnings,
   checkAdvancedWelcomeSend,
   ensureAdvancedWelcomeConfig,
+  getAdvancedWelcomeAutoCloseMenuButtons,
+  getAdvancedWelcomeAutoCloseMenuMsg,
   getAdvancedWelcomeListButtons,
   getAdvancedWelcomeListMsg,
   getAdvancedWelcomeLimitMenuButtons,

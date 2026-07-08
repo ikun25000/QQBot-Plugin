@@ -25,6 +25,9 @@ function ensureAdvancedWelcomeConfig (config, selfId = '') {
   aw.min1Limit = normalizeLimit(aw.min1Limit, 0)
   aw.cooldownSeconds = Math.max(0, Number(aw.cooldownSeconds) || 0)
   aw.speechLimit = Math.max(0, Number(aw.speechLimit) || 0)
+  aw.complaintAutoClose = Math.max(0, Number(aw.complaintAutoClose) || 0)
+  aw.errorAutoClose = Math.max(0, Number(aw.errorAutoClose) || 50)
+  aw.errorAutoCloseEnabled = typeof aw.errorAutoCloseEnabled === 'boolean' ? aw.errorAutoCloseEnabled : false
   return aw
 }
 
@@ -229,8 +232,39 @@ function getAdvancedWelcomeLimitMenuButtons () {
     ],
     [
       { text: '发言', input: '#QQBot高级群欢迎设置 发言限制 30' },
-      { text: '返回', callback: '#QQBot高级群欢迎菜单' }
+      { text: '自动关闭', callback: '#QQBot高级群欢迎设置 自动关闭菜单' }
     ]
+  ])
+}
+
+function getAdvancedWelcomeAutoCloseMenuMsg (config, selfId = '') {
+  const aw = ensureAdvancedWelcomeConfig(config, selfId)
+  return [
+    `#[${selfId || '-'}] 高级群欢迎自动关闭菜单`,
+    '',
+    `>投诉自动关闭: ${aw.complaintAutoClose > 0 ? `${aw.complaintAutoClose}次` : '关闭'}`,
+    '',
+    '><qqbot-cmd-input text="#QQBot高级群欢迎设置 投诉自动关闭 3" show="投诉关闭"/>',
+    '',
+    `>连续错误自动关闭: ${aw.errorAutoCloseEnabled ? `${aw.errorAutoClose}次` : '关闭'}`,
+    '',
+    '><qqbot-cmd-input text="#QQBot高级群欢迎设置 单群错误自动关闭 50" show="错误关闭"/>',
+    '',
+    '><qqbot-cmd-input text="#QQBot高级群欢迎设置 单群错误自动关闭 0" show="关闭错误自动"/>',
+    '',
+    '```text',
+    '投诉自动关闭为单群有效投诉人数达到阈值后关闭该群欢迎。',
+    '连续错误自动关闭为单群连续发送失败达到阈值后关闭该群欢迎；默认阈值50，默认关闭。',
+    '0 表示关闭对应自动关闭规则。',
+    '```'
+  ].join('\n')
+}
+
+function getAdvancedWelcomeAutoCloseMenuButtons () {
+  return limitButtonRows([
+    [{ text: '投诉3次', input: '#QQBot高级群欢迎设置 投诉自动关闭 3' }, { text: '投诉关闭', callback: '#QQBot高级群欢迎设置 投诉自动关闭 0' }],
+    [{ text: '错误50次', input: '#QQBot高级群欢迎设置 单群错误自动关闭 50' }, { text: '错误关闭', callback: '#QQBot高级群欢迎设置 单群错误自动关闭 0' }],
+    [{ text: '限制菜单', callback: '#QQBot高级群欢迎设置 限制菜单' }, { text: '返回', callback: '#QQBot高级群欢迎菜单' }]
   ])
 }
 
@@ -272,6 +306,7 @@ function getAdvancedWelcomeListMsg (config, selfId = '', type = 'all', page = 1,
     lines.push(`加群/退群: ${item.join_count || 0}/${item.leave_count || 0}`)
     lines.push(`全量群消息状态: ${item.full_message_active ? '可用' : '不可用'}，已统计${item.full_message_create_count || 0}次`)
     lines.push(`发送/失败: ${item.sent_count || 0}/${item.failed_count || 0}`)
+    lines.push(`连续错误: ${item.consecutive_failed_count || 0}`)
     lines.push(`投诉/撤回: ${complaints}/${withdrawn}`)
     lines.push(`最近失败: ${item.last_failed_reason || '-'}`)
     lines.push('```')
@@ -332,6 +367,8 @@ export {
   getAdvancedWelcomeListMsg,
   getAdvancedWelcomeLimitMenuButtons,
   getAdvancedWelcomeLimitMenuMsg,
+  getAdvancedWelcomeAutoCloseMenuButtons,
+  getAdvancedWelcomeAutoCloseMenuMsg,
   getAdvancedWelcomeMenuButtons,
   getAdvancedWelcomeMenuMsg,
   getAdvancedWelcomeRecommendButtonJson,
