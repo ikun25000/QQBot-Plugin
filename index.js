@@ -5623,7 +5623,7 @@ export class QQBotAdapter extends plugin {
           fnc: 'userCancelWithdraw'
         },
         {
-          reg: /^#?我要开启全量(?:\s*\S+)?$/i,
+          reg: /^\s*#?我要开启全量(?:\s*\S+)?$/i,
           fnc: 'requestFullMessageAuth'
         },
         {
@@ -6809,7 +6809,7 @@ export class QQBotAdapter extends plugin {
 
   async requestFullMessageAuth () {
     if (!this.guardOfficialBot()) return true
-    const msg = String(this.e.msg || '')
+    const msg = String(this.e.msg || '').trim()
     const m = /^#?我要开启全量\s*(\S*)$/i.exec(msg)
     const troopUin = m?.[1] || ''
     if (!troopUin) {
@@ -6851,7 +6851,7 @@ export class QQBotAdapter extends plugin {
     const masterForce = this.e.isMaster && normalizeQQBotMemberRole(role, this.e.raw?.author?.bot === true) !== 'owner'
     await userManageStore.recordFullBinding(this.e.self_id, userOpenid, groupOpenid, { troop_uin: troopUin, nickname })
     const authUrl = this._fullMessageAuthUrl(troopUin)
-    const fullEnabled = this.e.raw?._qqbotFullMessageCreate === true || userManageStore.isFullGroupEventSeen(this.e.self_id, groupOpenid)
+    const fullEnabled = this.e.raw?._qqbotFullMessageCreate === true
     const text = fullEnabled
       ? [
           masterForce ? '>💡 **开启方法：(你不是群主，不一定能开启)**' : '>💡 **开启方法：**',
