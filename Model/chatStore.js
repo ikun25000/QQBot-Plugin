@@ -26,6 +26,7 @@ class ChatStore {
     this._writeQueue = Promise.resolve()
     this._writeSeq = 0
     this._ready = false
+    this._userRecords = new Map()
   }
 
   _jsonPath () { return join(JSON_DATA_DIR, 'chat.json') }
@@ -34,21 +35,29 @@ class ChatStore {
     if (this._ready) return
     this.type = 'level'
     this._data = {}
+    this._userRecords = new Map()
     try {
       const { default: Level } = await import('./level.js')
       fs.mkdirSync(LEVEL_DATA_DIR, { recursive: true })
       this._db = new Level(LEVEL_DATA_DIR)
       await this._db.open()
-      for await (const [key, value] of this._db.db.iterator()) this._data[key] = value
+      for await (const [key, value] of this._db.db.iterator()) {
+        this._data[key] = value
+        this._indexUserRecord(key, value)
+      }
     } catch (err) {
       logger.error('[QQBot-Plugin] chatStore LevelDB init failed, fallback to json:', err.message)
       this.type = 'json'
       if (this._db) { try { this._db.close() } catch {} this._db = null }
+      this._data = {}
+      this._userRecords.clear()
       fs.mkdirSync(JSON_DATA_DIR, { recursive: true })
       try {
         this._data = JSON.parse(fs.readFileSync(this._jsonPath(), 'utf-8')) || {}
+        for (const [key, value] of Object.entries(this._data)) this._indexUserRecord(key, value)
       } catch {
         this._data = {}
+        this._userRecords.clear()
       }
     }
     this._ready = true
@@ -85,6 +94,21 @@ class ChatStore {
     return `left:${selfId}:${groupOpenid}:${userOpenid}`
   }
 
+  _userIndexKey (selfId, userOpenid) {
+    return `${selfId}:${userOpenid}`
+  }
+
+  _indexUserRecord (key, item) {
+    if (!item?.self_id || !item?.user_openid || !['group', 'private'].includes(item.scope)) return
+    const indexKey = this._userIndexKey(item.self_id, item.user_openid)
+    let records = this._userRecords.get(indexKey)
+    if (!records) {
+      records = new Set()
+      this._userRecords.set(indexKey, records)
+    }
+    records.add(key)
+  }
+
   async setGroupMemberLeft (selfId = '', groupOpenid = '', userOpenid = '', left = false) {
     if (!selfId || !groupOpenid || !userOpenid) return false
     const key = this._makeLeftMemberKey(selfId, groupOpenid, userOpenid)
@@ -115,6 +139,7 @@ class ChatStore {
     if (!item.first_time) item.first_time = now
     item.last_time = now
     this._data[key] = item
+    this._indexUserRecord(key, item)
     if (this.type === 'level' && this._db) await this._db.set(key, item, 31)
     else this._scheduleSave()
 
@@ -150,50 +175,48 @@ class ChatStore {
     return true
   }
 
-  _sum (selfId, userOpenid, days, scope = '', targetOpenid = '') {
-    let total = 0
-    for (const item of Object.values(this._data)) {
-      if (!['group', 'private'].includes(item.scope)) continue
-      if (item.self_id !== selfId || item.user_openid !== userOpenid || !days.includes(item.day)) continue
-      if (scope && item.scope !== scope) continue
-      if (targetOpenid && item.target_openid !== targetOpenid) continue
-      total += Number(item.count) || 0
-    }
-    return total
-  }
-
   getUserStats (selfId = '', userOpenid = '', scope = '', targetOpenid = '') {
     if (!selfId || !userOpenid) return null
-    const build = period => {
-      const days = periodDays(period)
-      return {
-        total: this._sum(selfId, userOpenid, days),
-        group: this._sum(selfId, userOpenid, days, 'group'),
-        private: this._sum(selfId, userOpenid, days, 'private'),
-        current: scope ? this._sum(selfId, userOpenid, days, scope, scope === 'group' ? targetOpenid : '') : 0
+    const periods = ['today', 'yesterday', 'week', 'month']
+    const periodSets = Object.fromEntries(periods.map(period => [period, new Set(periodDays(period))]))
+    const stats = Object.fromEntries(periods.map(period => [period, { total: 0, group: 0, private: 0, current: 0 }]))
+    const recordKeys = this._userRecords.get(this._userIndexKey(selfId, userOpenid)) || []
+
+    for (const key of recordKeys) {
+      const item = this._data[key]
+      if (!item || !['group', 'private'].includes(item.scope)) continue
+      const count = Number(item.count) || 0
+      if (!count) continue
+
+      for (const period of periods) {
+        if (!periodSets[period].has(item.day)) continue
+        stats[period].total += count
+        stats[period][item.scope] += count
+        if (scope && item.scope === scope && (scope !== 'group' || !targetOpenid || item.target_openid === targetOpenid)) {
+          stats[period].current += count
+        }
       }
     }
 
-    const currentForPeriod = period => build(period).current
     return {
       user_openid: userOpenid,
       scope,
       target_openid: targetOpenid || '',
-      today: currentForPeriod('today'),
-      yesterday: currentForPeriod('yesterday'),
-      week: currentForPeriod('week'),
-      month: currentForPeriod('month'),
+      today: stats.today.current,
+      yesterday: stats.yesterday.current,
+      week: stats.week.current,
+      month: stats.month.current,
       total: {
-        today: build('today').total,
-        yesterday: build('yesterday').total,
-        week: build('week').total,
-        month: build('month').total
+        today: stats.today.total,
+        yesterday: stats.yesterday.total,
+        week: stats.week.total,
+        month: stats.month.total
       },
       breakdown: {
-        today: { group: build('today').group, private: build('today').private },
-        yesterday: { group: build('yesterday').group, private: build('yesterday').private },
-        week: { group: build('week').group, private: build('week').private },
-        month: { group: build('month').group, private: build('month').private }
+        today: { group: stats.today.group, private: stats.today.private },
+        yesterday: { group: stats.yesterday.group, private: stats.yesterday.private },
+        week: { group: stats.week.group, private: stats.week.private },
+        month: { group: stats.month.group, private: stats.month.private }
       }
     }
   }
@@ -239,6 +262,7 @@ class ChatStore {
       await this._writeQueue.catch(() => {})
     }
     if (this._db) { try { this._db.close() } catch {}; this._db = null }
+    this._userRecords.clear()
     this._ready = false
   }
 }

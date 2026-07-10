@@ -3240,13 +3240,6 @@ const adapter = new class QQBotAdapter {
       const mentionState = getFullMessageMentionState(config, event, data.self_id)
       data.full_message = mentionState
       Bot.makeLog('debug', ['全量消息过滤状态', mentionState, { msg: data.raw_message, mentions: event._mentions || [] }], data.self_id)
-      Bot.makeLog('debug', ['全量消息文本诊断', {
-        raw_message: data.raw_message,
-        raw_json: JSON.stringify(data.raw_message),
-        message: data.message,
-        char_codes: [...String(data.raw_message || '')].map(i => i.charCodeAt(0))
-      }], data.self_id)
-      await this.debugFullMessagePluginRules(data)
       if (mentionState.shouldNotifyAll) {
         Bot.makeLog('info', `[${data.self_id}] 全量消息@全体通知：[${data.group_id}, ${data.group_openid || '-'}, ${data.user_id}] ${data.raw_message}`, data.self_id)
         try {
@@ -3257,33 +3250,6 @@ const adapter = new class QQBotAdapter {
       }
       if (!mentionState.shouldDispatch) return false
       data.atBot = true
-    }
-  }
-
-  async debugFullMessagePluginRules (data) {
-    try {
-      const loader = (await import(`file://${process.cwd()}/lib/plugins/loader.js`)).default
-      const msg = String(data.raw_message || '')
-      const plugins = loader.priority || []
-      const matched = []
-
-      for (const item of plugins) {
-        const rules = item.plugin?.rule || []
-        for (const rule of rules) {
-          const reg = rule.reg instanceof RegExp ? rule.reg : new RegExp(rule.reg)
-          reg.lastIndex = 0
-          const info = `${item.name || item.plugin?.name || item.key}:${reg}`
-          if (reg.test(msg)) matched.push(info)
-        }
-      }
-
-      Bot.makeLog('debug', ['全量消息规则诊断', {
-        msg,
-        plugin_count: plugins.length,
-        matched
-      }], data.self_id)
-    } catch (err) {
-      Bot.makeLog('debug', ['全量消息规则诊断失败', err.message], data.self_id)
     }
   }
 
