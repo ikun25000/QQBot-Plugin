@@ -273,7 +273,8 @@ function makeVirtualAtId (selfId = '', openid = '') {
 
 function getLastMentionVirtualAtId (selfId = '', mentions = []) {
   if (!Array.isArray(mentions) || !mentions.length) return ''
-  const mention = mentions[mentions.length - 1]
+  const mention = mentions.find(item => item?.bot !== true) ?? mentions[mentions.length - 1]
+  if (mention?.is_you === true) return ''
   const openid = mention?.id || mention?.member_openid || mention?.user_openid || ''
   return openid ? makeVirtualAtId(selfId, openid) : ''
 }
@@ -284,14 +285,10 @@ function getLastMentionOpenidFromText (text = '') {
 }
 
 function getVirtualAtIdFromEvent (selfId = '', event = {}) {
-  const fromMentions = getLastMentionVirtualAtId(selfId, event._mentions || event.mentions || event.raw?._mentions || event.raw?.mentions)
-  if (fromMentions) return fromMentions
+  const mentions = event._mentions || event.mentions || event.raw?._mentions || event.raw?.mentions
+  if (Array.isArray(mentions) && mentions.length) return getLastMentionVirtualAtId(selfId, mentions)
   const openid = getLastMentionOpenidFromText(event._rawContent || event.raw?._rawContent || event.raw?.content || event.content || event.raw_message || '')
   if (openid) return makeVirtualAtId(selfId, openid)
-  if (event._qqbotRawEvent === 'GROUP_AT_MESSAGE_CREATE' || event.qqbotRawEvent === 'GROUP_AT_MESSAGE_CREATE' || event.raw?._qqbotRawEvent === 'GROUP_AT_MESSAGE_CREATE' || event.raw?.qqbotRawEvent === 'GROUP_AT_MESSAGE_CREATE') {
-    const userOpenid = event.user_id || event.userid || event.author?.id || event.author?.member_openid || event.raw?.user_id || event.raw?.userid || event.raw?.author?.id || event.raw?.author?.member_openid || ''
-    return userOpenid ? makeVirtualAtId(selfId, userOpenid) : ''
-  }
   return ''
 }
 
@@ -3427,7 +3424,7 @@ const adapter = new class QQBotAdapter {
     if (data.raw && data.reply_id) data.raw.reply_id = data.reply_id
     data.source = data.reply_id ? { seq: 0 } : undefined
 
-    if (data.message_type === 'group' || (data.message_type === 'private' && data.sub_type === 'friend')) {
+    if ((data.message_type === 'group' && event._qqbotFullMessageCreate === true) || (data.message_type === 'private' && data.sub_type === 'friend')) {
       const atId = getVirtualAtIdFromEvent(id, event)
       if (atId) {
         data.at = atId
