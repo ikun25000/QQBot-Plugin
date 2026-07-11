@@ -812,7 +812,10 @@ function patchGroupMessageCreateEvent () {
     if (!QQBotClass.prototype._qqbotFullMessageDispatchPatched) {
       const originalDispatchEvent = QQBotClass.prototype.dispatchEvent
       QQBotClass.prototype.dispatchEvent = function (event, wsRes) {
-        if (wsRes?.d && typeof event === 'string') wsRes.d._qqbotRawEvent = event
+        if (wsRes?.d && typeof event === 'string') {
+          wsRes.d._qqbotRawEvent = event
+          if (typeof wsRes.d.content === 'string' && typeof wsRes.d._rawContent !== 'string') wsRes.d._rawContent = wsRes.d.content
+        }
         return originalDispatchEvent.call(this, event, wsRes)
       }
       QQBotClass.prototype._qqbotFullMessageDispatchPatched = true
@@ -823,7 +826,7 @@ function patchGroupMessageCreateEvent () {
       const GroupMessageEvent = messageModule.GroupMessageEvent
       const parseGroupMessageFallback = function (payload, isFullGroupMessage = false) {
         if (typeof payload?.content === 'string') {
-          payload._rawContent = payload.content
+          if (typeof payload._rawContent !== 'string') payload._rawContent = payload.content
           payload.content = normalizeQQBotContentByConfig(payload.content, this.config?.real_self_id || this.self_id || '', [this.nickname, this._qqbotNickname], payload.mentions)
         }
         if (payload?.timestamp) payload._rawTimestamp = payload.timestamp
@@ -859,7 +862,7 @@ function patchGroupMessageCreateEvent () {
         const isFullGroupMessage = payload?._qqbotRawEvent === 'GROUP_MESSAGE_CREATE'
         if (isFullGroupMessage) return parseGroupMessageFallback.call(this, payload, true)
         if (typeof payload?.content === 'string') {
-          payload._rawContent = payload.content
+          if (typeof payload._rawContent !== 'string') payload._rawContent = payload.content
           payload.content = normalizeQQBotContentByConfig(payload.content, this.config?.real_self_id || this.self_id || '', [this.nickname, this._qqbotNickname], payload.mentions)
         }
         if (payload?.timestamp) payload._rawTimestamp = payload.timestamp

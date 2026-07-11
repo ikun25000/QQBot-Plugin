@@ -371,7 +371,8 @@ function getFullMessageMentionState (config, event, selfId = '') {
   const botSelfId = selfId || event.self_id || event.bot?.uin || event.bot?.config?.real_self_id || event.raw?.self_id || ''
   const fullMessage = ensureFullMessageConfig(config, botSelfId)
   const mentions = event._mentions || event.raw?._mentions || []
-  const content = event._rawContent || event.raw?._rawContent || event.raw?.content || event.content || ''
+  const rawContent = event._rawContent ?? event.raw?._rawContent
+  const content = typeof rawContent === 'string' ? rawContent : (event.raw?.content || event.content || '')
   const isAllMention = mentions.some(item => item.scope === 'all') && content.includes('<@all>')
   const author = event.author || event.raw?.author || {}
   const groupOpenid = event.group_openid || event.raw?.group_openid || event.group_id || ''
