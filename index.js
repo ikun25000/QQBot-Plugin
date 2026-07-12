@@ -1215,7 +1215,7 @@ const adapter = new class QQBotAdapter {
 
     if (!forceSilk && !getBotConfigValue(selfId, 'forceSilk')) {
       const ext = typeof file === 'string' ? file.split('?')[0].split('.').pop()?.toLowerCase() : ''
-      if (['silk', 'wav', 'mp3', 'flac'].includes(ext)) return file
+      if (['silk', 'wav', 'mp3', 'flac', 'm4a'].includes(ext)) return file
     }
 
     const inputFile = join('temp', randomUUID())
