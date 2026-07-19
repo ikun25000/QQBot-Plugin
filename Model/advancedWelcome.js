@@ -41,6 +41,19 @@ function formatLimit (value) { return Number(value) > 0 ? `${Number(value)}次` 
 
 function formatLimitValue (value) { return Number(value) > 0 ? `${Number(value)}` : '无限' }
 
+function getAdvancedWelcomeStatusText (item = {}) {
+  const state = item.disabled ? '关闭' : '开启'
+  const sourceMap = { developer: '开发者', group_manager: '群内管理', system: '系统' }
+  const source = sourceMap[item.switch_source]
+  return source ? `${state}（${source}）` : state
+}
+
+function getFullMessageStatusText (item = {}) {
+  if (item.full_message_active !== true) return '不可用'
+  const count = Number(item.full_message_create_count) || 0
+  return `可用${count > 0 ? `，已统计${count}次` : ''}`
+}
+
 function getAdvancedWelcomeRecommendButtonJson (selfId = '') {
   return JSON.stringify({
     rows: [
@@ -300,11 +313,11 @@ function getAdvancedWelcomeListMsg (config, selfId = '', type = 'all', page = 1,
     const counts = advancedWelcomeStore.getSentWindowCounts(item.self_id, item.group_openid)
     lines.push('```text')
     lines.push(`${(page - 1) * pageSize + index + 1}. ${item.group_openid}`)
-    lines.push(`状态: ${item.disabled ? '关闭' : '开启'}`)
+    lines.push(`状态: ${getAdvancedWelcomeStatusText(item)}`)
     lines.push(`额度: 总${counts.total}/${formatLimit(aw.totalLimit)} 天${counts.day}/${formatLimit(aw.dayLimit)} 周${counts.week}/${formatLimit(aw.weekLimit)}`)
     lines.push(`短期: 5时: ${counts.hour5}/${formatLimitValue(aw.hour5Limit)} 1时: ${counts.hour1}/${formatLimitValue(aw.hour1Limit)} 5分: ${counts.min5}/${formatLimitValue(aw.min5Limit)} 1分: ${counts.min1}/${formatLimitValue(aw.min1Limit)}`)
     lines.push(`加群/退群: ${item.join_count || 0}/${item.leave_count || 0}`)
-    lines.push(`全量群消息状态: ${item.full_message_active ? '可用' : '不可用'}，已统计${item.full_message_create_count || 0}次`)
+    lines.push(`全量群消息状态: ${getFullMessageStatusText(item)}`)
     lines.push(`发送/失败: ${item.sent_count || 0}/${item.failed_count || 0}`)
     lines.push(`连续错误: ${item.consecutive_failed_count || 0}`)
     lines.push(`投诉/撤回: ${complaints}/${withdrawn}`)
@@ -372,5 +385,7 @@ export {
   getAdvancedWelcomeMenuButtons,
   getAdvancedWelcomeMenuMsg,
   getAdvancedWelcomeRecommendButtonJson,
+  getAdvancedWelcomeStatusText,
+  getFullMessageStatusText,
   replaceWelcomeVariables
 }

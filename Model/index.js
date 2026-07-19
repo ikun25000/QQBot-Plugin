@@ -5,11 +5,11 @@ import Runtime from '../../../lib/plugins/runtime.js'
 import Handler from '../../../lib/plugins/handler.js'
 import { config, configSave, refConfig } from './config.js'
 import { clearFullMessageRecords, ensureFullMessageConfig, getBotNicknameFromConfigOrStore, getMemberNicknameFromStore, getFullMessageAllNotifyMsg, getFullMessageBlackMenuButtons, getFullMessageBlackMenuMsg, getFullMessageBlackResultButtons, getFullMessageBotLimitButtons, getFullMessageBotLimitMsg, getFullMessageClearConfirmButtons, getFullMessageClearConfirmMsg, getFullMessageMentionState, getFullMessageRecordsButtons, getFullMessageRecordsMsg, getFullMessageStatusButtons, getFullMessageStatusMsg, initFullMessageStore, isFullMessageGroupBlacklisted, isFullMessageGroupRecorded, recordFullMessageGroup, recordMemberNickname, setFullMessageBlackGroup, setFullMessageBotLimitConfig, setFullMessageBotLimitEnabled, setFullMessageIgnoreAllAt, setFullMessageIgnoreBotAt, setFullMessageIgnoreBotMaster, setFullMessageOption, switchFullMessageDB } from './fullMessage.js'
-import { ensureIcebreakerConfig, ensureRecallConfig, getIcebreakerMenuMsg, getIcebreakerMenuButtons, getRecallMenuMsg, getRecallMenuButtons, getRecallOverviewMsg, getRecallOverviewButtons, getRecallListMsg, getRecallListButtons, initInviteStore, switchInviteDB } from './icebreaker.js'
+import { ensureIcebreakerConfig, ensureRecallConfig, getIcebreakerMenuMsg, getIcebreakerMenuButtons, getRecallMenuMsg, getRecallMenuButtons, getRecallConfigMsg, getRecallConfigButtons, getRecallOverviewMsg, getRecallOverviewButtons, getRecallListMsg, getRecallListButtons, initInviteStore, switchInviteDB } from './icebreaker.js'
 import inviteStore from './inviteStore.js'
 import chatStore from './chatStore.js'
 import userManageStore from './userManageStore.js'
-import { advancedWelcomeStore, buttonTextWarnings, checkAdvancedWelcomeSend, ensureAdvancedWelcomeConfig, getAdvancedWelcomeAutoCloseMenuButtons, getAdvancedWelcomeAutoCloseMenuMsg, getAdvancedWelcomeListButtons, getAdvancedWelcomeListMsg, getAdvancedWelcomeLimitMenuButtons, getAdvancedWelcomeLimitMenuMsg, getAdvancedWelcomeMenuButtons, getAdvancedWelcomeMenuMsg, getAdvancedWelcomeRecommendButtonJson, replaceWelcomeVariables } from './advancedWelcome.js'
+import { advancedWelcomeStore, buttonTextWarnings, checkAdvancedWelcomeSend, ensureAdvancedWelcomeConfig, getAdvancedWelcomeAutoCloseMenuButtons, getAdvancedWelcomeAutoCloseMenuMsg, getAdvancedWelcomeListButtons, getAdvancedWelcomeListMsg, getAdvancedWelcomeLimitMenuButtons, getAdvancedWelcomeLimitMenuMsg, getAdvancedWelcomeMenuButtons, getAdvancedWelcomeMenuMsg, getAdvancedWelcomeRecommendButtonJson, getAdvancedWelcomeStatusText, getFullMessageStatusText, replaceWelcomeVariables } from './advancedWelcome.js'
 
 export {
   Dau,
@@ -59,6 +59,8 @@ export {
   getIcebreakerMenuButtons,
   getRecallMenuMsg,
   getRecallMenuButtons,
+  getRecallConfigMsg,
+  getRecallConfigButtons,
   getRecallOverviewMsg,
   getRecallOverviewButtons,
   getRecallListMsg,
@@ -81,5 +83,7 @@ export {
   getAdvancedWelcomeMenuButtons,
   getAdvancedWelcomeMenuMsg,
   getAdvancedWelcomeRecommendButtonJson,
+  getAdvancedWelcomeStatusText,
+  getFullMessageStatusText,
   replaceWelcomeVariables
 }

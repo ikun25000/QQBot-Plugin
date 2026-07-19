@@ -53,6 +53,8 @@ import {
   getIcebreakerMenuButtons,
   getRecallMenuMsg,
   getRecallMenuButtons,
+  getRecallConfigMsg,
+  getRecallConfigButtons,
   getRecallOverviewMsg,
   getRecallOverviewButtons,
   getRecallListMsg,
@@ -74,6 +76,8 @@ import {
   getAdvancedWelcomeMenuButtons,
   getAdvancedWelcomeMenuMsg,
   getAdvancedWelcomeRecommendButtonJson,
+  getAdvancedWelcomeStatusText,
+  getFullMessageStatusText,
   replaceWelcomeVariables
 } from './Model/index.js'
 import { createRequire } from 'module'
@@ -665,6 +669,13 @@ function isQQBotIpWhitelistError (data) {
   const message = String(data?.response?.data?.message || data?.message || data?.msg || data || '')
   const code = Number(data?.response?.data?.code || data?.response?.data?.err_code || data?.code || data?.err_code)
   return code === 11298 || code === 40023002 || message.includes('接口访问源IP不在白名单') || message.includes('不在白名单')
+}
+
+function isQQBotTokenExpiredError (data) {
+  const body = data?.response?.data || data?.data || data || {}
+  const message = String(body?.message || body?.msg || data?.message || data?.msg || data || '')
+  const code = Number(body?.code || body?.err_code || data?.code || data?.err_code || String(message).match(/code\((\d+)\)/i)?.[1])
+  return code === 11244 || message.includes('code(11244)')
 }
 
 function isQQBotSdkError (data) {
@@ -3825,12 +3836,17 @@ const adapter = new class QQBotAdapter {
     return item
   }
 
-  async _sendWakeupMessage (selfId, userOpenid, mdOverride, buttonOverride, buttonEnabledOverride, force = false) {
+  async _sendWakeupMessage (selfId, userOpenid, mdOverride, buttonOverride, buttonEnabledOverride, force = false, active = false, retry = false) {
     const bot = Bot[selfId]
     if (!bot || bot.disabledRuntime || bot.readOnlyMode) return { success: false, error: 'bot不可用' }
 
-    // 周期检查（非强制模式）
-    if (!force) {
+    const c2cUser = inviteStore.getC2cUser(selfId, userOpenid)
+    if (c2cUser?.friendDeleted) {
+      return { success: false, error: '用户已删除好友，跳过发送', skipped: true, friendDeleted: true }
+    }
+
+    // 主动模式不属于召回，不读取或修改召回周期。
+    if (!active && !force && !retry) {
       const periodCheck = inviteStore.isWakeupSentInPeriod(selfId, userOpenid)
       if (periodCheck.expired) {
         return { success: false, error: '用户超过30天，不可召回', skipped: true }
@@ -3840,25 +3856,19 @@ const adapter = new class QQBotAdapter {
       }
     }
 
-    const c2cUser = inviteStore.getC2cUser(selfId, userOpenid)
-    if (c2cUser?.friendDeleted) {
-      return { success: false, error: '用户已删除好友，不可召回', skipped: true, friendDeleted: true }
-    }
-
     const rc = ensureRecallConfig(config, selfId)
     const md = mdOverride || rc.markdown || ''
     const btnEnabled = typeof buttonEnabledOverride === 'boolean' ? buttonEnabledOverride : rc.buttonEnabled
     const btn = buttonOverride || rc.button
-    const isRaw = config.markdown?.[selfId] === 'raw'
 
     const payload = {
       msg_type: 0,
       content: md || '。',
-      msg_seq: Math.floor(Math.random() * 1000000) + 1,
-      is_wakeup: true
+      msg_seq: Math.floor(Math.random() * 1000000) + 1
     }
+    if (!active) payload.is_wakeup = true
 
-    if (isRaw && md) {
+    if (md) {
       payload.msg_type = 2
       payload.markdown = { content: md }
       delete payload.content
@@ -3872,28 +3882,33 @@ const adapter = new class QQBotAdapter {
     }
 
     try {
-      const attemptPeriod = inviteStore.getUserWakeupPeriod(selfId, userOpenid)
+      const attemptPeriod = active ? null : inviteStore.getUserWakeupPeriod(selfId, userOpenid)
       if (attemptPeriod !== null) inviteStore.markWakeupAttempt(selfId, userOpenid, attemptPeriod)
       const { data: result } = await bot.sdk.request.post(`/v2/users/${userOpenid}/messages`, payload)
-      Bot.makeLog('info', [`[${selfId}] 召回消息发送成功`, { userOpenid, id: result?.id }], selfId)
-      // 记录周期
-      const period = inviteStore.getUserWakeupPeriod(selfId, userOpenid)
+      Bot.makeLog('info', [`[${selfId}] ${active ? '主动' : '召回'}消息发送成功`, { userOpenid, id: result?.id }], selfId)
+      const period = active ? null : inviteStore.getUserWakeupPeriod(selfId, userOpenid)
       if (period !== null) {
         inviteStore.markWakeupSent(selfId, userOpenid, period, result?.timestamp || '')
       }
       return { success: true, data: result }
     } catch (err) {
-      const errCode = err.response?.data?.err_code || err.response?.data?.code || 0
-      const errMsg = err.response?.data?.message || err.message || ''
-      Bot.makeLog('warn', [`[${selfId}] 召回消息发送失败`, userOpenid, errMsg, err.response?.data], selfId)
+      const rawErrMsg = err.response?.data?.message || err.message || ''
+      const errCode = Number(err.response?.data?.err_code || err.response?.data?.code || String(rawErrMsg).match(/code\((\d+)\)/i)?.[1]) || 0
+      const errMsg = errCode === 40034100
+        ? '主动消息发送超过频控限制'
+        : errCode === 40054004
+          ? '无好友关系，已标记为删除好友'
+          : rawErrMsg
+      if (errCode === 40054004) inviteStore.markC2cFriendDeleted(selfId, userOpenid)
+      Bot.makeLog('warn', [`[${selfId}] ${active ? '主动' : '召回'}消息发送失败`, userOpenid, errMsg, err.response?.data], selfId)
 
-      const period = inviteStore.getUserWakeupPeriod(selfId, userOpenid)
+      const period = active ? null : inviteStore.getUserWakeupPeriod(selfId, userOpenid)
       if (period !== null) {
         inviteStore.markWakeupFailed(selfId, userOpenid, period, errCode, errMsg)
       }
 
       // 记录特定错误
-      if (errCode === 40034122 || errCode === 40054013) {
+      if (!active && (errCode === 40034122 || errCode === 40054013)) {
         inviteStore.markWakeupError(selfId, userOpenid, errCode, errMsg)
       }
 
@@ -3903,6 +3918,9 @@ const adapter = new class QQBotAdapter {
         errCode,
         blocked: errCode === 40054013,
         periodExceeded: errCode === 40034122,
+        rateLimited: errCode === 40034100,
+        skipped: errCode === 40054004,
+        friendDeleted: errCode === 40054004,
         data: err.response?.data
       }
     }
@@ -4007,6 +4025,12 @@ const adapter = new class QQBotAdapter {
       case 'add':
       case 'delete':
         if (event.notice_type === 'friend') {
+          const userOpenid = event.user_id || event.operator_id || event.raw?.user_id || event.raw?.operator_id || ''
+          const timestamp = event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || ''
+          if (userOpenid) {
+            if (event.sub_type === 'add') inviteStore.recordC2cUser(data.self_id, userOpenid, event.raw?.event_id || event.event_id || '', timestamp)
+            else inviteStore.markC2cFriendDeleted(data.self_id, userOpenid, timestamp)
+          }
           Bot[data.self_id].dau.setDau(event.sub_type === 'add' ? 'friend_add' : 'friend_delete', data)
           Bot.em(`${data.post_type}.${data.notice_type}.${data.sub_type}`, data)
         }
@@ -5191,6 +5215,29 @@ async connect (token) {
     }
     return config
   })
+  const originalSdkRequest = Bot[id].sdk.request.request.bind(Bot[id].sdk.request)
+  const refreshAccessTokenImmediately = async () => {
+    if (!Bot[id].tokenRefreshPromise) {
+      Bot[id].tokenRefreshPromise = tokenSessionManager.getAccessToken()
+        .finally(() => { Bot[id].tokenRefreshPromise = null })
+    }
+    return Bot[id].tokenRefreshPromise
+  }
+  Bot[id].sdk.request.request = async function (configOrUrl, requestConfig) {
+    try {
+      return await originalSdkRequest(configOrUrl, requestConfig)
+    } catch (err) {
+      if (!isQQBotTokenExpiredError(err)) throw err
+      Bot.makeLog('warn', [`[${id}] API 返回 11244，立即刷新 Token 后重试一次`], id)
+      try {
+        await refreshAccessTokenImmediately()
+      } catch (refreshErr) {
+        Bot.makeLog('error', [`[${id}] 11244 后刷新 Token 失败`, refreshErr.message], id)
+        throw err
+      }
+      return originalSdkRequest(configOrUrl, requestConfig)
+    }
+  }
   // ===== getAccessToken 拦截结束 =====
 
   // 捕获初次登录失败，不抛出错误，交由掉线检测处理
@@ -5661,6 +5708,11 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
+          reg: /^#q+bot开始召回$/i,
+          fnc: 'recallOverview',
+          permission: config.permission
+        },
+        {
           reg: /^#q+bot召回删除(?:\s+(可召回|不可召回|全部)(?:\s+确认)?)?$/i,
           fnc: 'recallDelete',
           permission: config.permission
@@ -5676,7 +5728,7 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
-          reg: /^#q+bot单独召回\s+(\S+)(?:\s+强制)?$/i,
+          reg: /^#q+bot单独召回\s+\S+(?:\s+(?:强制|主动)){0,2}$/i,
           fnc: 'recallSingle',
           permission: config.permission
         },
@@ -5691,13 +5743,43 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
-          reg: /^#q+bot全部召回确认(?:\s+强制)?$/i,
+          reg: /^#q+bot全部召回确认(?:\s+(?:强制|主动)){0,2}$/i,
           fnc: 'recallBatchConfirm',
           permission: config.permission
         },
         {
-          reg: /^#q+bot召回设置(?:\s+([\s\S]+))?$/i,
+          reg: /^#q+bot召回(?:设置|配置)(?:\s+([\s\S]+))?$/i,
           fnc: 'recallSetting',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot召回不可召回主动(?:\s+(?:\d+|设置数量\s+\d+|确认))?$/i,
+          fnc: 'recallCannotActive',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot召回结果(?:\s+(\d+))?$/i,
+          fnc: 'recallResults',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot召回失败重发\s+(\d+)(?:\s+确认)?$/i,
+          fnc: 'recallRetryFailures',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot召回结果删除(?:\s+(?:\d+|全部)(?:\s+确认)?)?$/i,
+          fnc: 'recallDeleteResult',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot召回成功(?:\s+(\d+))?$/i,
+          fnc: 'recallSuccesses',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot召回失败(?:\s+(\d+))?$/i,
+          fnc: 'recallFailures',
           permission: config.permission
         },
         {
@@ -6081,7 +6163,8 @@ export class QQBotAdapter extends plugin {
     } else {
       lines.push('```text')
       data.list.forEach((item, index) => {
-        lines.push(`${data.start + index + 1}. ${item.openid} ${item.count}次 ${formatRankTime(item.time)}`)
+        const nickname = String(getMemberNicknameFromStore(this.e.self_id, item.openid) || userManageStore.getUser(this.e.self_id, item.openid)?.nickname || '').replace(/\s+/g, ' ').trim()
+        lines.push(`${data.start + index + 1}. ${nickname ? `${nickname} ${item.openid}` : item.openid} ${item.count}次 ${formatRankTime(item.time)}`)
       })
       lines.push('```')
     }
@@ -6396,8 +6479,18 @@ export class QQBotAdapter extends plugin {
     }
     if (/删除群聊缓存发言/i.test(msg)) {
       if (/确认/i.test(msg)) {
-        const count = await userManageStore.clearGroupHistories(this.e.self_id)
-        this.reply(`已删除全部群聊最近发言缓存，共 ${count} 条`, true)
+        const result = await userManageStore.clearGroupHistories(this.e.self_id)
+        this.reply([
+          `#[${this.e.self_id}] 群聊缓存清理完成`,
+          '',
+          `>已清空 ${result.groupCount} 个群的 ${result.messageCount} 条最近发言`,
+          '',
+          '>已删除: raw、发言文本、消息ID、发送者及时间等历史内容',
+          '',
+          '>已保留: 每个群的 seq 计数、群资料、用户资料和其他管理数据',
+          '',
+          '>QQBot查看所有群最近发言 中的旧内容已全部清空'
+        ].join('\n'), true)
         return
       }
       this.reply([
@@ -7381,7 +7474,7 @@ export class QQBotAdapter extends plugin {
     const disabled = match[1] === '关闭'
     const groupOpenid = match[2]
     const existed = !!advancedWelcomeStore.getGroup(this.e.self_id, groupOpenid)
-    await advancedWelcomeStore.setGroupDisabled(this.e.self_id, groupOpenid, disabled)
+    await advancedWelcomeStore.setGroupDisabled(this.e.self_id, groupOpenid, disabled, 'developer')
     this.reply(`[${this.e.self_id}] ${existed ? '已' : '群记录不存在，已提前'}${disabled ? '关闭' : '开启'}群 ${groupOpenid} 的高级群欢迎推送`, true)
   }
 
@@ -7404,13 +7497,13 @@ export class QQBotAdapter extends plugin {
       '',
       `>群openid: ${groupOpenid}`,
       '',
-      `>状态: ${item.disabled ? '关闭' : '开启'}`,
+      `>状态: ${getAdvancedWelcomeStatusText(item)}`,
       '',
       `>加群/退群: ${item.join_count || 0}/${item.leave_count || 0}`,
       '',
       `>发送/失败: ${item.sent_count || 0}/${item.failed_count || 0}`,
       '',
-      `>全量群消息状态: ${item.full_message_active ? '可用' : '不可用'}，已统计${item.full_message_create_count || 0}次`,
+      `>全量群消息状态: ${getFullMessageStatusText(item)}`,
       '',
       `>额度: 总 ${counts.total}/${Number(aw.totalLimit) > 0 ? aw.totalLimit : '无限'}，天 ${counts.day}/${Number(aw.dayLimit) > 0 ? aw.dayLimit : '无限'}，周 ${counts.week}/${Number(aw.weekLimit) > 0 ? aw.weekLimit : '无限'}`,
       '',
@@ -7421,8 +7514,7 @@ export class QQBotAdapter extends plugin {
       `>最近失败: ${item.last_failed_reason || '-'}`,
       '',
       '```text',
-      `开启用户/时间: ${item.switch_time ? `操作时间 ${item.switch_time}` : '-'}`,
-      `关闭用户/时间: ${item.switch_time ? `操作时间 ${item.switch_time}` : '-'}`,
+      `最近开关: ${item.switch_time ? `${getAdvancedWelcomeStatusText(item)} ${item.switch_time}` : '-'}`,
       `投诉用户(${complaints.length}):`,
       ...(complaints.length ? complaints.map(i => `${i.user_openid || '-'} ${i.time || ''}`) : ['-']),
       `撤回投诉用户(${withdrawn.length}):`,
@@ -7550,7 +7642,7 @@ export class QQBotAdapter extends plugin {
         this.reply(`当前群已经${action === '关闭' ? '关闭' : '开启'}通知`, true)
         return
       }
-      await advancedWelcomeStore.setGroupDisabled(this.e.self_id, groupOpenid, action === '关闭')
+      await advancedWelcomeStore.setGroupDisabled(this.e.self_id, groupOpenid, action === '关闭', 'group_manager')
       const cmd = `#我要${action === '关闭' ? '开启' : '关闭'}通知 ${this.e.self_id}`
       this.reply([action === '关闭' ? '成功关闭，如果误操作可以撤回' : '成功开启当前群的欢迎推送', segment.button([{ text: action === '关闭' ? '我要开启' : '我要关闭', callback: cmd }])], true)
       return
@@ -7692,19 +7784,38 @@ export class QQBotAdapter extends plugin {
 
   async recallSingle () {
     if (!this.guardOfficialBot()) return true
-    const match = /^#q+bot单独召回\s+(\S+)(?:\s+(强制))?$/i.exec(this.e.msg)
+    const match = /^#q+bot单独召回\s+(\S+)((?:\s+(?:强制|主动)){0,2})$/i.exec(this.e.msg)
     if (!match?.[1]) return
     const openid = match[1]
-    const force = match[2] === '强制'
-    // 校验 openid 是否存在
+    const options = match[2].trim().split(/\s+/).filter(Boolean)
+    const force = options.includes('强制')
+    const active = options.includes('主动')
+    if (force && active) {
+      this.reply(`[${this.e.self_id}] 主动发送不能与强制召回同时使用，请二选一`, true)
+      return
+    }
     const user = inviteStore.getC2cUser(this.e.self_id, openid)
     if (!user) {
       this.reply(`[${this.e.self_id}] openid 不存在于记录中: ${openid}`, true)
       return
     }
-    const result = await adapter._sendWakeupMessage(this.e.self_id, openid, undefined, undefined, undefined, force)
+    const result = await adapter._sendWakeupMessage(this.e.self_id, openid, undefined, undefined, undefined, force, active)
+    const time = new Date().toISOString()
+    await inviteStore.saveRecallRun(this.e.self_id, {
+      mode: active ? 'active' : force ? 'force' : 'wakeup',
+      title: active ? '单独主动发送' : '单独召回',
+      started_at: time,
+      finished_at: time,
+      elapsed_seconds: 0,
+      total: 1,
+      success_count: result.success ? 1 : 0,
+      failed_count: result.success ? 0 : 1,
+      skipped_count: result.skipped ? 1 : 0,
+      successes: result.success ? [{ openid, time }] : [],
+      failures: result.success ? [] : [{ openid, reason: result.error || '发送失败', code: result.errCode || 0, skipped: result.skipped === true, time }]
+    })
     if (result.success) {
-      this.reply(`[${this.e.self_id}] 召回消息已发送: ${openid}`, true)
+      this.reply(`[${this.e.self_id}] ${active ? '主动消息' : '召回消息'}已发送: ${openid}`, true)
     } else if (result.skipped) {
       this.reply(`[${this.e.self_id}] 跳过: ${openid}\n${result.error}\n使用 #QQBot单独召回 ${openid} 强制 可强制发送`, true)
     } else if (result.blocked) {
@@ -7712,8 +7823,40 @@ export class QQBotAdapter extends plugin {
     } else if (result.periodExceeded) {
       this.reply(`[${this.e.self_id}] 召回消息已达区间上限: ${openid}`, true)
     } else {
-      this.reply(`[${this.e.self_id}] 召回失败: ${openid}\n${result.error || ''}`, true)
+      this.reply(`[${this.e.self_id}] ${active ? '主动发送' : '召回'}失败: ${openid}\n${result.error || ''}`, true)
     }
+  }
+
+  _replyRecallBatchConfirm (requestedCount, maxCount, actualCount) {
+    const rc = ensureRecallConfig(config, this.e.self_id)
+    this.reply([
+      [
+        `#[${this.e.self_id}] 全部召回确认`,
+        '',
+        `>请求数量: ${requestedCount}`,
+        '',
+        `>可召回最大数量: ${maxCount}`,
+        '',
+        `>本次执行数量: ${actualCount}`,
+        '',
+        `>发送节奏: 每批${rc.batchSize}条，批次间隔${rc.sendDelaySeconds}秒`,
+        '',
+        '>“确认主动”只影响本次任务，不保存为默认模式。',
+        '',
+        '><qqbot-cmd-input text="#QQBot全部召回确认" show="确认执行"/>',
+        '',
+        '><qqbot-cmd-input text="#QQBot全部召回确认 主动" show="确认执行（主动）"/>',
+        '',
+        '><qqbot-cmd-input text="#QQBot全部召回确认 强制" show="强制执行"/>',
+        '',
+        `><qqbot-cmd-input text="#QQBot全部召回修改 ${actualCount}" show="修改数量"/>`
+      ].join('\n'),
+      segment.button(...limitButtonRows([
+        [{ text: '确认执行', callback: '#QQBot全部召回确认' }, { text: '确认主动', callback: '#QQBot全部召回确认 主动' }],
+        [{ text: '强制执行', callback: '#QQBot全部召回确认 强制' }, { text: '修改数量', input: '#QQBot全部召回修改 ' }],
+        [{ text: '返回', callback: '#QQBot召回查看' }]
+      ]))
+    ], true)
   }
 
   async recallBatchSetCount () {
@@ -7733,37 +7876,7 @@ export class QQBotAdapter extends plugin {
     rc.batchCount = actualCount
     await configSave()
 
-    this.reply([
-      [
-        `#[${this.e.self_id}] 全部召回确认`,
-        '',
-        `>请求数量: ${count}`,
-        '',
-        `>可召回最大数量: ${maxCount}`,
-        '',
-        `>本次执行数量: ${actualCount}`,
-        '',
-        '>确认后将按当前可召回列表顺序发送召回消息',
-        '',
-        '>超过5分钟完成时，结果将通知主人，不再回复当前会话',
-        '',
-        `><qqbot-cmd-input text="#QQBot全部召回确认" show="确认执行"/>`,
-        '',
-        `><qqbot-cmd-input text="#QQBot全部召回确认 强制" show="强制执行"/>`,
-        '',
-        `><qqbot-cmd-input text="#QQBot全部召回修改 ${actualCount}" show="修改数量"/>`
-      ].join('\n'),
-      segment.button(
-        [
-          { text: '确认执行', callback: '#QQBot全部召回确认' },
-          { text: '强制执行', callback: '#QQBot全部召回确认 强制' }
-        ],
-        [
-          { text: '修改数量', input: '#QQBot全部召回修改 ' },
-          { text: '返回', callback: '#QQBot召回查看' }
-        ]
-      )
-    ], true)
+    this._replyRecallBatchConfirm(count, maxCount, actualCount)
   }
 
   async recallBatchModify () {
@@ -7783,31 +7896,149 @@ export class QQBotAdapter extends plugin {
     rc.batchCount = actualCount
     await configSave()
 
-    this.reply([
-      [
-        `#[${this.e.self_id}] 全部召回确认`,
-        '',
-        `>请求数量: ${count}`,
-        '',
-        `>可召回最大数量: ${maxCount}`,
-        '',
-        `>本次执行数量: ${actualCount}`,
-        '',
-        '>确认后将按当前可召回列表顺序发送召回消息',
-        '',
-        '>超过5分钟完成时，结果将通知主人，不再回复当前会话'
-      ].join('\n'),
-      segment.button(
-        [
-          { text: '确认执行', callback: '#QQBot全部召回确认' },
-          { text: '强制执行', callback: '#QQBot全部召回确认 强制' }
-        ],
-        [
-          { text: '修改数量', input: '#QQBot全部召回修改 ' },
-          { text: '返回', callback: '#QQBot召回查看' }
-        ]
-      )
-    ], true)
+    this._replyRecallBatchConfirm(count, maxCount, actualCount)
+  }
+
+  async _runRecallTask (targets = [], options = {}) {
+    const selfId = this.e.self_id
+    if (!adapter._recallRunning) adapter._recallRunning = new Set()
+    if (adapter._recallRunning.has(selfId)) return { busy: true }
+    adapter._recallRunning.add(selfId)
+    const rc = ensureRecallConfig(config, selfId)
+    const batchSize = rc.batchSize
+    const delayMs = rc.sendDelaySeconds * 1000
+    const startedAt = new Date().toISOString()
+    const startTime = Date.now()
+    const successes = []
+    const failures = []
+    try {
+      for (let index = 0; index < targets.length; index += batchSize) {
+        const batch = targets.slice(index, index + batchSize)
+        const results = await Promise.all(batch.map(async user => {
+          try {
+            return {
+              user,
+              result: await adapter._sendWakeupMessage(selfId, user.openid, undefined, undefined, undefined, options.force === true, options.active === true, options.retry === true)
+            }
+          } catch (err) {
+            const rawError = err.response?.data?.message || err.message || '发送失败'
+            const errCode = Number(err.response?.data?.err_code || err.response?.data?.code || String(rawError).match(/code\((\d+)\)/i)?.[1]) || 0
+            if (errCode === 40054004) inviteStore.markC2cFriendDeleted(selfId, user.openid)
+            return {
+              user,
+              result: {
+                success: false,
+                error: errCode === 40034100 ? '主动消息发送超过频控限制' : errCode === 40054004 ? '无好友关系，已标记为删除好友' : rawError,
+                errCode,
+                skipped: errCode === 40054004,
+                friendDeleted: errCode === 40054004
+              }
+            }
+          }
+        }))
+        for (const { user, result } of results) {
+          const time = new Date().toISOString()
+          if (result.success) {
+            successes.push({ openid: user.openid, time })
+          } else {
+            failures.push({
+              openid: user.openid,
+              reason: result.error || (result.skipped ? '已跳过' : '发送失败'),
+              code: result.errCode || 0,
+              skipped: result.skipped === true,
+              time
+            })
+          }
+        }
+        if (index + batchSize < targets.length && delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs))
+      }
+      const run = await inviteStore.saveRecallRun(selfId, {
+        mode: options.active ? 'active' : options.force ? 'force' : 'wakeup',
+        title: options.title || '全部召回',
+        started_at: startedAt,
+        finished_at: new Date().toISOString(),
+        elapsed_seconds: Math.round((Date.now() - startTime) / 1000),
+        total: targets.length,
+        success_count: successes.length,
+        failed_count: failures.length,
+        skipped_count: failures.filter(item => item.skipped).length,
+        successes,
+        failures
+      })
+      return { run }
+    } finally {
+      adapter._recallRunning.delete(selfId)
+    }
+  }
+
+  _formatRecallRunSummary (run) {
+    const lines = [
+      `#[${run.self_id}] ${run.title}完成`,
+      '',
+      `>方式: ${run.mode === 'active' ? '主动' : run.mode === 'force' ? '强制召回' : '普通召回'}`,
+      '',
+      `>总数: ${run.total}`,
+      '',
+      `>成功: ${run.success_count}`,
+      '',
+      `>失败: ${run.failed_count}`,
+      ''
+    ]
+    if (run.skipped_count) lines.push(`>其中跳过: ${run.skipped_count}`, '')
+    lines.push(
+      `>耗时: ${run.elapsed_seconds}秒`,
+      '',
+      '><qqbot-cmd-input text="#QQBot召回失败 1" show="查看失败详情"/>'
+    )
+    return lines.join('\n')
+  }
+
+  _makeRecallResultPayload (summary, extra = {}) {
+    return {
+      msg_type: 2,
+      markdown: { content: summary },
+      msg_seq: Math.floor(Math.random() * 1000000) + 1,
+      ...extra
+    }
+  }
+
+  async _notifyRecallTaskResult (summary, context = {}) {
+    const bot = Bot[context.selfId]
+    const isGroup = context.messageType === 'group'
+    const targetId = isGroup ? context.groupOpenid : context.userOpenid
+    const url = isGroup ? `/v2/groups/${targetId}/messages` : `/v2/users/${targetId}/messages`
+    const validMs = isGroup ? 5 * 60 * 1000 : 60 * 60 * 1000
+    if (bot && targetId && context.messageId && Date.now() - context.createdAt <= validMs) {
+      try {
+        await bot.sdk.request.post(url, this._makeRecallResultPayload(summary, { msg_id: context.messageId }))
+        return true
+      } catch (err) {
+        Bot.makeLog('warn', ['召回结果回复确认消息失败', err.message], context.selfId)
+      }
+    }
+    if (bot && !isGroup && targetId) {
+      try {
+        await bot.sdk.request.post(url, this._makeRecallResultPayload(summary, { is_wakeup: true }))
+        return true
+      } catch (err) {
+        Bot.makeLog('warn', ['召回结果发送当前私聊召回失败', err.message], context.selfId)
+      }
+    }
+    if (bot && targetId) {
+      try {
+        await bot.sdk.request.post(url, this._makeRecallResultPayload(summary))
+        return true
+      } catch (err) {
+        Bot.makeLog('warn', ['召回结果发送当前环境失败', err.message], context.selfId)
+      }
+    }
+    try {
+      await Bot.sendMasterMsg(summary)
+      return true
+    } catch (err) {
+      Bot.makeLog('error', ['召回结果通知主人失败', err.message], context.selfId)
+      return false
+    }
   }
 
   async recallBatchConfirm () {
@@ -7815,7 +8046,12 @@ export class QQBotAdapter extends plugin {
     const selfId = this.e.self_id
     const rc = ensureRecallConfig(config, selfId)
     const batchCount = rc.batchCount || 0
-    const force = /强制$/i.test(this.e.msg)
+    const force = /\s强制(?:\s|$)/i.test(this.e.msg)
+    const active = /\s主动(?:\s|$)/i.test(this.e.msg)
+    if (force && active) {
+      this.reply(`[${selfId}] 主动发送不能与强制召回同时使用，请二选一`, true)
+      return
+    }
 
     if (!batchCount) {
       this.reply(`[${selfId}] 未设置召回数量，请先使用 #QQBot全部召回设置数量`, true)
@@ -7829,70 +8065,384 @@ export class QQBotAdapter extends plugin {
     }
 
     const targets = canRecall.slice(0, batchCount)
-    const startTime = Date.now()
-
-    let success = 0
-    let fail = 0
-    let skipped = 0
-    let blocked = 0
-    let periodExceeded = 0
-
-    for (const user of targets) {
-      const result = await adapter._sendWakeupMessage(selfId, user.openid, undefined, undefined, undefined, force)
-      if (result.success) {
-        success++
-      } else if (result.skipped) {
-        skipped++
-      } else if (result.blocked) {
-        blocked++
-        fail++
-      } else if (result.periodExceeded) {
-        periodExceeded++
-        fail++
-      } else {
-        fail++
-      }
-      await new Promise(resolve => setTimeout(resolve, 500))
+    const context = {
+      selfId,
+      messageId: this.e.message_id || '',
+      messageType: this.e.message_type || (this.e.group_id ? 'group' : 'private'),
+      groupOpenid: this._groupOpenidFromEvent(),
+      userOpenid: this._userOpenidFromEvent(),
+      createdAt: Date.now()
     }
-
+    let result
+    try {
+      result = await this._runRecallTask(targets, { force, active, title: active ? '全部主动发送' : '全部召回' })
+    } catch (err) {
+      this.reply(`[${selfId}] 召回任务执行失败: ${err.message || err}`, true)
+      return
+    }
+    if (result.busy) {
+      this.reply(`[${selfId}] 当前已有召回任务执行中，请稍后再试`, true)
+      return
+    }
     rc.batchCount = 0
     await configSave()
+    await this._notifyRecallTaskResult(this._formatRecallRunSummary(result.run), context)
+  }
 
-    const elapsed = Math.round((Date.now() - startTime) / 1000)
-    const summary = [
-      `[${selfId}] 全部召回完成`,
-      `成功: ${success}`,
-      `失败: ${fail}`,
-      skipped ? `跳过(已发过): ${skipped}` : '',
-      blocked ? `拉黑: ${blocked}` : '',
-      periodExceeded ? `区间上限: ${periodExceeded}` : '',
-      `耗时: ${elapsed}秒`
-    ].filter(Boolean).join('\n')
-
-    // 被动消息5分钟超时，超时则通知主人
-    if (elapsed > 280) {
-      try {
-        await Bot.sendMasterMsg(`${summary}`)
-      } catch (err) {
-        Bot.makeLog('error', ['全部召回结果通知主人失败', err.message], selfId)
-      }
-    } else {
-      this.reply(summary, true)
+  async recallCannotActive () {
+    if (!this.guardOfficialBot()) return true
+    const msg = String(this.e.msg || '')
+    const rc = ensureRecallConfig(config, this.e.self_id)
+    const countMatch = /\s设置数量\s+(\d+)$/i.exec(msg)
+    const confirmed = /\s确认$/i.test(msg)
+    const requestedPage = Math.max(1, Number(/\s+(\d+)$/i.exec(msg)?.[1]) || 1)
+    const { cannotRecall } = inviteStore.getRecallableList(this.e.self_id)
+    const eligible = cannotRecall.filter(item => item.friendDeleted !== true)
+    if (rc.cannotActiveCount > eligible.length) {
+      rc.cannotActiveCount = eligible.length
+      await configSave()
     }
+    if (countMatch) {
+      const requestedCount = Number(countMatch[1])
+      rc.cannotActiveCount = Math.min(requestedCount, eligible.length)
+      await configSave()
+      if (requestedCount > eligible.length) {
+        this.reply(`[${this.e.self_id}] 输入数量 ${requestedCount} 超过可主动发送数量 ${eligible.length}，已按最大值设置`, true)
+      }
+      this.e.msg = '#QQBot召回不可召回主动'
+      return this.recallCannotActive()
+    }
+    if (!confirmed) {
+      const pageSize = 20
+      const pageCount = Math.max(1, Math.ceil(eligible.length / pageSize))
+      const page = Math.min(requestedPage, pageCount)
+      const start = (page - 1) * pageSize
+      const pageList = eligible.slice(start, start + pageSize)
+      const lines = [
+        `#[${this.e.self_id}] 不可召回主动发送 ${page}/${pageCount}`,
+        '',
+        `>不可召回用户: ${cannotRecall.length}`,
+        '',
+        `>已排除删除好友: ${cannotRecall.length - eligible.length}`,
+        '',
+        `>可主动发送: ${eligible.length}`,
+        '',
+        `>本次已设置数量: ${rc.cannotActiveCount || 0}`,
+        ''
+      ]
+      if (!pageList.length) {
+        lines.push('>暂无非删除好友的不可召回用户')
+      } else {
+        lines.push('```text')
+        pageList.forEach((item, index) => {
+          lines.push(`${start + index + 1}. ${item.openid}`)
+          lines.push(`   原因: ${item.reason || '不可召回'}`)
+        })
+        lines.push('```')
+      }
+      lines.push('', `><qqbot-cmd-input text="#QQBot召回不可召回主动 设置数量 ${eligible.length}" show="设置主动发送数量"/>`)
+      if (rc.cannotActiveCount > 0) lines.push('', '><qqbot-cmd-input text="#QQBot召回不可召回主动 确认" show="确认主动发送"/>')
+      const rows = []
+      const pageRow = []
+      if (page > 1) pageRow.push({ text: '上一页', callback: `#QQBot召回不可召回主动 ${page - 1}` })
+      if (page < pageCount) pageRow.push({ text: '下一页', callback: `#QQBot召回不可召回主动 ${page + 1}` })
+      if (pageRow.length) rows.push(pageRow)
+      rows.push([{ text: '设置数量', input: '#QQBot召回不可召回主动 设置数量 ' }, { text: '查看列表', callback: '#QQBot不可召回列表 1' }])
+      if (rc.cannotActiveCount > 0) rows.push([{ text: '确认主动', callback: '#QQBot召回不可召回主动 确认' }, { text: '返回', callback: '#QQBot召回查看' }])
+      else rows.push([{ text: '返回', callback: '#QQBot召回查看' }])
+      this.reply([
+        lines.join('\n'),
+        segment.button(...limitButtonRows(rows))
+      ], true)
+      return
+    }
+    if (!rc.cannotActiveCount) {
+      this.reply([
+        `#[${this.e.self_id}] 不可召回主动发送\n\n>请先设置本次主动发送数量\n\n><qqbot-cmd-input text="#QQBot召回不可召回主动 设置数量 ${eligible.length}" show="设置主动发送数量"/>`,
+        segment.button(...limitButtonRows([[{ text: '设置数量', input: '#QQBot召回不可召回主动 设置数量 ' }, { text: '返回', callback: '#QQBot召回不可召回主动' }]]))
+      ], true)
+      return
+    }
+    if (!eligible.length) {
+      rc.cannotActiveCount = 0
+      await configSave()
+      this.reply(`[${this.e.self_id}] 当前无非删除好友的不可召回用户`, true)
+      return
+    }
+    const targets = eligible.slice(0, rc.cannotActiveCount)
+    const context = {
+      selfId: this.e.self_id,
+      messageId: this.e.message_id || '',
+      messageType: this.e.message_type || (this.e.group_id ? 'group' : 'private'),
+      groupOpenid: this._groupOpenidFromEvent(),
+      userOpenid: this._userOpenidFromEvent(),
+      createdAt: Date.now()
+    }
+    let result
+    try {
+      result = await this._runRecallTask(targets, { active: true, title: '不可召回主动发送' })
+    } catch (err) {
+      this.reply(`[${this.e.self_id}] 主动发送任务执行失败: ${err.message || err}`, true)
+      return
+    }
+    if (result.busy) {
+      this.reply(`[${this.e.self_id}] 当前已有召回任务执行中，请稍后再试`, true)
+      return
+    }
+    rc.cannotActiveCount = 0
+    await configSave()
+    await this._notifyRecallTaskResult(this._formatRecallRunSummary(result.run), context)
+  }
+
+  _formatRecallResultTime (value = '') {
+    if (!value) return '-'
+    const time = Date.parse(value)
+    if (!Number.isFinite(time)) return String(value)
+    const offset = ensureRecallConfig(config, this.e.self_id).displayTimeOffsetHours
+    return new Date(time + offset * 60 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19)
+  }
+
+  _replyRecallRunList (field = 'failures') {
+    if (!this.guardOfficialBot()) return true
+    const page = Math.max(1, Number(String(this.e.msg || '').match(/\s+(\d+)$/)?.[1]) || 1)
+    const run = inviteStore.getLatestRecallRun(this.e.self_id)
+    const isSuccess = field === 'successes'
+    const list = Array.isArray(run?.[field]) ? run[field] : []
+    const pageSize = 20
+    const pageCount = Math.max(1, Math.ceil(list.length / pageSize))
+    const current = Math.min(page, pageCount)
+    const pageList = list.slice((current - 1) * pageSize, current * pageSize)
+    const command = isSuccess ? '#QQBot召回成功' : '#QQBot召回失败'
+    const title = isSuccess ? '召回成功' : '召回失败'
+    const lines = [
+      `#[${this.e.self_id}] ${title} ${current}/${pageCount}`,
+      '',
+      `>最近任务: ${run?.title || '-'}`,
+      '',
+      `>共 ${list.length} 条`,
+      ''
+    ]
+    if (!pageList.length) {
+      lines.push('>暂无记录')
+    } else {
+      lines.push('```text')
+      pageList.forEach((item, index) => {
+        lines.push(`${(current - 1) * pageSize + index + 1}. ${item.openid}`)
+        lines.push(`   时间: ${this._formatRecallResultTime(item.time)}`)
+        if (!isSuccess) {
+          lines.push(`   原因: ${item.reason || '发送失败'}`)
+          if (item.code) lines.push(`   错误码: ${item.code}`)
+        }
+      })
+      lines.push('```')
+    }
+    const rows = []
+    const pageRow = []
+    if (current > 1) pageRow.push({ text: '上一页', callback: `${command} ${current - 1}` })
+    if (current < pageCount) pageRow.push({ text: '下一页', callback: `${command} ${current + 1}` })
+    if (pageRow.length) rows.push(pageRow)
+    rows.push([{ text: '结果概览', callback: '#QQBot召回结果' }, { text: '召回菜单', callback: '#QQBot召回菜单' }])
+    this.reply([lines.join('\n'), segment.button(...limitButtonRows(rows))], true)
+  }
+
+  recallSuccesses () { return this._replyRecallRunList('successes') }
+  recallFailures () { return this._replyRecallRunList('failures') }
+
+  async recallRetryFailures () {
+    if (!this.guardOfficialBot()) return true
+    const match = /^#q+bot召回失败重发\s+(\d+)(?:\s+(确认))?$/i.exec(String(this.e.msg || ''))
+    if (!match) return
+    const sequence = Number(match[1])
+    const confirmed = match[2] === '确认'
+    const run = inviteStore.getRecallRunBySequence(this.e.self_id, sequence)
+    if (!run) {
+      this.reply(`[${this.e.self_id}] 召回结果序号 ${sequence} 不存在`, true)
+      return
+    }
+    const targets = [...new Set((run.failures || []).filter(item => item?.skipped !== true).map(item => item?.openid).filter(Boolean))].map(openid => ({ openid }))
+    if (!targets.length) {
+      this.reply(`[${this.e.self_id}] 第 ${sequence} 条召回结果没有可重发的失败用户`, true)
+      return
+    }
+    const mode = run.mode === 'active' ? '主动' : run.mode === 'force' ? '强制召回' : '普通召回'
+    if (!confirmed) {
+      this.reply([
+        [
+          `#[${this.e.self_id}] 召回失败重发确认`,
+          '',
+          `>结果序号: ${sequence}`,
+          '',
+          `>原任务: ${run.title || '召回任务'}`,
+          '',
+          `>原方式: ${mode}`,
+          '',
+          `>失败用户: ${targets.length}`,
+          '',
+          '>已通过删除好友事件或无好友关系标记的用户会直接跳过。',
+          '',
+          `><qqbot-cmd-input text="#QQBot召回失败重发 ${sequence} 确认" show="确认重发失败用户"/>`
+        ].join('\n'),
+        segment.button(...limitButtonRows([
+          [{ text: '确认重发', callback: `#QQBot召回失败重发 ${sequence} 确认` }, { text: '返回结果', callback: '#QQBot召回结果 1' }]
+        ]))
+      ], true)
+      return
+    }
+    const context = {
+      selfId: this.e.self_id,
+      messageId: this.e.message_id || '',
+      messageType: this.e.message_type || (this.e.group_id ? 'group' : 'private'),
+      groupOpenid: this._groupOpenidFromEvent(),
+      userOpenid: this._userOpenidFromEvent(),
+      createdAt: Date.now()
+    }
+    let result
+    try {
+      result = await this._runRecallTask(targets, {
+        active: run.mode === 'active',
+        force: run.mode === 'force',
+        retry: run.mode === 'wakeup',
+        title: `${run.title || '召回任务'}失败重发`
+      })
+    } catch (err) {
+      this.reply(`[${this.e.self_id}] 失败重发任务执行失败: ${err.message || err}`, true)
+      return
+    }
+    if (result.busy) {
+      this.reply(`[${this.e.self_id}] 当前已有召回任务执行中，请稍后再试`, true)
+      return
+    }
+    await this._notifyRecallTaskResult(this._formatRecallRunSummary(result.run), context)
+  }
+
+  async recallDeleteResult () {
+    if (!this.guardOfficialBot()) return true
+    const match = /^#q+bot召回结果删除(?:\s+(\d+|全部)(?:\s+(确认))?)?$/i.exec(String(this.e.msg || ''))
+    if (!match) return
+    const target = match[1] || ''
+    const confirmed = match[2] === '确认'
+    if (!target) {
+      this.reply([
+        `#[${this.e.self_id}] 删除召回结果\n\n>缺少参数: 请输入结果序号或全部\n\n><qqbot-cmd-input text="#QQBot召回结果删除 全部" show="删除全部结果"/>`,
+        segment.button(...limitButtonRows([
+          [{ text: '删除全部', callback: '#QQBot召回结果删除 全部' }, { text: '返回结果', callback: '#QQBot召回结果 1' }]
+        ]))
+      ], true)
+      return
+    }
+    if (target === '全部') {
+      const count = inviteStore.getRecallRuns(this.e.self_id).length
+      if (!count) {
+        this.reply(`[${this.e.self_id}] 暂无可删除的召回结果`, true)
+        return
+      }
+      if (!confirmed) {
+        this.reply([
+          [
+            `#[${this.e.self_id}] 删除全部召回结果确认`,
+            '',
+            `>将删除全部 ${count} 条召回任务结果`,
+            '',
+            '>删除后不可恢复，不影响召回用户记录和召回配置。',
+            '',
+            '><qqbot-cmd-input text="#QQBot召回结果删除 全部 确认" show="确认删除全部结果"/>'
+          ].join('\n'),
+          segment.button(...limitButtonRows([
+            [{ text: '确认删除', callback: '#QQBot召回结果删除 全部 确认' }, { text: '返回结果', callback: '#QQBot召回结果 1' }]
+          ]))
+        ], true)
+        return
+      }
+      const deleted = await inviteStore.clearRecallRuns(this.e.self_id)
+      this.reply([
+        `#[${this.e.self_id}] 召回结果已清空\n\n>已删除全部 ${deleted} 条召回任务结果`,
+        segment.button(...limitButtonRows([[{ text: '召回结果', callback: '#QQBot召回结果 1' }, { text: '召回菜单', callback: '#QQBot召回菜单' }]]))
+      ], true)
+      return
+    }
+    const sequence = Number(target)
+    const run = inviteStore.getRecallRunBySequence(this.e.self_id, sequence)
+    if (!run) {
+      this.reply(`[${this.e.self_id}] 召回结果序号 ${sequence} 不存在`, true)
+      return
+    }
+    if (!confirmed) {
+      this.reply([
+        [
+          `#[${this.e.self_id}] 删除召回结果确认`,
+          '',
+          `>结果序号: ${sequence}`,
+          '',
+          `>任务: ${run.title || '召回任务'}`,
+          '',
+          `>成功/失败: ${run.success_count || 0}/${run.failed_count || 0}`,
+          '',
+          '>删除后不可恢复，其他结果会重新编号。',
+          '',
+          `><qqbot-cmd-input text="#QQBot召回结果删除 ${sequence} 确认" show="确认删除结果"/>`
+        ].join('\n'),
+        segment.button(...limitButtonRows([
+          [{ text: '确认删除', callback: `#QQBot召回结果删除 ${sequence} 确认` }, { text: '返回结果', callback: '#QQBot召回结果 1' }]
+        ]))
+      ], true)
+      return
+    }
+    const removed = await inviteStore.deleteRecallRunBySequence(this.e.self_id, sequence)
+    this.reply([
+      `#[${this.e.self_id}] 召回结果已删除\n\n>已删除第 ${sequence} 条: ${removed?.title || '召回任务'}`,
+      segment.button(...limitButtonRows([[{ text: '返回结果', callback: '#QQBot召回结果 1' }, { text: '召回菜单', callback: '#QQBot召回菜单' }]]))
+    ], true)
+  }
+
+  recallResults () {
+    if (!this.guardOfficialBot()) return true
+    const requestedPage = Math.max(1, Number(String(this.e.msg || '').match(/\s+(\d+)$/)?.[1]) || 1)
+    const runs = inviteStore.getRecallRuns(this.e.self_id)
+    const pageSize = 10
+    const pageCount = Math.max(1, Math.ceil(runs.length / pageSize))
+    const page = Math.min(requestedPage, pageCount)
+    const list = runs.slice((page - 1) * pageSize, page * pageSize)
+    const lines = [`#[${this.e.self_id}] 召回结果 ${page}/${pageCount}`, '', `>共 ${runs.length} 次任务`, '']
+    const actionLines = []
+    if (!list.length) {
+      lines.push('>暂无任务结果')
+    } else {
+      lines.push('```text')
+      list.forEach((run, index) => {
+        const sequence = (page - 1) * pageSize + index + 1
+        const mode = run.mode === 'active' ? '主动' : run.mode === 'force' ? '强制' : '召回'
+        lines.push(`${sequence}. ${run.title || '召回任务'} [${mode}]`)
+        lines.push(`   成功/失败: ${run.success_count || 0}/${run.failed_count || 0}`)
+        lines.push(`   完成: ${this._formatRecallResultTime(run.finished_at)}`)
+        if (Number(run.failed_count) > 0) actionLines.push(`><qqbot-cmd-input text="#QQBot召回失败重发 ${sequence}" show="重发第${sequence}条失败"/>`)
+        actionLines.push(`><qqbot-cmd-input text="#QQBot召回结果删除 ${sequence}" show="删除第${sequence}条结果"/>`)
+      })
+      lines.push('```')
+      lines.push('', ...actionLines.flatMap((line, index) => index ? ['', line] : [line]))
+      lines.push('', '><qqbot-cmd-input text="#QQBot召回结果删除 全部" show="删除全部结果"/>')
+    }
+    const rows = []
+    const pageRow = []
+    if (page > 1) pageRow.push({ text: '上一页', callback: `#QQBot召回结果 ${page - 1}` })
+    if (page < pageCount) pageRow.push({ text: '下一页', callback: `#QQBot召回结果 ${page + 1}` })
+    if (pageRow.length) rows.push(pageRow)
+    rows.push([{ text: '成功记录', callback: '#QQBot召回成功 1' }, { text: '失败详情', callback: '#QQBot召回失败 1' }])
+    rows.push([{ text: '失败重发', input: '#QQBot召回失败重发 ' }, { text: '删除结果', input: '#QQBot召回结果删除 ' }])
+    rows.push([{ text: '删除全部', callback: '#QQBot召回结果删除 全部' }, { text: '召回菜单', callback: '#QQBot召回菜单' }])
+    this.reply([lines.join('\n'), segment.button(...limitButtonRows(rows))], true)
   }
 
   async recallSetting () {
     if (!this.guardOfficialBot()) return true
-    const match = /^#q+bot召回设置(?:\s+([\s\S]+))?$/i.exec(this.e.msg)
+    const match = /^#q+bot召回(?:设置|配置)(?:\s+([\s\S]+))?$/i.exec(this.e.msg)
     const argsRaw = (match?.[1] || '').trim()
     const selfId = this.e.self_id
     const rc = ensureRecallConfig(config, selfId)
 
     if (!argsRaw) {
-      // 显示召回设置菜单
       this.reply([
-        getRecallMenuMsg(config, selfId),
-        segment.button(...getRecallMenuButtons(config, selfId))
+        getRecallConfigMsg(config, selfId),
+        segment.button(...getRecallConfigButtons(config, selfId))
       ], true)
       return
     }
@@ -7900,7 +8450,9 @@ export class QQBotAdapter extends plugin {
     // Markdown
     let m = /^[Mm]arkdown\s+([\s\S]+)$/i.exec(argsRaw)
     if (m) {
-      const content = m[1].trim()
+      const rawArgs = getRawCommandArgs(this.e, /^#q+bot召回(?:设置|配置)\s+([\s\S]+)$/i)
+      const rawMarkdown = /^[Mm]arkdown\s+([\s\S]+)$/i.exec(rawArgs)?.[1]
+      const content = (rawMarkdown ?? m[1]).trim()
       if (content === '清空') {
         rc.markdown = ''
         rc.buttonEnabled = false
@@ -7916,6 +8468,15 @@ export class QQBotAdapter extends plugin {
     }
 
     // button 开启/关闭
+    m = /^button\s*(删除|清空)$/i.exec(argsRaw)
+    if (m) {
+      rc.button = null
+      rc.buttonEnabled = false
+      await configSave()
+      this.reply(`[${selfId}] 召回Button已删除并关闭，Markdown和其他召回配置保持不变`, true)
+      return
+    }
+
     m = /^button\s*(开启|关闭)$/i.exec(argsRaw)
     if (m) {
       const state = m[1] === '开启'
@@ -7968,6 +8529,22 @@ export class QQBotAdapter extends plugin {
       return
     }
 
+    m = /^发送延迟\s*(\d+(?:\.\d+)?)\s*(?:秒)?$/i.exec(argsRaw)
+    if (m) {
+      rc.sendDelaySeconds = Math.max(0, Math.min(60, Number(m[1]) || 0))
+      await configSave()
+      this.reply(`[${selfId}] 发送延迟已设置为每批之间 ${rc.sendDelaySeconds} 秒`, true)
+      return
+    }
+
+    m = /^每批数量\s*(\d+)\s*(?:条)?$/i.exec(argsRaw)
+    if (m) {
+      rc.batchSize = Math.max(1, Math.min(20, Number(m[1]) || 2))
+      await configSave()
+      this.reply(`[${selfId}] 每批数量已设置为 ${rc.batchSize} 条`, true)
+      return
+    }
+
     m = /^时间加8小时\s*(开启|关闭)$/i.exec(argsRaw)
     if (m) {
       rc.displayTimeOffsetHours = m[1] === '开启' ? 8 : 0
@@ -7976,7 +8553,7 @@ export class QQBotAdapter extends plugin {
       return
     }
 
-    this.reply(`[${selfId}] 未知召回设置参数`, true)
+    this.reply(`[${selfId}] 未知召回配置参数`, true)
   }
 
   async recallPreview () {
@@ -8013,11 +8590,11 @@ export class QQBotAdapter extends plugin {
       segment.button(
         [
           { text: '发送预览', callback: '#QQBot召回发送预览' },
-          { text: '设置MD', input: '#QQBot召回设置 Markdown ' }
+          { text: '设置MD', input: '#QQBot召回配置 Markdown ' }
         ],
         [
-          { text: 'MD清空', callback: '#QQBot召回设置 Markdown 清空' },
-          { text: `${btnEnabled ? '关' : '开'}按钮`, callback: `#QQBot召回设置 button ${btnEnabled ? '关闭' : '开启'}` }
+          { text: 'MD清空', callback: '#QQBot召回配置 Markdown 清空' },
+          { text: `${btnEnabled ? '关' : '开'}按钮`, callback: `#QQBot召回配置 button ${btnEnabled ? '关闭' : '开启'}` }
         ],
         [
           { text: '返回', callback: '#QQBot召回菜单' }

@@ -11,13 +11,16 @@ class InviteStore {
     this._data = {}
     this._c2c = {}
     this._atId = {}
+    this._recallRuns = {}
     this._db = null
     this._saveTimer = null
     this._c2cSaveTimer = null
     this._atIdSaveTimer = null
+    this._recallRunsSaveTimer = null
     this._writeQueue = Promise.resolve()
     this._c2cWriteQueue = Promise.resolve()
     this._atIdWriteQueue = Promise.resolve()
+    this._recallRunsWriteQueue = Promise.resolve()
     this._writeSeq = 0
     this._ready = false
   }
@@ -25,6 +28,7 @@ class InviteStore {
   _dataJsonPath () { return join(JSON_DATA_DIR, 'invite.json') }
   _c2cJsonPath () { return join(JSON_DATA_DIR, 'c2c_openids.json') }
   _atIdJsonPath () { return join(JSON_DATA_DIR, 'at_id.json') }
+  _recallRunsJsonPath () { return join(JSON_DATA_DIR, 'recall_runs.json') }
 
   async init (type = 'json') {
     if (this._ready && this.type === type) return
@@ -34,6 +38,7 @@ class InviteStore {
     this._data = {}
     this._c2c = {}
     this._atId = {}
+    this._recallRuns = {}
 
     if (type === 'level') {
       try {
@@ -48,6 +53,9 @@ class InviteStore {
           } else if (String(key).startsWith('__at_id__')) {
             const selfId = String(key).replace('__at_id__', '')
             this._atId[selfId] = value
+          } else if (String(key).startsWith('__recall_runs__')) {
+            const selfId = String(key).replace('__recall_runs__', '')
+            this._recallRuns[selfId] = Array.isArray(value) ? value : []
           } else {
             this._data[key] = value
           }
@@ -64,6 +72,7 @@ class InviteStore {
       this._loadJson(this._dataJsonPath(), '_data')
       this._loadJson(this._c2cJsonPath(), '_c2c')
       this._loadJson(this._atIdJsonPath(), '_atId')
+      this._loadJson(this._recallRunsJsonPath(), '_recallRuns')
     }
 
     this._ready = true
@@ -105,6 +114,15 @@ class InviteStore {
     }, 1000)
   }
 
+  _scheduleRecallRunsSave () {
+    if (this.type === 'level' && this._db) return
+    if (this._recallRunsSaveTimer) clearTimeout(this._recallRunsSaveTimer)
+    this._recallRunsSaveTimer = setTimeout(() => {
+      this._writeJsonAtomic(this._recallRunsJsonPath(), this._recallRuns, '_recallRunsWriteQueue')
+      this._recallRunsSaveTimer = null
+    }, 1000)
+  }
+
   _writeJsonAtomic (file, data, queueKey) {
     this[queueKey] = this[queueKey]
       .catch(() => {})
@@ -141,6 +159,14 @@ class InviteStore {
       await this._db.set(`__at_id__${selfId}`, this._atId[selfId] || {}, 0)
     } else {
       this._scheduleAtIdSave()
+    }
+  }
+
+  async _saveRecallRuns (selfId) {
+    if (this.type === 'level' && this._db) {
+      await this._db.set(`__recall_runs__${selfId}`, this._recallRuns[selfId] || [], 0)
+    } else {
+      this._scheduleRecallRunsSave()
     }
   }
 
@@ -363,6 +389,52 @@ class InviteStore {
     return count
   }
 
+  async saveRecallRun (selfId, run = {}) {
+    if (!selfId) return null
+    const runs = Array.isArray(this._recallRuns[selfId]) ? this._recallRuns[selfId] : []
+    const item = {
+      ...run,
+      id: run.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      self_id: selfId,
+      successes: Array.isArray(run.successes) ? run.successes.slice(-500) : [],
+      failures: Array.isArray(run.failures) ? run.failures.slice(-500) : []
+    }
+    runs.unshift(item)
+    this._recallRuns[selfId] = runs.slice(0, 20)
+    await this._saveRecallRuns(selfId)
+    return item
+  }
+
+  getRecallRuns (selfId) {
+    return Array.isArray(this._recallRuns[selfId]) ? this._recallRuns[selfId] : []
+  }
+
+  getLatestRecallRun (selfId) {
+    return this.getRecallRuns(selfId)[0] || null
+  }
+
+  getRecallRunBySequence (selfId, sequence = 0) {
+    const index = Number(sequence) - 1
+    return index >= 0 ? this.getRecallRuns(selfId)[index] || null : null
+  }
+
+  async deleteRecallRunBySequence (selfId, sequence = 0) {
+    const runs = this.getRecallRuns(selfId)
+    const index = Number(sequence) - 1
+    if (index < 0 || index >= runs.length) return null
+    const [removed] = runs.splice(index, 1)
+    this._recallRuns[selfId] = runs
+    await this._saveRecallRuns(selfId)
+    return removed || null
+  }
+
+  async clearRecallRuns (selfId) {
+    const count = this.getRecallRuns(selfId).length
+    this._recallRuns[selfId] = []
+    await this._saveRecallRuns(selfId)
+    return count
+  }
+
   _calcPeriod (lastActiveMs, nowMs) {
     const diffDays = this._naturalDayDiff(lastActiveMs, nowMs)
     if (diffDays === 0) return '0'
@@ -476,7 +548,7 @@ class InviteStore {
 
   // ========== 存储切换/迁移 ==========
   getAllData () {
-    return { data: { ...this._data }, c2c: JSON.parse(JSON.stringify(this._c2c)), atId: JSON.parse(JSON.stringify(this._atId)) }
+    return { data: { ...this._data }, c2c: JSON.parse(JSON.stringify(this._c2c)), atId: JSON.parse(JSON.stringify(this._atId)), recallRuns: JSON.parse(JSON.stringify(this._recallRuns)) }
   }
 
   async migrateFrom (oldData) {
@@ -504,10 +576,17 @@ class InviteStore {
         }
       }
     }
+    if (oldData.recallRuns && typeof oldData.recallRuns === 'object') {
+      for (const [selfId, runs] of Object.entries(oldData.recallRuns)) {
+        this._recallRuns[selfId] = Array.isArray(runs) ? runs : []
+        if (this.type === 'level' && this._db) await this._db.set(`__recall_runs__${selfId}`, this._recallRuns[selfId], 0)
+      }
+    }
     if (this.type === 'json') {
       this._scheduleDataSave()
       this._scheduleC2cSave()
       this._scheduleAtIdSave()
+      this._scheduleRecallRunsSave()
     }
     const inviteCount = Object.keys(oldData.data || {}).length
     const c2cCount = Object.values(oldData.c2c || {}).reduce((sum, users) => sum + Object.keys(users).length, 0)
@@ -518,11 +597,13 @@ class InviteStore {
     if (this._saveTimer) { clearTimeout(this._saveTimer); this._saveTimer = null }
     if (this._c2cSaveTimer) { clearTimeout(this._c2cSaveTimer); this._c2cSaveTimer = null }
     if (this._atIdSaveTimer) { clearTimeout(this._atIdSaveTimer); this._atIdSaveTimer = null }
+    if (this._recallRunsSaveTimer) { clearTimeout(this._recallRunsSaveTimer); this._recallRunsSaveTimer = null }
     if (this.type === 'json' && this._ready) {
       this._writeJsonAtomic(this._dataJsonPath(), this._data, '_writeQueue')
       this._writeJsonAtomic(this._c2cJsonPath(), this._c2c, '_c2cWriteQueue')
       this._writeJsonAtomic(this._atIdJsonPath(), this._atId, '_atIdWriteQueue')
-      await Promise.allSettled([this._writeQueue, this._c2cWriteQueue, this._atIdWriteQueue])
+      this._writeJsonAtomic(this._recallRunsJsonPath(), this._recallRuns, '_recallRunsWriteQueue')
+      await Promise.allSettled([this._writeQueue, this._c2cWriteQueue, this._atIdWriteQueue, this._recallRunsWriteQueue])
     }
     if (this._db) {
       try { this._db.close() } catch {}

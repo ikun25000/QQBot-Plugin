@@ -136,10 +136,11 @@ class AdvancedWelcomeStore {
     return true
   }
 
-  async setGroupDisabled (selfId = '', groupOpenid = '', disabled = false) {
+  async setGroupDisabled (selfId = '', groupOpenid = '', disabled = false, source = '') {
     const item = this.getGroup(selfId, groupOpenid, true)
     item.disabled = !!disabled
     item.switch_time = nowIso()
+    if (source) item.switch_source = source
     await this.saveGroup(item)
     return item
   }
@@ -228,6 +229,7 @@ class AdvancedWelcomeStore {
     if (item.disabled) return item
     item.disabled = true
     item.switch_time = nowIso()
+    item.switch_source = 'system'
     item.auto_disabled_reason = String(reason || '自动关闭').slice(0, 300)
     await this.saveGroup(item)
     return item

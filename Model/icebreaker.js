@@ -42,6 +42,11 @@ function ensureRecallConfig (config, selfId = '') {
   if (typeof rc.buttonEnabled !== 'boolean') rc.buttonEnabled = false
   if (!rc.button || typeof rc.button !== 'object') rc.button = null
   if (typeof rc.batchCount !== 'number') rc.batchCount = 0
+  if (typeof rc.cannotActiveCount !== 'number') rc.cannotActiveCount = 0
+  if (typeof rc.sendDelaySeconds !== 'number') rc.sendDelaySeconds = 1
+  if (typeof rc.batchSize !== 'number') rc.batchSize = 2
+  rc.sendDelaySeconds = Math.max(0, Math.min(60, Number(rc.sendDelaySeconds) || 0))
+  rc.batchSize = Math.max(1, Math.min(20, Number(rc.batchSize) || 2))
   if (typeof rc.displayTimeOffsetHours !== 'number') {
     rc.displayTimeOffsetHours = rc.displayTimeOffset8 === true ? 8 : 0
   }
@@ -127,17 +132,13 @@ function getRecallMenuMsg (config, selfId = '') {
     '',
     `>私信用户总数: ${totalUsers}`,
     '',
-    `>召回Markdown: ${rc.markdown ? '已设置' : '未设置'}`,
-    '',
-    `>召回Button: ${rc.buttonEnabled ? '开启' : '关闭'}${rc.button ? '' : '(未配置)'}`,
-    '',
-    `>列表时间偏移: ${rc.displayTimeOffsetHours}小时${rc.displayTimeOffsetHours === 0 ? '(默认)' : ''}`,
-    '',
-    `><qqbot-cmd-input text="#QQBot召回设置 时间偏移 ${rc.displayTimeOffsetHours || 8}小时" show="设置时间偏移"/>`,
-    '',
-    '><qqbot-cmd-input text="#QQBot召回设置 时间偏移 恢复默认" show="恢复默认偏移"/>',
-    '',
     `>存储方式: ${dbType}`,
+    '',
+    `>发送节奏: 每批${rc.batchSize}条，间隔${rc.sendDelaySeconds}秒`,
+    '',
+    '><qqbot-cmd-input text="#QQBot开始召回" show="开始召回"/>',
+    '',
+    '><qqbot-cmd-input text="#QQBot召回配置" show="打开召回配置"/>',
     '',
     `><qqbot-cmd-input text="#QQBot召回预览" show="打开预览菜单"/>`,
     '',
@@ -149,42 +150,92 @@ function getRecallMenuMsg (config, selfId = '') {
   ].join('\n')
 }
 
-function getRecallMenuButtons (config, selfId = '') {
-  const rc = ensureRecallConfig(config, selfId)
-  const dbType = config.inviteDB || 'json'
+function getRecallMenuButtons () {
   return limitButtonRows([
     [
-      { text: '可召回', callback: '#QQBot可召回列表' },
-      { text: '不可召回', callback: '#QQBot不可召回列表' }
+      { text: '开始召回', callback: '#QQBot开始召回' },
+      { text: '可召回', callback: '#QQBot可召回列表' }
     ],
     [
-      { text: '召回查看', callback: '#QQBot召回查看' },
+      { text: '不可召回', callback: '#QQBot不可召回列表' },
       { text: '召回删除', callback: '#QQBot召回删除' }
     ],
     [
       { text: '召回预览', callback: '#QQBot召回预览' },
-      { text: '设置MD', input: '#QQBot召回设置 Markdown ' }
+      { text: '召回配置', callback: '#QQBot召回配置' }
     ],
+    [
+      { text: '召回结果', callback: '#QQBot召回结果' },
+      { text: '返回', callback: '#QQBot普通设置' }
+    ]
+  ])
+}
+
+function getRecallConfigMsg (config, selfId = '') {
+  const rc = ensureRecallConfig(config, selfId)
+  const dbType = config.inviteDB || 'json'
+  return [
+    `#[${selfId || '-'}] 召回配置`,
+    '',
+    `>存储方式: ${dbType}`,
+    '',
+    `>召回Markdown: ${rc.markdown ? '已设置' : '未设置'}`,
+    '',
+    `>召回Button: ${rc.buttonEnabled ? '开启' : '关闭'}${rc.button ? '' : '(未配置)'}`,
+    '',
+    '><qqbot-cmd-input text="#QQBot召回配置 button 删除" show="删除召回Button"/>',
+    '',
+    `>列表时间偏移: ${rc.displayTimeOffsetHours}小时${rc.displayTimeOffsetHours === 0 ? '(默认)' : ''}`,
+    '',
+    `>发送延迟: ${rc.sendDelaySeconds}秒（每批之间）`,
+    '',
+    `>每批数量: ${rc.batchSize}条`,
+    '',
+    `><qqbot-cmd-input text="#QQBot召回配置 发送延迟 ${rc.sendDelaySeconds}秒" show="设置发送延迟"/>`,
+    '',
+    `><qqbot-cmd-input text="#QQBot召回配置 每批数量 ${rc.batchSize}" show="设置每批数量"/>`,
+    '',
+    '```text',
+    '主动发送仅在确认命令中单次选择，不会保存为默认模式。',
+    '默认每批发送2条，批次之间等待1秒。',
+    '```'
+  ].join('\n')
+}
+
+function getRecallConfigButtons (config) {
+  const dbType = config.inviteDB || 'json'
+  return limitButtonRows([
     [
       dbType === 'level'
-        ? { text: '切JSON存储', callback: '#QQBot召回设置 存储 json' }
-        : { text: '切LevelDB存储', callback: '#QQBot召回设置 存储 level' },
-      { text: '设置按钮', input: '#QQBot召回设置 button ' }
+        ? { text: '切JSON', callback: '#QQBot召回配置 存储 json' }
+        : { text: '切Level', callback: '#QQBot召回配置 存储 level' },
+      { text: '设延迟', input: '#QQBot召回配置 发送延迟 1秒' }
     ],
     [
-      { text: '设时间', input: '#QQBot召回设置 时间偏移 8小时' },
-      { text: '恢复默认', callback: '#QQBot召回设置 时间偏移 恢复默认' }
+      { text: '设批量', input: '#QQBot召回配置 每批数量 2' },
+      { text: '设置MD', input: '#QQBot召回配置 Markdown ' }
+    ],
+    [
+      { text: '设置按钮', input: '#QQBot召回配置 button ' },
+      { text: '设时间', input: '#QQBot召回配置 时间偏移 8小时' }
+    ],
+    [
+      { text: '预览', callback: '#QQBot召回预览' },
+      { text: '删按钮', callback: '#QQBot召回配置 button 删除' }
+    ],
+    [
+      { text: '召回结果', callback: '#QQBot召回结果' },
+      { text: '返回', callback: '#QQBot召回菜单' }
     ]
   ])
 }
 
 function getRecallOverviewMsg (config, selfId = '') {
-  const rc = ensureRecallConfig(config, selfId)
   const { canRecall, cannotRecall } = inviteStore.getRecallableList(selfId)
   const totalUsers = inviteStore.getC2cUserCount(selfId)
   const maxBatch = canRecall.length
   return [
-    `#[${selfId || '-'}] 召回查看`,
+    `#[${selfId || '-'}] 开始召回`,
     '',
     `>可召回数量: ${canRecall.length}`,
     '',
@@ -192,13 +243,20 @@ function getRecallOverviewMsg (config, selfId = '') {
     '',
     `>私信用户总数: ${totalUsers}`,
     '',
-    `>全部召回命令:`,
+    '>全部召回:',
     '',
     `><qqbot-cmd-input text="#QQBot全部召回设置数量 ${maxBatch}" show="设置全部召回(${maxBatch})"/>`,
     '',
+    '><qqbot-cmd-input text="#QQBot单独召回 " show="单独召回"/>',
+    '',
+    '><qqbot-cmd-input text="#QQBot召回不可召回主动" show="主动发送不可召回用户"/>',
+    '',
+    '><qqbot-cmd-input text="#QQBot召回结果" show="查看结果或重发失败"/>',
+    '',
     '```text',
-    `当前可召回最大数量: ${maxBatch}`,
-    '输入数量后需要确认才会执行',
+    `全部召回最大数量: ${maxBatch}，确认页可选普通、主动或强制。`,
+    '单独召回请输入 openid；末尾可加“主动”或“强制”。',
+    '不可召回主动会先列出用户，再设置数量并确认发送。',
     '```'
   ].join('\n')
 }
@@ -212,8 +270,15 @@ function getRecallOverviewButtons (config, selfId = '') {
       { text: '不可召回列表', callback: '#QQBot不可召回列表' }
     ],
     [
-      { text: `全部召回(${maxBatch})`, input: `#QQBot全部召回设置数量 ${maxBatch}` },
-      { text: '返回', callback: '#QQBot召回菜单' }
+      { text: '全部召回', input: `#QQBot全部召回设置数量 ${maxBatch}` },
+      { text: '单独召回', input: '#QQBot单独召回 ' }
+    ],
+    [
+      { text: '不可主动', callback: '#QQBot召回不可召回主动' },
+      { text: '召回结果', callback: '#QQBot召回结果' }
+    ],
+    [
+      { text: '返回菜单', callback: '#QQBot召回菜单' }
     ]
   ])
 }
@@ -270,8 +335,9 @@ function getRecallListMsg (config, selfId = '', type = 'can', page = 1, pageSize
     })
     lines.push('```')
     if (type === 'can') {
-      pageList.forEach((item) => {
-        lines.push('', `><qqbot-cmd-input text="#QQBot单独召回 ${item.openid}" show="召回 ${item.openid.slice(0, 8)}..."/>`)
+      pageList.forEach((item, index) => {
+        const active = start + index < 2
+        lines.push('', `><qqbot-cmd-input text="#QQBot单独召回 ${item.openid}${active ? ' 主动' : ''}" show="${active ? '主动' : '召回'} ${item.openid.slice(0, 8)}..."/>`)
       })
     }
   }
@@ -333,6 +399,8 @@ export {
   getIcebreakerMenuButtons,
   getRecallMenuMsg,
   getRecallMenuButtons,
+  getRecallConfigMsg,
+  getRecallConfigButtons,
   getRecallOverviewMsg,
   getRecallOverviewButtons,
   getRecallListMsg,

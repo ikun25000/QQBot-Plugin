@@ -49,7 +49,8 @@ class UserManageStore {
       pendingCancels: {},
       fullBindings: {},
       fullGroupEvents: {},
-      histories: {}
+      histories: {},
+      historySeqs: {}
     }
   }
 
@@ -86,6 +87,7 @@ class UserManageStore {
     else if (key.startsWith('pendingCancel:')) this._data.pendingCancels[key.slice(14)] = value
     else if (key.startsWith('fullBinding:')) this._data.fullBindings[key.slice(12)] = value
     else if (key.startsWith('fullGroupEvent:')) this._data.fullGroupEvents[key.slice(15)] = value
+    else if (key.startsWith('historySeq:')) this._data.historySeqs[key.slice(11)] = Number(value) || 0
     else if (key.startsWith('history:')) this._data.histories[key.slice(8)] = value
   }
 
@@ -149,7 +151,9 @@ class UserManageStore {
     if (!selfId || !targetOpenid || String(targetOpenid).startsWith('qg')) return false
     const key = this._historyKey(selfId, targetOpenid, msg.type || 'group')
     const list = Array.isArray(this._data.histories[key]) ? this._data.histories[key] : []
-    const seq = Number(msg.seq) || (list.length ? (Number(list[list.length - 1].seq) || 0) + 1 : 1)
+    const listSeq = list.reduce((max, item) => Math.max(max, Number(item?.seq) || 0), 0)
+    const lastSeq = Math.max(Number(this._data.historySeqs[key]) || 0, listSeq)
+    const seq = Number(msg.seq) || lastSeq + 1
     list.push({
       seq,
       message_id: msg.message_id || '',
@@ -163,6 +167,8 @@ class UserManageStore {
     })
     while (list.length > HISTORY_LIMIT) list.shift()
     this._data.histories[key] = list
+    this._data.historySeqs[key] = Math.max(lastSeq, seq)
+    await this._save('historySeq', key, this._data.historySeqs[key])
     await this._save('history', key, list)
     return seq
   }
@@ -209,6 +215,9 @@ class UserManageStore {
     if (!list.length) return 0
     const n = String(count) === '全部' ? list.length : Math.max(0, Number(count) || 0)
     if (n <= 0) return 0
+    const maxSeq = list.reduce((max, item) => Math.max(max, Number(item?.seq) || 0), 0)
+    this._data.historySeqs[key] = Math.max(Number(this._data.historySeqs[key]) || 0, maxSeq)
+    await this._save('historySeq', key, this._data.historySeqs[key])
     const deleted = Math.min(n, list.length)
     list.splice(Math.max(0, list.length - deleted), deleted)
     this._data.histories[key] = list
@@ -217,16 +226,22 @@ class UserManageStore {
   }
 
   async clearGroupHistories (selfId = '') {
-    let count = 0
+    let messageCount = 0
+    let groupCount = 0
     for (const key of Object.keys(this._data.histories)) {
       if (key.startsWith('user:')) continue
       if (!key.startsWith(`${selfId}:`)) continue
       const list = Array.isArray(this._data.histories[key]) ? this._data.histories[key] : []
-      count += list.length
+      if (!list.length) continue
+      const maxSeq = list.reduce((max, item) => Math.max(max, Number(item?.seq) || 0), 0)
+      this._data.historySeqs[key] = Math.max(Number(this._data.historySeqs[key]) || 0, maxSeq)
+      await this._save('historySeq', key, this._data.historySeqs[key])
+      messageCount += list.length
+      groupCount++
       this._data.histories[key] = []
       await this._save('history', key, [])
     }
-    return count
+    return { messageCount, groupCount }
   }
 
   findHistoryByMessageId (selfId = '', targetOpenid = '', messageId = '', type = 'group') {
