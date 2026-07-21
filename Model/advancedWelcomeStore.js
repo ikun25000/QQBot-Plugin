@@ -316,11 +316,69 @@ class AdvancedWelcomeStore {
       const aliasItem = { ...item, message_id: alias, actual_message_id: record.message_id }
       this._data.messageIds[alias] = aliasItem
       await this._save(`msg:${alias}`, aliasItem)
+      if (record.self_id && record.target_id && record.type) {
+        const scopedAlias = this._messageAliasKey(record.self_id, record.type, record.target_id, alias)
+        const oldScoped = this._data.messageIds[scopedAlias]
+        const oldActualId = oldScoped?.actual_message_id || oldScoped?.message_id || ''
+        const scopedItem = oldActualId && oldActualId !== record.message_id
+          ? {
+              ...aliasItem,
+              ambiguous: true,
+              actual_message_ids: [...new Set([...(oldScoped.actual_message_ids || [oldActualId]), record.message_id].filter(Boolean))]
+            }
+          : aliasItem
+        this._data.messageIds[scopedAlias] = scopedItem
+        await this._save(`msg:${scopedAlias}`, scopedItem)
+      }
     }
     return true
   }
 
-  getMessageIndex (messageId = '') { return this._data.messageIds[messageId] || null }
+  _messageAliasKey (selfId = '', type = '', targetId = '', alias = '') {
+    return `alias:${selfId}:${type}:${targetId}:${alias}`
+  }
+
+  getMessageIndex (messageId = '', context = {}) {
+    if (!messageId) return null
+    if (context.selfId && context.type && context.targetId) {
+      const scoped = this._data.messageIds[this._messageAliasKey(context.selfId, context.type, context.targetId, messageId)]
+      if (scoped) return scoped.ambiguous ? null : scoped
+    }
+    const item = this._data.messageIds[messageId] || null
+    if (!item) return null
+    if (context.selfId && item.self_id !== context.selfId) return null
+    if (context.type && item.type !== context.type) return null
+    if (context.targetId && item.target_id !== context.targetId) return null
+    return item
+  }
+
+  findRecallCandidatesByContent (selfId = '', targetId = '', content = '', options = {}) {
+    const text = String(content || '').replace(/\s+/g, ' ').trim()
+    if (!selfId || !targetId || !text) return { items: [], total: 0, truncated: false }
+    const beforeTime = Number(options.beforeTime) || Date.now()
+    const beforeSeq = Number(options.beforeSeq) || 0
+    const limitMs = Math.max(1, Number(options.limitMs) || 10 * 60 * 1000)
+    const limit = Math.max(1, Number(options.limit) || 20)
+    const excludedIds = new Set((options.excludeMessageIds || []).filter(Boolean).map(String))
+    const candidates = Object.values(this._data.messageIds)
+      .filter(item => {
+        if (!item || item.actual_message_id || item.self_id !== selfId || item.target_id !== targetId || item.type !== 'group') return false
+        if (excludedIds.has(String(item.message_id || ''))) return false
+        if (!/^ROBOT\d+\.\d+_/i.test(String(item.message_id || ''))) return false
+        if (item.bot === true || item.member_role !== 'member') return false
+        if (String(item.content_fingerprint || '').replace(/\s+/g, ' ').trim() !== text) return false
+        const itemTime = Date.parse(item.time || '') || Number(item.time) || 0
+        if (!(itemTime > 0 && itemTime <= beforeTime && beforeTime - itemTime <= limitMs)) return false
+        const itemSeq = Number(item.seq) || 0
+        return !(beforeSeq && itemSeq && itemSeq >= beforeSeq)
+      })
+      .sort((a, b) => (Date.parse(b.time || '') || Number(b.time) || 0) - (Date.parse(a.time || '') || Number(a.time) || 0))
+    return {
+      items: candidates.slice(0, limit),
+      total: candidates.length,
+      truncated: candidates.length > limit
+    }
+  }
 
   findRecentMessageByContent (selfId = '', targetId = '', content = '', options = {}) {
     const text = String(content || '').trim()
