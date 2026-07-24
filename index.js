@@ -83,6 +83,7 @@ import {
 import { createRequire } from 'module'
 import { Bot as QQBot } from 'qq-official-bot'
 const require = createRequire(import.meta.url)
+const qqbotOriginalEventMap = new WeakMap()
 
 function stripAttachmentPlaceholders (text) {
   if (typeof text !== 'string' || !text.includes('<')) return text
@@ -205,6 +206,30 @@ function getQQBotMessageAliases (payload = {}) {
   return aliases
 }
 
+function getQQBotResponseAliases (payload = {}) {
+  return [...new Set([
+    payload.ext_info?.ref_idx,
+    payload.ext_info?.msg_idx,
+    payload.ref_idx,
+    payload.msg_idx,
+    getOwnMsgIdx(payload)
+  ].filter(Boolean).map(String))]
+}
+
+async function recordQQBotLocalMessageResponse (record = {}, response = {}) {
+  const item = {
+    ...record,
+    message_id: response.id,
+    bot: true,
+    local_bot: true,
+    aliases: getQQBotResponseAliases(response)
+  }
+  if (!item.message_id) return false
+  await advancedWelcomeStore.recordMessageIndex(item)
+  await advancedWelcomeStore.recordLocalMessageResponse(item)
+  return item
+}
+
 function getQQBotEventTime (payload = {}) {
   const value = payload._rawTimestamp || payload.raw?._rawTimestamp || payload.timestamp || payload.raw?.timestamp || payload.time || ''
   const numeric = Number(value)
@@ -228,7 +253,9 @@ function getQQBotQuotedContentFingerprint (payload = {}) {
     ...(Array.isArray(payload.raw?.msg_elements) ? payload.raw.msg_elements : [])
   ]
   const item = elements.find(item => item?.content || item?.text || item?.markdown?.content)
-  return String(item?.content || item?.text || item?.markdown?.content || '').replace(/\s+/g, ' ').trim().slice(0, 500)
+  const raw = String(item?.content || item?.text || item?.markdown?.content || '')
+  const officialQuote = /^\s*===\s*消息\s*\d+\s*===\s*\r?\n\s*\[消息内容\][ \t]*([\s\S]*?)(?=\r?\n\s*\[消息类型\])/i.exec(raw)
+  return String(officialQuote?.[1] || raw).replace(/\s+/g, ' ').trim().slice(0, 500)
 }
 
 function getQQBotQuotedAuthorBot (payload = {}) {
@@ -246,14 +273,42 @@ function cacheQQBotReplyRefContent (payload = {}, selfId = '', groupOpenid = '')
   const content = getQQBotQuotedContentFingerprint(payload)
   if (!content) return
   if (!globalThis.__qqbotRefContentMap) globalThis.__qqbotRefContentMap = new Map()
-  globalThis.__qqbotRefContentMap.set(ref, {
+  const key = getQQBotRefMapKey(selfId, 'group', groupOpenid, ref)
+  globalThis.__qqbotRefContentMap.set(key, {
     self_id: selfId,
     group_openid: groupOpenid,
     content,
     bot: getQQBotQuotedAuthorBot(payload),
     time: Date.now()
   })
-  setTimeout(() => globalThis.__qqbotRefContentMap?.delete?.(ref), 10 * 60 * 1000)
+  setTimeout(() => globalThis.__qqbotRefContentMap?.delete?.(key), 10 * 60 * 1000)
+}
+
+function stringifyQQBotRecallDetail (value) {
+  const seen = new WeakSet()
+  try {
+    return JSON.stringify(value, (key, item) => {
+      if (typeof item === 'function' || typeof item === 'symbol') return undefined
+      if (!item || typeof item !== 'object') return item
+      if (seen.has(item)) return '[Circular]'
+      seen.add(item)
+      return item
+    }, 2)
+  } catch (err) {
+    return String(value || err.message || '')
+  }
+}
+
+function formatQQBotRecallFailure (data = {}, result = {}, inputMessageId = '') {
+  const detail = {
+    ...result,
+    code: result.code || 'RECALL_FAILED',
+    reason: result.message || result.error?.message || '撤回失败',
+    input_message_id: result.input_message_id || inputMessageId || '',
+    resolved_message_id: result.resolved_message_id || result.message_id || '',
+    target_type: result.type || result.target_type || ''
+  }
+  return `撤回失败/未撤回\n\`\`\`json\n${stringifyQQBotRecallDetail(detail)}\n\`\`\`\n原始官方事件\n\`\`\`json\n${stringifyQQBotRecallDetail(data.raw?._qqbotOriginalEvent || data.raw || {})}\n\`\`\``
 }
 
 function getQQBotActualMessageId (event = {}) {
@@ -866,6 +921,13 @@ function patchGroupMessageCreateEvent () {
       const originalDispatchEvent = QQBotClass.prototype.dispatchEvent
       QQBotClass.prototype.dispatchEvent = function (event, wsRes) {
         if (wsRes?.d && typeof event === 'string') {
+          qqbotOriginalEventMap.set(wsRes.d, {
+            op: wsRes.op,
+            s: wsRes.s,
+            t: event,
+            id: wsRes.id,
+            d: { ...wsRes.d }
+          })
           wsRes.d._qqbotRawEvent = event
           if (typeof wsRes.d.content === 'string' && typeof wsRes.d._rawContent !== 'string') wsRes.d._rawContent = wsRes.d.content
         }
@@ -909,7 +971,10 @@ function patchGroupMessageCreateEvent () {
         payload.timestamp = payload.time
         payload.font = 0
         payload.seq = payload.seq || payload.s || payload.message_id
-        return new GroupMessageEvent(this, payload)
+        const parsed = new GroupMessageEvent(this, payload)
+        const originalEvent = qqbotOriginalEventMap.get(payload)
+        if (originalEvent) Object.defineProperty(parsed, '_qqbotOriginalEvent', { value: originalEvent, configurable: true })
+        return parsed
       }
       const patchedParse = function (event, payload) {
         const isFullGroupMessage = payload?._qqbotRawEvent === 'GROUP_MESSAGE_CREATE'
@@ -925,6 +990,8 @@ function patchGroupMessageCreateEvent () {
         try {
           const parsed = originalParse(event, payload)
           if (parsed) {
+            const originalEvent = qqbotOriginalEventMap.get(payload)
+            if (originalEvent) Object.defineProperty(parsed, '_qqbotOriginalEvent', { value: originalEvent, configurable: true })
             parsed.reply_id = getReplyMessageIdFromPayload(payload)
             parsed.getReply = async () => parsed.reply_id ? { message_id: parsed.reply_id } : null
           }
@@ -1475,7 +1542,7 @@ const adapter = new class QQBotAdapter {
   }
 
   async simpleRecallMsg (data, messageId = '', targetId = '', targetType = '') {
-    if (!messageId) return { ok: false, message: 'msgid不能为空' }
+    if (!messageId) return { ok: false, code: 'EMPTY_MESSAGE_ID', input_message_id: '', message: 'msgid不能为空' }
     const originalMessageId = messageId
     const isReferenceIndex = value => /^(?:REFIDX_|TMP_)/i.test(String(value || ''))
     const contextTargetId = targetId || getRawQQBotGroupId(data, data.self_id, this.sep)
@@ -1484,6 +1551,12 @@ const adapter = new class QQBotAdapter {
     const scopedRefKey = getQQBotRefMapKey(data.self_id, contextType, contextTargetId, messageId)
     const findRecord = async () => {
       if (isReferenceIndex(messageId) && contextType === 'group' && !contextTargetId) return null
+      const local = advancedWelcomeStore.getLocalMessageResponse(messageId, {
+        selfId: data.self_id,
+        targetId: contextTargetId,
+        type: contextType
+      })
+      if (local) return local
       return advancedWelcomeStore.getMessageIndex(messageId, {
         selfId: data.self_id,
         targetId: contextTargetId,
@@ -1494,7 +1567,7 @@ const adapter = new class QQBotAdapter {
     try {
       record = await withTimeout(findRecord(), 2000, '查找消息记录超时')
     } catch (err) {
-      return { ok: false, message_id: messageId, message: err.message }
+      return { ok: false, code: 'MESSAGE_INDEX_TIMEOUT', input_message_id: originalMessageId, message_id: messageId, message: err.message }
     }
     if (!record && isReferenceIndex(messageId) && contextTargetId && refMap?.get?.(scopedRefKey)) {
       messageId = refMap.get(scopedRefKey)
@@ -1509,8 +1582,24 @@ const adapter = new class QQBotAdapter {
       record = advancedWelcomeStore.getMessageIndex(messageId, { selfId: data.self_id, targetId: targetOpenid, type: 'group' })
       if (record) messageId = record.actual_message_id || record.message_id
     }
+    if (!record && isReferenceIndex(messageId) && data.message_type === 'group' && contextTargetId) {
+      const history = userManageStore.findUniqueHistoryByMessageId(data.self_id, contextTargetId, messageId)
+      if (/^ROBOT\d+\.\d+_/i.test(String(history?.message_id || '')) && (history.bot !== true || history.local_bot === true)) {
+        record = {
+          message_id: messageId,
+          actual_message_id: history.message_id,
+          self_id: data.self_id,
+          target_id: contextTargetId,
+          type: 'group',
+          author_openid: history.user_openid || '',
+          bot: history.bot === true,
+          local_bot: history.local_bot === true
+        }
+        messageId = history.message_id
+      }
+    }
     if (!record && isReferenceIndex(messageId) && data.message_type === 'group') {
-      const cachedRef = globalThis.__qqbotRefContentMap?.get?.(originalMessageId) || globalThis.__qqbotRefContentMap?.get?.(messageId)
+      const cachedRef = globalThis.__qqbotRefContentMap?.get?.(getQQBotRefMapKey(data.self_id, 'group', contextTargetId, originalMessageId)) || globalThis.__qqbotRefContentMap?.get?.(getQQBotRefMapKey(data.self_id, 'group', contextTargetId, messageId))
       const quotedContent = cachedRef?.content || getQQBotQuotedContentFingerprint(data.raw || {})
       if (quotedContent) {
         const targetOpenid = contextTargetId || cachedRef?.group_openid || getRawQQBotGroupId(data.raw || {}, data.self_id, this.sep)
@@ -1534,27 +1623,15 @@ const adapter = new class QQBotAdapter {
           })
         }
         const successCount = results.filter(item => item.ok).length
-        Bot.makeLog(candidateResult.truncated || successCount !== results.length ? 'warn' : 'info', ['引用索引激进回退撤回完成', {
-          input_message_id: originalMessageId,
-          target_id: targetOpenid,
-          quoted_content: quotedContent,
-          cached: !!cachedRef,
-          candidate_total: candidateResult.total,
-          attempted: results.length,
-          success: successCount,
-          failed: results.length - successCount,
-          truncated: candidateResult.truncated,
-          results
-        }], data.self_id)
         return {
-          ok: successCount > 0,
-          code: results.length ? 'AGGRESSIVE_CONTENT_RECALL' : 'NO_SAFE_RECALL_CANDIDATE',
+          ok: results.length > 0 && successCount === results.length,
+          code: results.length ? (successCount === results.length ? 'AGGRESSIVE_CONTENT_RECALL' : 'AGGRESSIVE_CONTENT_RECALL_PARTIAL') : 'NO_SAFE_RECALL_CANDIDATE',
           type: 'group',
           target_id: targetOpenid,
           message_id: originalMessageId,
           message: results.length
             ? `精确索引无法解析，已激进撤回同内容候选 ${successCount}/${results.length}${candidateResult.truncated ? `（候选共${candidateResult.total}条，仅处理最近20条）` : ''}`
-            : '精确索引无法解析，引用前10分钟内没有可撤回的普通成员同内容消息',
+            : '精确索引无法解析，引用前10分钟内没有可撤回的本机器人或普通成员同内容消息',
           aggressive: true,
           candidate_total: candidateResult.total,
           attempted: results.length,
@@ -1577,42 +1654,57 @@ const adapter = new class QQBotAdapter {
     if (!openid && data.message_type === 'group') openid = data.raw?.group_id || data.group_openid || String(data.group_id || '').replace(`${data.self_id}${this.sep}`, '')
     if (!openid && data.message_type === 'private') openid = data.raw?.sender?.user_id || String(data.user_id || '').replace(`${data.self_id}${this.sep}`, '')
 
-    if (!openid || !type) return { ok: false, message_id: messageId, message: '未找到消息记录，且未提供群/私聊openid' }
+    if (!openid || !type) return { ok: false, code: 'RECALL_TARGET_UNRESOLVED', input_message_id: originalMessageId, message_id: messageId, message: '未找到消息记录，且未提供群/私聊openid' }
+    const localMessageIds = record?.local_bot === true
+      ? [...new Set([...(record.actual_message_ids || []), record.actual_message_id].filter(id => /^ROBOT\d+\.\d+_/i.test(String(id))).map(String))]
+      : []
+    if (localMessageIds.length > 1) {
+      const targetTypeApi = type === 'group' ? 'group' : 'user'
+      const results = []
+      for (const id of localMessageIds) {
+        const result = await withTimeout(this.recallMessageById(data, id, targetTypeApi, openid), 8000, '撤回超时')
+          .catch(err => ({ ok: false, type: type === 'group' ? 'group' : 'c2c', target_id: openid, message_id: id, message: err.message }))
+        results.push(result)
+      }
+      const successCount = results.filter(item => item.ok).length
+      const ret = {
+        ok: successCount === results.length,
+        code: successCount === results.length ? 'LOCAL_REF_MULTI_RECALL' : 'LOCAL_REF_MULTI_RECALL_PARTIAL',
+        type: type === 'group' ? 'group' : 'c2c',
+        target_id: openid,
+        input_message_id: originalMessageId,
+        message_id: originalMessageId,
+        actual_message_ids: localMessageIds,
+        attempted: results.length,
+        success_count: successCount,
+        failed_count: results.length - successCount,
+        results,
+        message: `本地发送索引对应 ${results.length} 条消息，撤回成功 ${successCount} 条，失败 ${results.length - successCount} 条`
+      }
+      Bot.makeLog(ret.ok ? 'info' : 'warn', [ret.ok ? '本地引用消息全部撤回完成' : '本地引用消息部分撤回失败', ret], data.self_id)
+      return ret
+    }
     const actualMessageId = record?.actual_message_id || record?.message_id || messageId
-    Bot.makeLog('debug', ['撤回消息诊断', {
-      input_message_id: originalMessageId,
-      resolved_message_id: messageId,
-      actual_message_id: actualMessageId,
-      target_id: openid,
-      type,
-      target_type_arg: targetType,
-      target_id_arg: targetId,
-      record: record ? {
-        message_id: record.message_id,
-        actual_message_id: record.actual_message_id,
-        target_id: record.target_id,
-        type: record.type,
-        author_openid: record.author_openid,
-        member_role: record.member_role,
-        bot: record.bot
-      } : null,
-      event_group_id: data.group_id,
-      event_group_openid: data.group_openid,
-      event_user_id: data.user_id,
-      event_message_type: data.message_type
-    }], data.self_id)
+    const currentMessageId = getQQBotActualMessageId(data.raw || data)
+    const isCurrentMessage = String(actualMessageId || '') === String(currentMessageId || '')
+    const isLocalBotMessage = record?.local_bot === true
     if (isReferenceIndex(actualMessageId)) {
-      const ret = { ok: false, code: 'REFIDX_UNRESOLVED', type, target_id: openid, message_id: actualMessageId, message: '未找到REFIDX对应的真实消息ID' }
+      const ret = { ok: false, code: 'REFIDX_UNRESOLVED', type, target_id: openid, input_message_id: originalMessageId, message_id: actualMessageId, message: '未找到TMP/REFIDX对应的真实消息ID' }
       Bot.makeLog('warn', ['撤回消息失败', ret], data.self_id)
       return ret
     }
-    if (record?.member_role && ['owner', 'admin'].includes(record.member_role)) {
-      const ret = { ok: false, code: 'ROLE_PROTECTED', type, target_id: openid, message_id: actualMessageId, message: '不能撤回管理员或群主消息' }
+    if (!isCurrentMessage && record?.bot === true && !isLocalBotMessage) {
+      const ret = { ok: false, code: 'FOREIGN_BOT_MESSAGE', type, target_id: openid, input_message_id: originalMessageId, message_id: actualMessageId, message: '不能撤回其他机器人发送的消息' }
       Bot.makeLog('warn', ['撤回消息跳过', ret], data.self_id)
       return ret
     }
-    if (type === 'user' && record && record.bot !== true) {
-      const ret = { ok: false, code: 'C2C_USER_MESSAGE', type: 'c2c', target_id: openid, message_id: messageId, message: 'C2C不能撤回用户发送的消息' }
+    if (!isCurrentMessage && !isLocalBotMessage && record?.member_role && ['owner', 'admin'].includes(record.member_role)) {
+      const ret = { ok: false, code: 'ROLE_PROTECTED', type, target_id: openid, input_message_id: originalMessageId, message_id: actualMessageId, message: '不能撤回管理员或群主消息' }
+      Bot.makeLog('warn', ['撤回消息跳过', ret], data.self_id)
+      return ret
+    }
+    if (type === 'user' && record && !isLocalBotMessage) {
+      const ret = { ok: false, code: 'C2C_USER_MESSAGE', type: 'c2c', target_id: openid, input_message_id: originalMessageId, message_id: messageId, message: 'C2C不能撤回用户发送的消息' }
       Bot.makeLog('warn', ['撤回消息跳过', ret], data.self_id)
       return ret
     }
@@ -1620,6 +1712,8 @@ const adapter = new class QQBotAdapter {
     const targetTypeApi = type === 'group' ? 'group' : 'user'
     const ret = await withTimeout(this.recallMessageById(data, actualMessageId, targetTypeApi, openid), 8000, '撤回超时')
       .catch(err => ({ ok: false, type: type === 'group' ? 'group' : 'c2c', target_id: openid, message_id: actualMessageId, message: err.message }))
+    ret.input_message_id = originalMessageId
+    ret.resolved_message_id = actualMessageId
     Bot.makeLog(ret?.ok ? 'info' : 'warn', [ret?.ok ? '撤回消息完成' : '撤回消息失败', ret], data.self_id)
     return ret
   }
@@ -2775,18 +2869,15 @@ const adapter = new class QQBotAdapter {
           if (ret.id) {
             const targetType = data.group_id ? 'group' : 'user'
             const targetId = data.group_id ? (data.raw?.group_id || data.group_openid || String(data.group_id || '').replace(`${data.self_id}${this.sep}`, '')) : (data.raw?.sender?.user_id || String(data.user_id || '').replace(`${data.self_id}${this.sep}`, ''))
-            const aliases = ret.ext_info?.ref_idx ? [ret.ext_info.ref_idx] : []
+            const aliases = getQQBotResponseAliases(ret)
             const contentFingerprint = getQQBotMessageContentFingerprint({ raw_message: Array.isArray(i) ? i.map(seg => seg?.text || seg?.content || '').join('') : '' })
-            await advancedWelcomeStore.recordMessageIndex({
-              message_id: ret.id,
+            await recordQQBotLocalMessageResponse({
               self_id: data.self_id,
               target_id: targetId,
               type: targetType,
               author_openid: data.self_id,
-              bot: true,
-              content_fingerprint: contentFingerprint,
-              aliases
-            })
+              content_fingerprint: contentFingerprint
+            }, ret)
             if (targetType === 'group' && targetId && !String(data.group_id || '').startsWith('qg_')) {
               await userManageStore.recordHistory(data.self_id, targetId, {
                 type: 'group',
@@ -2795,6 +2886,7 @@ const adapter = new class QQBotAdapter {
                 user_openid: data.self_id,
                 nickname: data.bot?.nickname || data.self_id,
                 bot: true,
+                local_bot: true,
                 raw_message: contentFingerprint,
                 time: Date.now()
               })
@@ -2806,6 +2898,7 @@ const adapter = new class QQBotAdapter {
                 user_openid: data.self_id,
                 nickname: data.bot?.nickname || data.self_id,
                 bot: true,
+                local_bot: true,
                 raw_message: contentFingerprint,
                 time: Date.now()
               })
@@ -3329,15 +3422,6 @@ const adapter = new class QQBotAdapter {
 
     if (data.message_id && data.group_openid) {
       const aliases = getQQBotMessageAliases(event).filter(Boolean).filter(id => id !== data.message_id)
-      if (!/^ROBOT\d+\.\d+_/i.test(String(data.message_id)) && aliases.some(id => String(id).startsWith('REFIDX_'))) {
-        Bot.makeLog('debug', ['群消息索引缺少真实消息ID', {
-          message_id: data.message_id,
-          aliases,
-          group_openid: data.group_openid,
-          author_openid: rawUserOpenid || '',
-          author: event.author || event.raw?.author || {}
-        }], data.self_id)
-      }
       await advancedWelcomeStore.recordMessageIndex({
         message_id: data.message_id,
         self_id: data.self_id,
@@ -3351,18 +3435,6 @@ const adapter = new class QQBotAdapter {
         seq: data.seq || 0,
         aliases
       })
-      Bot.makeLog('debug', ['群消息索引记录', {
-        message_id: data.message_id,
-        aliases,
-        group_openid: data.group_openid,
-        author_openid: rawUserOpenid || '',
-        member_role: authorRole,
-        bot: event.author?.bot === true,
-        raw_id: event.raw?.id,
-        event_id: event.id,
-        event_message_id: event.message_id,
-        msg_elements: event.msg_elements || event.raw?.msg_elements || []
-      }], data.self_id)
     }
 
     const fullMessage = ensureFullMessageConfig(config, data.self_id)
@@ -3464,6 +3536,7 @@ const adapter = new class QQBotAdapter {
       })
     }
     data.friend = data.bot.pickFriend(data.user_id)
+    this.wrapRecallResultReporter(data, data.friend)
   }
 
   async setGroupMap (data) {
@@ -3484,7 +3557,93 @@ const adapter = new class QQBotAdapter {
       ...data.sender
     })
     data.group = data.bot.pickGroup(data.group_id)
+    this.wrapRecallResultReporter(data, data.group)
     if (data.user_id) data.member = data.bot.pickMember(data.group_id, data.user_id)
+  }
+
+  wrapRecallResultReporter (data, target) {
+    if (!target?.recallMsg || target.recallMsg._qqbotResultReporter) return
+    const recall = target.recallMsg.bind(target)
+    const scheduleReport = () => {
+      if (data._qqbotRecallReportTimer) clearTimeout(data._qqbotRecallReportTimer)
+      data._qqbotRecallReportTimer = setTimeout(async () => {
+        data._qqbotRecallReportTimer = null
+        if (data._qqbotCurrentRecallPending) return
+        const reports = data._qqbotRecallReports || []
+        data._qqbotRecallReports = []
+        const failures = reports.filter(item => !item.result?.ok)
+        if (!failures.length) return
+        const successes = reports.filter(item => item.result?.ok)
+        let message
+        if (successes.length) {
+          const details = failures.map(item => {
+            const targetName = String(item.messageId || '') === String(data.message_id || '') ? '当前消息' : '引用消息'
+            return `${targetName}未撤回：${item.result?.message || '撤回失败'}${item.result?.code ? `（${item.result.code}）` : ''}`
+          })
+          message = `撤回部分成功\n${details.join('\n')}`
+        } else {
+          const result = failures.length === 1
+            ? failures[0].result
+            : {
+                ok: false,
+                code: 'ALL_RECALL_FAILED',
+                message: '所有撤回操作均失败或未执行',
+                results: failures.map(item => ({ input_message_id: item.messageId, ...item.result }))
+              }
+          message = formatQQBotRecallFailure(data, result || {}, failures[0]?.messageId || '')
+        }
+        try {
+          await data.reply?.(message)
+        } catch (err) {
+          Bot.makeLog('warn', ['撤回结果被动回复失败', err.message, err.response?.data], data.self_id)
+        }
+      }, 0)
+    }
+    const run = async (messageId, args) => {
+      let result
+      try {
+        result = await recall(messageId, ...args)
+      } catch (err) {
+        result = {
+          ok: false,
+          code: 'RECALL_EXCEPTION',
+          input_message_id: messageId,
+          message: err.message || String(err),
+          error: err.response?.data || { message: err.message }
+        }
+      }
+      if (result?.ok) {
+        Bot.makeLog('info', ['外部插件撤回成功', { input_message_id: messageId, resolved_message_id: result.resolved_message_id || result.message_id, target_id: result.target_id }], data.self_id)
+      } else {
+        Bot.makeLog('warn', ['外部插件撤回失败/未撤回', { input_message_id: messageId, code: result?.code, reason: result?.message }], data.self_id)
+      }
+      if (!Array.isArray(data._qqbotRecallReports)) data._qqbotRecallReports = []
+      data._qqbotRecallReports.push({ messageId, result })
+      scheduleReport()
+      return result
+    }
+    const wrapped = async (messageId, ...args) => {
+      if (String(messageId || '') === String(data.message_id || '')) {
+        data._qqbotCurrentRecallPending = true
+        try {
+          await new Promise(resolve => setTimeout(resolve, 0))
+          if (data._qqbotReplyRecallPromise) await data._qqbotReplyRecallPromise
+          return await run(messageId, args)
+        } finally {
+          data._qqbotCurrentRecallPending = false
+          scheduleReport()
+        }
+      }
+      const pending = run(messageId, args)
+      data._qqbotReplyRecallPromise = pending
+      try {
+        return await pending
+      } finally {
+        if (data._qqbotReplyRecallPromise === pending) data._qqbotReplyRecallPromise = null
+      }
+    }
+    wrapped._qqbotResultReporter = true
+    target.recallMsg = wrapped
   }
 
   isMessageAuditEvent (event) {
@@ -3924,6 +4083,7 @@ const adapter = new class QQBotAdapter {
 
     try {
       const { data: result } = await bot.sdk.request.post(`${urlBase}/messages`, payload)
+      await recordQQBotLocalMessageResponse({ self_id: selfId, target_id: targetId, type, author_openid: selfId, content_fingerprint: getQQBotMessageContentFingerprint(payload) }, result)
       Bot.makeLog('info', [`[${selfId}] ${isGroup ? '群聊' : '私聊'}破冰发送成功`, { targetId, id: result?.id }], selfId)
     } catch (err) {
       Bot.makeLog('warn', [`[${selfId}] ${isGroup ? '群聊' : '私聊'}破冰发送失败`, err.message, err.response?.data], selfId)
@@ -3966,7 +4126,7 @@ const adapter = new class QQBotAdapter {
     try {
       const { data: result } = await bot.sdk.request.post(`/v2/groups/${groupOpenid}/messages`, payload)
       await advancedWelcomeStore.recordSendSuccess(selfId, groupOpenid, eventId)
-      if (result?.id) await advancedWelcomeStore.recordMessageIndex({ message_id: result.id, self_id: selfId, target_id: groupOpenid, type: 'group', author_openid: selfId, bot: true })
+      await recordQQBotLocalMessageResponse({ self_id: selfId, target_id: groupOpenid, type: 'group', author_openid: selfId, content_fingerprint: getQQBotMessageContentFingerprint(payload) }, result)
       Bot.makeLog('info', [`[${selfId}] 高级群欢迎发送成功`, { groupOpenid, id: result?.id }], selfId)
     } catch (err) {
       const reason = err.response?.data?.message || err.message || '发送失败'
@@ -4033,6 +4193,7 @@ const adapter = new class QQBotAdapter {
       const attemptPeriod = active ? null : inviteStore.getUserWakeupPeriod(selfId, userOpenid)
       if (attemptPeriod !== null) inviteStore.markWakeupAttempt(selfId, userOpenid, attemptPeriod)
       const { data: result } = await bot.sdk.request.post(`/v2/users/${userOpenid}/messages`, payload)
+      await recordQQBotLocalMessageResponse({ self_id: selfId, target_id: userOpenid, type: 'user', author_openid: selfId, content_fingerprint: getQQBotMessageContentFingerprint(payload) }, result)
       Bot.makeLog('info', [`[${selfId}] ${active ? '主动' : '召回'}消息发送成功`, { userOpenid, id: result?.id }], selfId)
       const period = active ? null : inviteStore.getUserWakeupPeriod(selfId, userOpenid)
       if (period !== null) {
@@ -7721,7 +7882,7 @@ export class QQBotAdapter extends plugin {
 
     try {
       const { data: result } = await bot.sdk.request.post(url, payload)
-      if (result?.id) await advancedWelcomeStore.recordMessageIndex({ message_id: result.id, self_id: this.e.self_id, target_id: targetId, type: targetType, author_openid: this.e.self_id, bot: true })
+      await recordQQBotLocalMessageResponse({ self_id: this.e.self_id, target_id: targetId, type: targetType, author_openid: this.e.self_id, content_fingerprint: getQQBotMessageContentFingerprint(payload) }, result)
     } catch (err) {
       this.reply(`[${this.e.self_id}] 高级群欢迎预览发送失败: ${err.response?.data?.message || err.message}`, true)
     }
@@ -8804,7 +8965,14 @@ export class QQBotAdapter extends plugin {
     }
 
     try {
-      await bot.sdk.request.post(`${targetUrl}/messages`, payload)
+      const { data: result } = await bot.sdk.request.post(`${targetUrl}/messages`, payload)
+      await recordQQBotLocalMessageResponse({
+        self_id: selfId,
+        target_id: isGroup ? rawGroupId : rawUserId,
+        type: isGroup ? 'group' : 'user',
+        author_openid: selfId,
+        content_fingerprint: getQQBotMessageContentFingerprint(payload)
+      }, result)
       Bot.makeLog('info', [`[${selfId}] 召回预览消息已发送`], selfId)
     } catch (err) {
       this.reply(`[${selfId}] 预览发送失败: ${err.response?.data?.message || err.message}`, true)

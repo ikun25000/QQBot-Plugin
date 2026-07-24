@@ -161,6 +161,7 @@ class UserManageStore {
       user_openid: msg.user_openid || '',
       nickname: safeText(msg.nickname || '', 80),
       bot: msg.bot === true,
+      local_bot: msg.local_bot === true,
       raw_message: safeText(msg.raw_message || '', 0),
       raw: safeClone(msg.raw),
       time: msg.time || nowIso()
@@ -249,6 +250,17 @@ class UserManageStore {
     const list = Array.isArray(this._data.histories[this._historyKey(selfId, targetOpenid, type)]) ? this._data.histories[this._historyKey(selfId, targetOpenid, type)] : []
     const id = String(messageId)
     return list.find(item => item.message_id === id || item.aliases?.includes?.(id)) || null
+  }
+
+  findUniqueHistoryByMessageId (selfId = '', targetOpenid = '', messageId = '', type = 'group') {
+    if (!messageId) return null
+    const list = Array.isArray(this._data.histories[this._historyKey(selfId, targetOpenid, type)]) ? this._data.histories[this._historyKey(selfId, targetOpenid, type)] : []
+    const id = String(messageId)
+    const matches = list.filter(item => item.message_id === id || item.aliases?.includes?.(id))
+    if (new Set(matches.map(item => item.message_id).filter(Boolean)).size !== 1) return null
+    const latest = matches.at(-1)
+    const localBot = matches.some(item => item.local_bot === true)
+    return localBot ? { ...latest, local_bot: true, user_openid: selfId } : latest
   }
 
   findHistoryByAnyId (selfId = '', targetOpenid = '', ids = [], type = 'group') {

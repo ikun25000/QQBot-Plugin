@@ -19,7 +19,7 @@ function weekKey (date = new Date()) {
 class AdvancedWelcomeStore {
   constructor () {
     this.type = 'level'
-    this._data = { groups: {}, pendingComplaints: {}, messageIds: {} }
+    this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {} }
     this._db = null
     this._ready = false
     this._saveTimer = null
@@ -31,7 +31,7 @@ class AdvancedWelcomeStore {
 
   async init () {
     if (this._ready) return
-    this._data = { groups: {}, pendingComplaints: {}, messageIds: {} }
+    this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {} }
     try {
       const { default: Level } = await import('./level.js')
       fs.mkdirSync(LEVEL_DATA_DIR, { recursive: true })
@@ -44,9 +44,9 @@ class AdvancedWelcomeStore {
       if (this._db) { try { this._db.close() } catch {}; this._db = null }
       fs.mkdirSync(JSON_DATA_DIR, { recursive: true })
       try {
-        this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, ...JSON.parse(fs.readFileSync(this._jsonPath(), 'utf-8')) }
+        this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {}, ...JSON.parse(fs.readFileSync(this._jsonPath(), 'utf-8')) }
       } catch {
-        this._data = { groups: {}, pendingComplaints: {}, messageIds: {} }
+        this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {} }
       }
     }
     this._ready = true
@@ -55,6 +55,7 @@ class AdvancedWelcomeStore {
   _setByKey (key, value) {
     if (String(key).startsWith('group:')) this._data.groups[String(key).slice(6)] = value
     else if (String(key).startsWith('pending:')) this._data.pendingComplaints[String(key).slice(8)] = value
+    else if (String(key).startsWith('localmsg:')) this._data.localMessageIds[String(key).slice(9)] = value
     else if (String(key).startsWith('msg:')) this._data.messageIds[String(key).slice(4)] = value
   }
 
@@ -308,7 +309,13 @@ class AdvancedWelcomeStore {
 
   async recordMessageIndex (record = {}) {
     if (!record.message_id) return false
-    const item = { ...record, time: record.time || nowIso() }
+    const oldItem = this._data.messageIds[record.message_id]
+    const sameContext = oldItem?.self_id === record.self_id && oldItem?.target_id === record.target_id && oldItem?.type === record.type
+    const item = {
+      ...record,
+      local_bot: record.local_bot === true || (sameContext && oldItem.local_bot === true),
+      time: record.time || nowIso()
+    }
     this._data.messageIds[record.message_id] = item
     await this._save(`msg:${record.message_id}`, item)
     for (const alias of Array.isArray(record.aliases) ? record.aliases : []) {
@@ -338,6 +345,40 @@ class AdvancedWelcomeStore {
     return `alias:${selfId}:${type}:${targetId}:${alias}`
   }
 
+  _localMessageKey (selfId = '', type = '', targetId = '', alias = '') {
+    return `${selfId}:${type}:${targetId}:${alias}`
+  }
+
+  async recordLocalMessageResponse (record = {}) {
+    if (!record.message_id || !record.self_id || !record.type || !record.target_id) return false
+    const aliases = [...new Set([record.message_id, ...(record.aliases || [])].filter(Boolean).map(String))]
+    for (const alias of aliases) {
+      const key = this._localMessageKey(record.self_id, record.type, record.target_id, alias)
+      const old = this._data.localMessageIds[key]
+      const actualMessageIds = [...new Set([
+        ...(old?.actual_message_ids || []),
+        old?.actual_message_id,
+        record.message_id
+      ].filter(Boolean).map(String))]
+      const item = {
+        ...record,
+        alias,
+        actual_message_id: record.message_id,
+        actual_message_ids: actualMessageIds,
+        local_bot: true,
+        time: record.time || nowIso()
+      }
+      this._data.localMessageIds[key] = item
+      await this._save(`localmsg:${key}`, item)
+    }
+    return true
+  }
+
+  getLocalMessageResponse (messageId = '', context = {}) {
+    if (!messageId || !context.selfId || !context.type || !context.targetId) return null
+    return this._data.localMessageIds[this._localMessageKey(context.selfId, context.type, context.targetId, messageId)] || null
+  }
+
   getMessageIndex (messageId = '', context = {}) {
     if (!messageId) return null
     if (context.selfId && context.type && context.targetId) {
@@ -365,7 +406,8 @@ class AdvancedWelcomeStore {
         if (!item || item.actual_message_id || item.self_id !== selfId || item.target_id !== targetId || item.type !== 'group') return false
         if (excludedIds.has(String(item.message_id || ''))) return false
         if (!/^ROBOT\d+\.\d+_/i.test(String(item.message_id || ''))) return false
-        if (item.bot === true || item.member_role !== 'member') return false
+        const localBot = item.local_bot === true
+        if (!localBot && (item.bot === true || item.member_role !== 'member')) return false
         if (String(item.content_fingerprint || '').replace(/\s+/g, ' ').trim() !== text) return false
         const itemTime = Date.parse(item.time || '') || Number(item.time) || 0
         if (!(itemTime > 0 && itemTime <= beforeTime && beforeTime - itemTime <= limitMs)) return false
