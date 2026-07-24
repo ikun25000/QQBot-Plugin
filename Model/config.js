@@ -20,14 +20,17 @@ let { config, configSave } = await makeConfig('QQBot', {
   },
   sendButton: true,
   customMD: {},
-  mdSuffix: {},
-  btnSuffix: {},
+  messageSuffix: {
+    bots: {}
+  },
   filterLog: {},
   simplifiedSdkLog: false,
   markdownImgScale: 1.0,
   sep: '',
   bus: {},
   bots: {},
+  apiMode: 'old',
+  selfOpenid: {},
   claw: {
     bots: {}
   },

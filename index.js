@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { encode as encodeSilk } from 'silk-wasm'
 import crypto from 'node:crypto'
 import axios from 'axios'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import {
   Dau,
   importJS,
@@ -45,7 +46,6 @@ import {
   setFullMessageIgnoreBotMaster,
   setFullMessageOption,
   splitMarkDownTemplate,
-  getMustacheTemplating,
   switchFullMessageDB,
   ensureIcebreakerConfig,
   ensureRecallConfig,
@@ -82,8 +82,13 @@ import {
 } from './Model/index.js'
 import { createRequire } from 'module'
 import { Bot as QQBot } from 'qq-official-bot'
+import { BindStatus, qrRegister } from './Model/qr-auth.js'
 const require = createRequire(import.meta.url)
 const qqbotOriginalEventMap = new WeakMap()
+const qqbotInternalSendStorage = new AsyncLocalStorage()
+const qqbotMessageSuffixApplied = new WeakSet()
+const qqbotMessageSuffixExcluded = new WeakSet()
+const qqbotApiSwitchConfirmations = new Map()
 
 function stripAttachmentPlaceholders (text) {
   if (typeof text !== 'string' || !text.includes('<')) return text
@@ -583,6 +588,87 @@ function setBotConfigValue (selfId, key, value) {
   botConfig[key] = value
 }
 
+function ensureMessageSuffixConfig (selfId = '') {
+  if (!config.messageSuffix || typeof config.messageSuffix !== 'object' || Array.isArray(config.messageSuffix)) config.messageSuffix = { bots: {} }
+  if (!config.messageSuffix.bots || typeof config.messageSuffix.bots !== 'object' || Array.isArray(config.messageSuffix.bots)) config.messageSuffix.bots = {}
+  const key = selfId || 'default'
+  if (!config.messageSuffix.bots[key] || typeof config.messageSuffix.bots[key] !== 'object') config.messageSuffix.bots[key] = {}
+  const item = config.messageSuffix.bots[key]
+  if (typeof item.enabled !== 'boolean') item.enabled = false
+  if (typeof item.markdown !== 'string') item.markdown = ''
+  return item
+}
+
+function withQQBotInternalSend (fn) {
+  return qqbotInternalSendStorage.run(true, fn)
+}
+
+function isQQBotInternalSend () {
+  return qqbotInternalSendStorage.getStore() === true
+}
+
+function getQQBotMessageSuffixInputState (msg) {
+  const state = { eligible: false, excludedMedia: false }
+  const walk = value => {
+    if (typeof value === 'string') {
+      if (value.trim()) state.eligible = true
+      return
+    }
+    if (!value || typeof value !== 'object') return
+    if (Array.isArray(value)) {
+      value.forEach(walk)
+      return
+    }
+    if (value.type === 'raw') {
+      return
+    }
+    if (['record', 'audio', 'video', 'file'].includes(value.type)) state.excludedMedia = true
+    if (value.type === 'text' && String(value.text || '').trim()) state.eligible = true
+    if (value.type === 'image') state.eligible = true
+    if (value.type === 'markdown') {
+      const content = typeof value.data === 'string' ? value.data : value.data?.content || value.content
+      if (String(content || '').trim()) state.eligible = true
+    }
+    if (value.type === 'node' && Array.isArray(value.data)) value.data.forEach(item => walk(item?.message))
+  }
+  walk(msg)
+  return state
+}
+
+function excludeQQBotRawSuffixSegments (value) {
+  if (!value || typeof value !== 'object') return
+  if (Array.isArray(value)) {
+    value.forEach(excludeQQBotRawSuffixSegments)
+    return
+  }
+  qqbotMessageSuffixExcluded.add(value)
+}
+
+function getQQBotActiveMessageSuffix (selfId = '') {
+  const suffix = ensureMessageSuffixConfig(selfId)
+  if (!suffix.enabled) return ''
+  const markdown = suffix.markdown.trim()
+  if (markdown) return markdown
+  suffix.enabled = false
+  Promise.resolve(configSave()).catch(err => Bot.makeLog('warn', ['消息后缀自动关闭保存失败', err.message], selfId))
+  return ''
+}
+
+function appendQQBotMessageSuffix (messages, markdown = '', state = {}) {
+  if (!markdown || !state.eligible || state.excludedMedia || !Array.isArray(messages)) return messages
+  for (const message of messages) {
+    const segments = Array.isArray(message) ? message : [message]
+    for (const segment of segments) {
+      if (segment?.type !== 'markdown' || typeof segment.content !== 'string' || !segment.content.trim()) continue
+      if (qqbotMessageSuffixExcluded.has(segment)) continue
+      if (qqbotMessageSuffixApplied.has(segment)) continue
+      segment.content = `${segment.content}\n\n${markdown}`
+      qqbotMessageSuffixApplied.add(segment)
+    }
+  }
+  return messages
+}
+
 function getOfflineDetectConfig (selfId = '') {
   return ensureBotConfig(selfId).offlineDetect || {}
 }
@@ -814,6 +900,157 @@ function extractRobotUinFromShareUrl (shareUrl = '') {
   return match?.[1] || ''
 }
 
+function getQQBotApiMode () {
+  return config.apiMode === 'new' ? 'new' : 'old'
+}
+
+function getQQBotApiEndpoints () {
+  if (getQQBotApiMode() === 'new') {
+    return {
+      tokenUrl: 'https://api.bot.qq.com/app/getAppAccessToken',
+      apiBase: 'https://api.bot.qq.com',
+      wsUrl: 'wss://api.bot.qq.com/websocket/'
+    }
+  }
+  return {
+    tokenUrl: 'https://bots.qq.com/app/getAppAccessToken',
+    apiBase: config.bot?.sandbox ? 'https://sandbox.api.sgroup.qq.com' : 'https://api.sgroup.qq.com',
+    wsUrl: config.bot?.sandbox ? 'wss://sandbox.api.sgroup.qq.com/websocket' : 'wss://api.sgroup.qq.com/websocket'
+  }
+}
+
+function getQQBotRequestBase (selfId = '') {
+  const apiBase = getQQBotApiEndpoints().apiBase
+  return config.bus?.[selfId]
+    ? `https://${config.bus[selfId]}/proxy?url=${apiBase}`
+    : apiBase
+}
+
+function parseQQBotAccount (value = '') {
+  const text = String(value || '').trim()
+  const parts = text.split(':')
+  const legacy = parts.length === 6
+  const modern = parts.length === 4
+  const selfId = parts[0]?.trim() || ''
+  const appid = parts[1]?.trim() || ''
+  const legacyToken = legacy ? parts[2]?.trim() || '' : ''
+  const secret = (legacy ? parts[3] : parts[2])?.trim() || ''
+  const legacyGroup = legacy ? parts[4]?.trim() || '' : ''
+  const guildPrivate = (legacy ? parts[5] : parts[3])?.trim() || ''
+
+  if (!selfId) return { ok: false, error: '缺少机器人QQ号' }
+  if (!/^\d+$/.test(selfId)) return { ok: false, error: '机器人QQ号必须为数字' }
+  if (!appid) return { ok: false, error: '缺少AppID' }
+  if (!/^\d+$/.test(appid)) return { ok: false, error: 'AppID必须为数字' }
+  if (!modern && !legacy) {
+    if (parts.length === 1) return { ok: false, error: '缺少AppID' }
+    if (parts.length === 2) return { ok: false, error: '缺少AppSecret' }
+    if (parts.length === 3) return { ok: false, error: '缺少频道私域开关' }
+    if (parts.length === 5) {
+      if (!parts[2]?.trim()) return { ok: false, error: '缺少Token（旧格式该字段不会使用，但不能省略）' }
+      if (!parts[3]?.trim()) return { ok: false, error: '缺少AppSecret' }
+      if (!parts[4]?.trim()) return { ok: false, error: '缺少群Bot开关（旧格式该字段不会使用，但不能省略）' }
+      return { ok: false, error: '缺少频道私域开关' }
+    }
+    return { ok: false, error: '格式错误，应为 机器人QQ号:AppID:AppSecret:[01]；兼容旧格式 机器人QQ号:AppID:Token:AppSecret:[01]:[01]' }
+  }
+  if (legacy && !legacyToken) return { ok: false, error: '缺少Token（旧格式该字段不会使用，但不能省略）' }
+  if (!secret) return { ok: false, error: '缺少AppSecret' }
+  if (legacy && !legacyGroup) return { ok: false, error: '缺少群Bot开关（旧格式该字段不会使用，但不能省略）' }
+  if (!guildPrivate) return { ok: false, error: '缺少频道私域开关' }
+  if (!/^[01]$/.test(guildPrivate)) return { ok: false, error: '频道私域开关必须为0或1' }
+
+  const account = { selfId, appid, secret, guildPrivate, legacy }
+  account.text = `${selfId}:${appid}:${secret}:${guildPrivate}`
+  return { ok: true, account }
+}
+
+function migrateLegacyAccountConfig () {
+  if (!Array.isArray(config.token)) {
+    config.token = []
+    return true
+  }
+  let changed = false
+  const seen = new Set()
+  const next = config.token.map(value => {
+    const parsed = parseQQBotAccount(value)
+    if (!parsed.ok) {
+      Bot.makeLog?.('warn', ['QQBot账号配置无法自动迁移', parsed.error], 'QQBot-Plugin')
+      return String(value)
+    }
+    if (parsed.account.text !== String(value)) changed = true
+    return parsed.account.text
+  }).filter(value => {
+    if (seen.has(value)) {
+      changed = true
+      return false
+    }
+    seen.add(value)
+    return true
+  })
+  if (changed) config.token = next
+  return changed
+}
+
+function ensureSelfOpenidMap () {
+  if (!config.selfOpenid || typeof config.selfOpenid !== 'object' || Array.isArray(config.selfOpenid)) config.selfOpenid = {}
+  return config.selfOpenid
+}
+
+async function learnQQBotSelfOpenid (selfId = '', event = {}) {
+  if (event?._qqbotFullMessageCreate !== true && event?.raw?._qqbotFullMessageCreate !== true) return ''
+  const mentions = event._mentions || event.mentions || event.raw?._mentions || event.raw?.mentions
+  if (!Array.isArray(mentions)) return ''
+  const mention = mentions.find(item => item?.bot === true && item?.is_you === true && (item?.id || item?.member_openid))
+  const openid = String(mention?.id || mention?.member_openid || '').trim()
+  if (!selfId || !openid) return ''
+  const map = ensureSelfOpenidMap()
+  const previous = String(map[selfId] || '')
+  if (previous === openid) return openid
+  map[selfId] = openid
+  if (previous) Bot.makeLog?.('warn', [`[${selfId}] 机器人self_openid发生变化，已覆盖`, { previous, current: openid }], selfId)
+  try {
+    await configSave()
+  } catch (err) {
+    Bot.makeLog?.('error', [`[${selfId}] 保存self_openid映射失败`, err.message], selfId)
+  }
+  return openid
+}
+
+function exposeQQBotSelfOpenid (raw, selfId = '', currentOpenid = '') {
+  if (!raw || typeof raw !== 'object') return
+  Object.defineProperty(raw, 'self_openid', {
+    configurable: true,
+    enumerable: true,
+    get () {
+      if (currentOpenid) return currentOpenid
+      const map = config.selfOpenid
+      if (!map || typeof map !== 'object' || Array.isArray(map)) return 'unknown'
+      return String(map[selfId] || 'unknown')
+    }
+  })
+}
+
+async function getQQBotMeByCredentials (appid, secret, selfId = '') {
+  const endpoints = getQQBotApiEndpoints()
+  const tokenRes = await axios.post(endpoints.tokenUrl, {
+    appId: appid,
+    clientSecret: secret
+  }, { timeout: 15000, headers: withQQBotUserAgentHeaders(selfId) })
+  const accessToken = tokenRes.data?.access_token
+  if (!accessToken) throw new Error(getQQBotAuthError(tokenRes.data) || '获取access_token失败')
+  const meRes = await axios.get(`${endpoints.apiBase}/users/@me`, {
+    timeout: 15000,
+    headers: {
+      Authorization: `QQBot ${accessToken}`,
+      'X-Union-Appid': appid,
+      ...withQQBotUserAgentHeaders(selfId, { 'User-Agent': 'BotNodeSDK/0.0.1' })
+    }
+  })
+  const me = meRes.data || {}
+  return { me, robotUin: extractRobotUinFromShareUrl(me.share_url) }
+}
+
 function normalizeQQBotOpenid (value = '') {
   const text = String(value || '')
   if (!text) return ''
@@ -822,37 +1059,16 @@ function normalizeQQBotOpenid (value = '') {
 }
 
 async function validateQQBotToken (tokenText) {
-  const parts = String(tokenText || '').split(':')
-  const [selfId, appid, token, secret, sandboxRaw, intentRaw] = parts
-  if (!selfId || !appid || !secret || parts.length < 6) {
-    return { ok: false, error: '配置格式错误' }
-  }
-  const sandbox = sandboxRaw === '1'
+  const parsed = parseQQBotAccount(tokenText)
+  if (!parsed.ok) return parsed
+  const { selfId, appid, secret, guildPrivate, text } = parsed.account
   try {
-    const tokenRes = await axios.post('https://bots.qq.com/app/getAppAccessToken', {
-      appId: appid,
-      clientSecret: secret
-    }, { timeout: 15000, headers: withQQBotUserAgentHeaders(selfId) })
-    const accessToken = tokenRes.data?.access_token
-    if (!accessToken) {
-      return { ok: false, error: getQQBotAuthError(tokenRes.data) || 'secret验证失败' }
-    }
-    const apiBase = sandbox ? 'https://sandbox.api.sgroup.qq.com' : 'https://api.sgroup.qq.com'
-    const meRes = await axios.get(`${apiBase}/users/@me`, {
-      timeout: 15000,
-      headers: {
-        Authorization: `QQBot ${accessToken}`,
-        'X-Union-Appid': appid,
-        ...withQQBotUserAgentHeaders(selfId, { 'User-Agent': 'BotNodeSDK/0.0.1' })
-      }
-    })
-    const me = meRes.data || {}
-    const robotUin = extractRobotUinFromShareUrl(me.share_url)
+    const { me, robotUin } = await getQQBotMeByCredentials(appid, secret, selfId)
     const warnings = []
     if (robotUin && String(robotUin) !== String(selfId)) {
       warnings.push(`配置QQ(${selfId})与@me返回robot_uin(${robotUin})不一致`)
     }
-    return { ok: true, selfId, appid, token, secret, sandbox, intentRaw, me, robotUin, warnings }
+    return { ok: true, selfId, appid, secret, guildPrivate, text, me, robotUin, warnings }
   } catch (err) {
     const authError = getQQBotAuthError(err.response?.data)
     return { ok: false, error: authError || err.response?.data?.message || err.message || 'secret验证失败' }
@@ -906,6 +1122,16 @@ function migrateLegacyBotConfig () {
   }
   for (const key of Object.keys(legacy)) delete config[key]
   return true
+}
+
+function removeLegacySuffixConfig () {
+  let changed = false
+  for (const key of ['mdSuffix', 'btnSuffix']) {
+    if (!Object.prototype.hasOwnProperty.call(config, key)) continue
+    delete config[key]
+    changed = true
+  }
+  return changed
 }
 
 function patchGroupMessageCreateEvent () {
@@ -2305,6 +2531,9 @@ const adapter = new class QQBotAdapter {
   }
 
   async makeRawMarkdownMsg (data, msg, skipHandle = false) {
+    const suffixState = getQQBotMessageSuffixInputState(msg)
+    const officialChat = (data.group_id && !String(data.group_id).startsWith('qg_')) || (data.user_id && !String(data.user_id).startsWith('qg_') && !data.guild_id && !data.channel_id)
+    const suffixMarkdown = !isQQBotInternalSend() && officialChat ? getQQBotActiveMessageSuffix(data.self_id) : ''
     if (!skipHandle && Handler.has('QQBot.makeRawMarkdownMsg')) {
       const res = await Handler.call('QQBot.makeRawMarkdownMsg', data, {
         adapter: this,
@@ -2312,7 +2541,7 @@ const adapter = new class QQBotAdapter {
         msg,
         make: nextMsg => this.makeRawMarkdownMsg(data, nextMsg ?? msg, true)
       })
-      if (res !== false && res !== undefined && res !== null) return res
+      if (res !== false && res !== undefined && res !== null) return appendQQBotMessageSuffix(res, suffixMarkdown, suffixState)
     }
 
     const messages = []
@@ -2373,6 +2602,7 @@ const adapter = new class QQBotAdapter {
           for (const { message } of i.data) { messages.push(...(await this.makeRawMarkdownMsg(data, message, true))) }
           continue
         case 'raw':
+          excludeQQBotRawSuffixSegments(i.data)
           if (Array.isArray(i.data)) {
             messages.push(i.data)
           } else if (i.data && (i.data.type === 'keyboard' || i.data.type === 'button')) {
@@ -2412,7 +2642,7 @@ const adapter = new class QQBotAdapter {
       data._files = (data._files || []).concat(files)
     }
 
-    return messages
+    return appendQQBotMessageSuffix(messages, suffixMarkdown, suffixState)
   }
 
   makeMarkdownText (data, text, button) {
@@ -2462,18 +2692,6 @@ const adapter = new class QQBotAdapter {
           })
         }
         index++
-      }
-    }
-
-    if (config.mdSuffix?.[data.self_id]) {
-      if (!params.some(p => config.mdSuffix[data.self_id].some(c => (c.key === p.key && p.values[0] !== '\u200B')))) {
-        for (const i of config.mdSuffix[data.self_id]) {
-          if (data.group_id) data.group = data.bot.pickGroup(data.group_id)
-          if (data.user_id) data.friend = data.bot.pickFriend(data.user_id)
-          if (data.user_id && data.group_id) data.member = data.bot.pickMember(data.group_id, data.user_id)
-          const value = getMustacheTemplating(i.values[0], { e: data })
-          params.push({ key: i.key, values: [value] })
-        }
       }
     }
 
@@ -2647,27 +2865,6 @@ const adapter = new class QQBotAdapter {
       } else {
         messages.push(tmp)
       }
-    }
-
-    if (template.length && button.length < 5 && config.btnSuffix[data.self_id]) {
-      let { position, values } = config.btnSuffix[data.self_id]
-      position = +position - 1
-      if (position > button.length) {
-        position = button.length
-      }
-      const btn = values.filter(i => {
-        if (i.show) {
-          switch (i.show.type) {
-            case 'random':
-              if (i.show.data <= _.random(1, 100)) return false
-              break
-            default:
-              break
-          }
-        }
-        return true
-      })
-      button.splice(position, 0, ...this.makeButtons(data, [btn]))
     }
 
     if (button.length) {
@@ -3593,7 +3790,7 @@ const adapter = new class QQBotAdapter {
           message = formatQQBotRecallFailure(data, result || {}, failures[0]?.messageId || '')
         }
         try {
-          await data.reply?.(message)
+          await withQQBotInternalSend(() => data.reply?.(message))
         } catch (err) {
           Bot.makeLog('warn', ['撤回结果被动回复失败', err.message, err.response?.data], data.self_id)
         }
@@ -3684,6 +3881,7 @@ const adapter = new class QQBotAdapter {
       return
     }
 
+    const selfOpenid = await learnQQBotSelfOpenid(id, event)
     const botNames = [event.bot?.nickname, event.bot?._qqbotNickname]
     const normalizedMessage = this.normalizeSdkMessage(event.message, event._mentions || event.mentions).map(seg => {
       if (seg?.type === 'text') return { ...seg, text: normalizeQQBotContentByConfig(seg.text, id, botNames, event._mentions || event.mentions) }
@@ -3704,6 +3902,7 @@ const adapter = new class QQBotAdapter {
     }
 
     if (data.raw) {
+      exposeQQBotSelfOpenid(data.raw, id, selfOpenid)
       data.raw._qqbotFullMessageCreate = event._qqbotFullMessageCreate === true
       data.raw._qqbotFullMessageRecorded = isFullMessageGroupRecorded(id, event.group_openid || event.raw?.group_openid || '')
     }
@@ -3814,7 +4013,7 @@ const adapter = new class QQBotAdapter {
     const blackUserState = userManageStore.getBlackUser(data.self_id, eventUserOpenid)
     const blackGroupState = eventGroupOpenid ? userManageStore.getBlackGroup(data.self_id, eventGroupOpenid) : null
     if (!isInternalQQBotCommand && !isGuildLikeMessage && (blackUserState || blackGroupState)) {
-      if (ensureUserManageConfig(data.self_id).blackReply) await data.reply?.((blackUserState?.reason || blackGroupState?.reason) || '当前环境被拉黑，请联系开发者解决')
+      if (ensureUserManageConfig(data.self_id).blackReply) await withQQBotInternalSend(() => data.reply?.((blackUserState?.reason || blackGroupState?.reason) || '当前环境被拉黑，请联系开发者解决'))
       return
     }
     if (!isInternalQQBotCommand && !isGuildLikeMessage && activeCancelState) {
@@ -3822,13 +4021,13 @@ const adapter = new class QQBotAdapter {
       if (cancelState.forced) {
         const days = Math.max(0, Math.ceil((Number(cancelState.block_until || now) - now) / 86400000))
         const reason = cancelState.reason || '你已被强制注销(可能违反用户协议)，只有开发者强制撤回才能解除。'
-        await data.reply?.(`${reason}\n你的账号所有数据被清空，${days}天无法使用机器人，如果有问题，请自行查找机器人官方群/开发者(如果有的话，即使找到也无法恢复你的数据)`)
+        await withQQBotInternalSend(() => data.reply?.(`${reason}\n你的账号所有数据被清空，${days}天无法使用机器人，如果有问题，请自行查找机器人官方群/开发者(如果有的话，即使找到也无法恢复你的数据)`))
       } else if (now < Number(cancelState.cancel_at || 0)) {
         const cmd = `#机器人用户注销撤回 ${data.self_id}`
-        await data.reply?.([`你已经注销，撤回注销才能使用\n\n><qqbot-cmd-input text="${cmd}" show="撤回注销"/>`, segment.button([{ text: '撤回注销', callback: cmd }])])
+        await withQQBotInternalSend(() => data.reply?.([`你已经注销，撤回注销才能使用\n\n><qqbot-cmd-input text="${cmd}" show="撤回注销"/>`, segment.button([{ text: '撤回注销', callback: cmd }])]))
       } else {
         const days = Math.max(0, Math.ceil((Number(cancelState.block_until || now) - now) / 86400000))
-        await data.reply?.(`你的账号所有数据被清空，${days}天无法使用机器人，如果有问题，请自行查找机器人官方群/开发者(如果有的话，即使找到也无法恢复你的数据)`)
+        await withQQBotInternalSend(() => data.reply?.(`你的账号所有数据被清空，${days}天无法使用机器人，如果有问题，请自行查找机器人官方群/开发者(如果有的话，即使找到也无法恢复你的数据)`))
       }
       return
     }
@@ -3940,7 +4139,7 @@ const adapter = new class QQBotAdapter {
     const callbackBlackUser = userManageStore.getBlackUser(data.self_id, callbackUserOpenid)
     const callbackBlackGroup = callbackGroupOpenid ? userManageStore.getBlackGroup(data.self_id, callbackGroupOpenid) : null
     if (!callbackIsInternalQQBotCommand && !callbackIsGuildLike && (callbackBlackUser || callbackBlackGroup)) {
-      if (ensureUserManageConfig(data.self_id).blackReply) await data.reply?.((callbackBlackUser?.reason || callbackBlackGroup?.reason) || '当前环境被拉黑，请联系开发者解决')
+      if (ensureUserManageConfig(data.self_id).blackReply) await withQQBotInternalSend(() => data.reply?.((callbackBlackUser?.reason || callbackBlackGroup?.reason) || '当前环境被拉黑，请联系开发者解决'))
       return
     }
     if (!callbackIsInternalQQBotCommand && !callbackIsGuildLike && callbackActiveCancel) {
@@ -3948,13 +4147,13 @@ const adapter = new class QQBotAdapter {
       if (callbackCancelState.forced) {
         const days = Math.max(0, Math.ceil((Number(callbackCancelState.block_until || now) - now) / 86400000))
         const reason = callbackCancelState.reason || '你已被强制注销(可能违反用户协议)，只有开发者强制撤回才能解除。'
-        await data.reply?.(`${reason}\n你的账号所有数据被清空，${days}天无法使用机器人，如果有问题，请自行查找机器人官方群/开发者(如果有的话，即使找到也无法恢复你的数据)`)
+        await withQQBotInternalSend(() => data.reply?.(`${reason}\n你的账号所有数据被清空，${days}天无法使用机器人，如果有问题，请自行查找机器人官方群/开发者(如果有的话，即使找到也无法恢复你的数据)`))
       } else if (now < Number(callbackCancelState.cancel_at || 0)) {
         const cmd = `#机器人用户注销撤回 ${data.self_id}`
-        await data.reply?.([`你已经注销，撤回注销才能使用\n\n><qqbot-cmd-input text="${cmd}" show="撤回注销"/>`, segment.button([{ text: '撤回注销', callback: cmd }])])
+        await withQQBotInternalSend(() => data.reply?.([`你已经注销，撤回注销才能使用\n\n><qqbot-cmd-input text="${cmd}" show="撤回注销"/>`, segment.button([{ text: '撤回注销', callback: cmd }])]))
       } else {
         const days = Math.max(0, Math.ceil((Number(callbackCancelState.block_until || now) - now) / 86400000))
-        await data.reply?.(`你的账号所有数据被清空，${days}天无法使用机器人，如果有问题，请自行查找机器人官方群/开发者(如果有的话，即使找到也无法恢复你的数据)`)
+        await withQQBotInternalSend(() => data.reply?.(`你的账号所有数据被清空，${days}天无法使用机器人，如果有问题，请自行查找机器人官方群/开发者(如果有的话，即使找到也无法恢复你的数据)`))
       }
       return
     }
@@ -4290,7 +4489,7 @@ const adapter = new class QQBotAdapter {
                 msg = i
               }
               if (msg?.length > 0) {
-                this.sendGroupMsg({ ...data, group_id: groupOpenid, group_openid: groupOpenid }, msg)
+                withQQBotInternalSend(() => this.sendGroupMsg({ ...data, group_id: groupOpenid, group_openid: groupOpenid }, msg))
               }
             })
           }
@@ -4536,6 +4735,7 @@ const adapter = new class QQBotAdapter {
     if (!bot) return
     if (bot.disabledRuntime) return
     bot.disabledRuntime = true
+    bot.disabledReason = reason || bot.disabledReason || '机器人运行态已停止'
     bot.isReconnecting = false
     try { bot.sdk.sessionManager.getAccessToken = async () => ({ access_token: '', expires_in: '0' }) } catch {}
     try { bot.sdk.sessionManager.getWsUrl = async () => '' } catch {}
@@ -4865,14 +5065,22 @@ const adapter = new class QQBotAdapter {
   // ========== 掉线检测结束 ==========
 
 async connect (token) {
-  token = token.split(':')
-  const id = token[0]
+  const parsed = parseQQBotAccount(token)
+  if (!parsed.ok) return { ok: false, reason: parsed.error }
+  const account = parsed.account
+  const id = account.selfId
+  const existingBot = Bot[id]
+  if (existingBot) {
+    this.stopOfflineCheck(id)
+    try { await existingBot.logout() } catch (err) {
+      Bot.makeLog('warn', [`[${id}] 替换账号配置时关闭旧连接失败`, err.message], id)
+    }
+  }
   const opts = {
     ...config.bot,
     real_self_id: id,
-    appid: token[1],
-    token: token[2],
-    secret: token[3],
+    appid: account.appid,
+    secret: account.secret,
     intents: [
       'GUILDS',
       'GUILD_MEMBERS',
@@ -4884,11 +5092,12 @@ async connect (token) {
     mode: 'websocket'
   }
 
-  if (Number(token[4])) opts.intents.push('GROUP_AT_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE', 'GROUP_MEMBER_ADD', 'GROUP_MEMBER_REMOVE')
-  if (Number(token[5])) opts.intents.push('GUILD_MESSAGES')
+  opts.intents.push('GROUP_AT_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE', 'GROUP_MEMBER_ADD', 'GROUP_MEMBER_REMOVE')
+  if (Number(account.guildPrivate)) opts.intents.push('GUILD_MESSAGES')
   else opts.intents.push('PUBLIC_GUILD_MESSAGES')
 
   let sdk = new QQBot(opts)
+  sdk.request.defaults.baseURL = getQQBotRequestBase(id)
   const getCurrentUserAgent = () => getQQBotUserAgentHeader(id)
   const applyUserAgentToRequest = () => {
     const ua = getCurrentUserAgent()
@@ -4907,7 +5116,7 @@ async connect (token) {
       const ua = getCurrentUserAgent()
       if (!ua) return originalGetAccessToken()
       const { secret, appid } = this.bot.config
-      const getToken = () => axios.post('https://bots.qq.com/app/getAppAccessToken', {
+      const getToken = () => axios.post(getQQBotApiEndpoints().tokenUrl, {
         appId: appid,
         clientSecret: secret
       }, { headers: { 'User-Agent': ua } }).then(res => res.data)
@@ -4967,7 +5176,7 @@ async connect (token) {
     return {
       status: 200,
       data: {
-        url: 'wss://api.sgroup.qq.com/websocket',
+        url: getQQBotApiEndpoints().wsUrl,
         shards: 1
       }
     }
@@ -4979,7 +5188,7 @@ async connect (token) {
     return {
       status: 200,
       data: {
-        url: 'wss://api.sgroup.qq.com/websocket',
+        url: getQQBotApiEndpoints().wsUrl,
         shards: 1
       }
     }
@@ -4991,7 +5200,7 @@ async connect (token) {
     return {
       status: 200,
       data: {
-        url: 'wss://api.sgroup.qq.com/websocket',
+        url: getQQBotApiEndpoints().wsUrl,
         shards: 1
       }
     }
@@ -5003,7 +5212,7 @@ async connect (token) {
     return {
       status: 200,
       data: {
-        url: 'wss://api.sgroup.qq.com/websocket',
+        url: getQQBotApiEndpoints().wsUrl,
         shards: 1
       }
     }
@@ -5015,7 +5224,7 @@ async connect (token) {
     return {
       status: 200,
       data: {
-        url: 'wss://api.sgroup.qq.com/websocket',
+        url: getQQBotApiEndpoints().wsUrl,
         shards: 1
       }
     }
@@ -5092,19 +5301,19 @@ async connect (token) {
       }
       if (isQQBotCanceledError(err)) {
         enterDefaultWsMode(err.message)
-        this.wsUrl = 'wss://api.sgroup.qq.com/websocket'
+        this.wsUrl = getQQBotApiEndpoints().wsUrl
         this.shards = 1
         return this.wsUrl
       }
       if (isQQBotRateLimitError(err)) {
         enterRateLimitedGatewayMode(err.message)
-        this.wsUrl = 'wss://api.sgroup.qq.com/websocket'
+        this.wsUrl = getQQBotApiEndpoints().wsUrl
         this.shards = 1
         return this.wsUrl
       }
       if (!isQQBotReadOnlyError(err)) throw err
       enterReadOnlyMode(err.message)
-      this.wsUrl = 'wss://api.sgroup.qq.com/websocket'
+      this.wsUrl = getQQBotApiEndpoints().wsUrl
       this.shards = 1
       return this.wsUrl
     }
@@ -5112,11 +5321,8 @@ async connect (token) {
    
   if (config.bus?.[id]) {
     let keys = Object.keys(config.bus)
-    const { sandbox, appid } = opts
-    const base = sandbox
-      ? `https://${config.bus[id]}/proxy?url=https://sandbox.api.sgroup.qq.com`
-      : `https://${config.bus[id]}/proxy?url=https://api.sgroup.qq.com`
-    sdk.request.defaults.baseURL = base
+    const { appid } = opts
+    sdk.request.defaults.baseURL = getQQBotRequestBase(id)
     const { SessionManager } = require('qq-official-bot/lib/sessionManager.js')
     Object.assign(SessionManager.prototype, {
       getWsUrl: async function () {
@@ -5162,7 +5368,7 @@ async connect (token) {
               return
             }
             if (isQQBotRateLimitError(err)) {
-              const fallbackWsUrl = 'wss://api.sgroup.qq.com/websocket'
+              const fallbackWsUrl = getQQBotApiEndpoints().wsUrl
               Bot[id].gatewayRateLimitedMode = true
               Bot.makeLog('warn', [`[${id}] 获取 websocket 地址连续触发频率限制，bus 分支使用默认 websocket 地址继续处理消息`, err.message], id)
               this.wsUrl = keys.some(i => i == this.bot.config.real_self_id)
@@ -5172,7 +5378,7 @@ async connect (token) {
               return
             }
             if (isQQBotNetworkTimeoutError(err)) {
-              const fallbackWsUrl = 'wss://api.sgroup.qq.com/websocket'
+              const fallbackWsUrl = getQQBotApiEndpoints().wsUrl
               Bot[id].gatewayNetworkFallbackMode = true
               Bot.makeLog('warn', [`[${id}] 获取 websocket 地址网络超时，bus 分支使用默认 websocket 地址继续连接；请检查网络连通性`, err.message], id)
               this.wsUrl = keys.some(i => i == this.bot.config.real_self_id)
@@ -5182,7 +5388,7 @@ async connect (token) {
               return
             }
             if (isQQBotGatewayBusyError(err)) {
-              const fallbackWsUrl = 'wss://api.sgroup.qq.com/websocket'
+              const fallbackWsUrl = getQQBotApiEndpoints().wsUrl
               Bot[id].gatewayBusyFallbackMode = true
               Bot.makeLog('warn', [`[${id}] 获取 websocket 地址系统繁忙，bus 分支使用默认 websocket 地址继续连接并等待自动重连恢复`, err.message], id)
               this.wsUrl = keys.some(i => i == this.bot.config.real_self_id)
@@ -5373,6 +5579,13 @@ async connect (token) {
     callback: {}
   }
 
+  const failConnection = async reason => {
+    const failedBot = Bot[id]
+    try { await failedBot?.logout?.() } catch {}
+    if (Bot[id] === failedBot) delete Bot[id]
+    return { ok: false, reason: reason || '登录失败' }
+  }
+
   await this.cleanGuildCacheFromContactMaps(Bot[id], id)
 
   sdk.pickFriend = userId => this.pickFriend(id, String(userId || ''))
@@ -5444,7 +5657,7 @@ async connect (token) {
         try {
           const token = await new Promise((resolve, reject) => {
             const { secret, appid } = this.bot.config
-            axios.post("https://bots.qq.com/app/getAppAccessToken", {
+            axios.post(getQQBotApiEndpoints().tokenUrl, {
               appId: appid,
               clientSecret: secret
             }, { headers: withQQBotUserAgentHeaders(id) }).then(res => {
@@ -5459,12 +5672,11 @@ async connect (token) {
             }).catch(reject)
           })
 
-          this.bot.logger.warn("getAccessToken", token)
           this.access_token = token.access_token
           // 记录过期时间（提前60秒刷新，留出缓冲时间）
           const expiresIn = parseInt(token.expires_in)
           Bot[id].tokenExpireTime = Date.now() + (expiresIn - 60) * 1000
-          this.bot.logger.warn(`[TOKEN] access_token 已刷新，过期时间: ${expiresIn}秒，将在 ${Math.round((expiresIn - 60) / 60)} 分钟后刷新`)
+          this.bot.logger.info(`[TOKEN] access_token 已刷新，过期时间: ${expiresIn}秒，将在 ${Math.round((expiresIn - 60) / 60)} 分钟后刷新`)
           return token
         } catch (err) {
           const authError = getQQBotAuthError(err.response?.data)
@@ -5555,19 +5767,22 @@ async connect (token) {
   }
   // ===== getAccessToken 拦截结束 =====
 
-  // 捕获初次登录失败，不抛出错误，交由掉线检测处理
+  // 初次登录失败必须返回给设置命令，不能继续伪装成已连接。
   try {
-    await Bot[id].login()
+    const loginResult = await Bot[id].login()
+    if (loginResult === false) {
+      return failConnection(Bot[id]?.disabledReason || '登录未完成')
+    }
   } catch (err) {
-    if (Bot[id]?.disabledRuntime) return false
+    if (Bot[id]?.disabledRuntime) return failConnection(Bot[id]?.disabledReason || err.message || '登录失败')
     Bot.makeLog('error', [`[${id}] 初次登录失败`, err.message], id)
-    // 不返回 false，继续初始化其他部分
+    return failConnection(getQQBotSdkErrorSummary(err))
   }
   if (gatewayIpBlocked) {
     this.disableBotRuntime(id, '接口访问源IP不在白名单')
-    return false
+    return failConnection('接口访问源IP不在白名单')
   }
-  if (Bot[id]?.disabledRuntime) return false
+  if (Bot[id]?.disabledRuntime) return failConnection(Bot[id]?.disabledReason || '机器人运行态已停止')
   
   await Bot[id].dau.init()
 
@@ -5724,13 +5939,19 @@ async connect (token) {
 
   Bot.makeLog('mark', `${this.name}(${this.id}) ${this.version} 已连接`, id)
   Bot.em(`connect.${id}`, { self_id: id })
-  return true
+  return { ok: true, selfId: id }
 }
 
   async load () {
     for (const token of config.token) {
       await new Promise(resolve => {
-        adapter.connect(token).then(resolve)
+        adapter.connect(token).then(result => {
+          if (!result?.ok) Bot.makeLog('error', ['QQBot账号启动连接失败', result?.reason || '未知原因'], 'QQBot-Plugin')
+          resolve(result)
+        }).catch(err => {
+          Bot.makeLog('error', ['QQBot账号启动连接失败', getQQBotSdkErrorSummary(err)], 'QQBot-Plugin')
+          resolve({ ok: false, reason: err.message })
+        })
         setTimeout(resolve, 5000)
       })
     }
@@ -5740,9 +5961,19 @@ async connect (token) {
 Bot.adapter.push(adapter)
 
 const cleanedBotConfig = migrateLegacyBotConfig()
+const cleanedSuffixConfig = removeLegacySuffixConfig()
+const migratedAccountConfig = migrateLegacyAccountConfig()
+
+if (migratedAccountConfig) {
+  try {
+    await configSave()
+  } catch (err) {
+    Bot.makeLog?.('error', ['QQBot账号配置迁移保存失败', err.message], 'QQBot-Plugin')
+  }
+}
 
 initFullMessageStore(config).then(cleanedConfig => {
-  if (cleanedConfig || cleanedBotConfig) configSave()
+  if (cleanedConfig || cleanedBotConfig || cleanedSuffixConfig) configSave()
 })
 
 initInviteStore(config).catch(err => {
@@ -5789,8 +6020,8 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
-          reg: /^#q+bot设置[0-9]+:[0-9]+:.+:.+:[01]:[01]$/i,
-          fnc: 'Token',
+          reg: /^#q+bot设置\s+扫码登录$/i,
+          fnc: 'QRLogin',
           permission: config.permission
         },
         {
@@ -5801,6 +6032,11 @@ export class QQBotAdapter extends plugin {
         {
           reg: new RegExp(`^#q+bot设置(${Object.keys(setMap).join('|')})\\s*(开启|关闭)$`, 'i'),
           fnc: 'Setting',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot设置(?!\s+扫码登录).*$/i,
+          fnc: 'Token',
           permission: config.permission
         },
         {
@@ -5856,6 +6092,21 @@ export class QQBotAdapter extends plugin {
         {
           reg: /^#q+bot普通设置(?:\s*(强制silk\s*(?:开启|关闭)|群事件\s*(?:开启|关闭)|查看(?:踢出|拉入)排行(?:\s+\d+)?))?$/i,
           fnc: 'normalSetting',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot其他菜单$/i,
+          fnc: 'otherMenu',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot接口(?:切换菜单|查看|切换\s+(?:开始切换|确认))$/i,
+          fnc: 'apiSwitch',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot消息后缀(?:菜单|\s+(?:设置md\s+[\s\S]+|清空并关闭|预览|开启|关闭))$/i,
+          fnc: 'messageSuffixSetting',
           permission: config.permission
         },
         {
@@ -6109,6 +6360,8 @@ export class QQBotAdapter extends plugin {
         }
       ]
     })
+    const reply = this.reply.bind(this)
+    this.reply = (...args) => withQQBotInternalSend(() => reply(...args))
   }
 
   // ==================== 官方机器人检测 (ICQQ无法登录官方机器人) ====================
@@ -6154,8 +6407,8 @@ export class QQBotAdapter extends plugin {
       `<qqbot-cmd-input text="#QQBot设置按钮回调${botConfig.toCallback ? '关闭' : '开启'}" show="${botConfig.toCallback ? '关闭' : '开启'}按钮回调" />\n` +
       `<qqbot-cmd-input text="#QQBot设置调用统计${botConfig.callStats ? '关闭' : '开启'}" show="${botConfig.callStats ? '关闭' : '开启'}调用统计" />\n` +
       `<qqbot-cmd-input text="#QQBot设置用户统计${botConfig.userStats ? '关闭' : '开启'}" show="${botConfig.userStats ? '关闭' : '开启'}用户统计" />\n` +
-      `<qqbot-cmd-input text="#QQBot设置转图片${botConfig.toImg ? '关闭' : '开启'}" show="${botConfig.toImg ? '关闭' : '开启'}转图片" />\n` +
       `<qqbot-cmd-input text="#QQBot设置二维码${botConfig.toQRCode ? '关闭' : '开启'}" show="${botConfig.toQRCode ? '关闭' : '开启'}二维码" />\n` +
+      '<qqbot-cmd-input text="#QQBot其他菜单" show="其他菜单" />\n' +
       '<qqbot-cmd-input text="#QQBot高级群欢迎菜单" show="高级群欢迎" />',
       segment.button(
         [
@@ -6172,7 +6425,7 @@ export class QQBotAdapter extends plugin {
         ],
         [
           { text: `${botConfig.toCallback ? '关' : '开'}回调`, callback: `#QQBot设置按钮回调${botConfig.toCallback ? '关闭' : '开启'}` },
-          { text: `${botConfig.toImg ? '关' : '开'}转图`, callback: `#QQBot设置转图片${botConfig.toImg ? '关闭' : '开启'}` }
+          { text: '其他菜单', callback: '#QQBot其他菜单' }
         ],
         [
           { text: `${botConfig.toQRCode ? '关' : '开'}二维码`, callback: `#QQBot设置二维码${botConfig.toQRCode ? '关闭' : '开启'}` },
@@ -6233,8 +6486,8 @@ export class QQBotAdapter extends plugin {
       `#QQBot设置按钮回调开启/关闭 [当前: ${botConfig.toCallback ? '开启' : '关闭'}]\n` +
       `#QQBot设置调用统计开启/关闭 [当前: ${botConfig.callStats ? '开启' : '关闭'}]\n` +
       `#QQBot设置用户统计开启/关闭 [当前: ${botConfig.userStats ? '开启' : '关闭'}]\n` +
-      `#QQBot设置转图片开启/关闭 [当前: ${botConfig.toImg ? '开启' : '关闭'}]\n` +
       `#QQBot设置二维码开启/关闭 [当前: ${botConfig.toQRCode ? '开启' : '关闭'}]\n` +
+      '#QQBot其他菜单 - 转图片、消息后缀等设置\n' +
       '#QQBot高级群欢迎菜单 - 高级群欢迎设置\n\n' +
       '🔌 掉线检测\n' +
       `#QQBot账号掉线检测开启/关闭 [当前: ${od.enabled ? '开启' : '关闭'}]\n` +
@@ -6258,32 +6511,97 @@ export class QQBotAdapter extends plugin {
   refConfig () {
     if (!this.guardOfficialBot()) return true
     refConfig()
+    if (migrateLegacyAccountConfig()) configSave()
     ensureFullMessageConfig(config, this.e.self_id)
   }
 
   List () {
     if (!this.guardOfficialBot()) return true
-    const accounts = config.token.map(token => String(token).split(':')[0]).filter(Boolean)
-    this.reply(`共${config.token.length}个账号：\n${accounts.join('\n')}`, true)
+    const accounts = config.token.map(value => {
+      const parsed = parseQQBotAccount(value)
+      return parsed.ok ? `QQ: ${parsed.account.selfId} AppID: ${parsed.account.appid}` : `无效配置: ${String(value).split(':')[0] || 'unknown'}`
+    })
+    this.reply(`共${config.token.length}个账号：\n${accounts.join('\n') || '暂无账号'}`, true)
+  }
+
+  async QRLogin () {
+    const riskText = '扫码登录会重置appsecret，请确保机器人没有在其他地方使用。'
+    await this.reply(riskText, true)
+    try {
+      const result = await qrRegister({
+        timeoutSeconds: 300,
+        onQRCode: async (imageBuffer, connectUrl) => {
+          const image = await adapter.uploadImage(imageBuffer, this.e.self_id, { summary: '二维码' })
+          if (!image?.url) throw new Error('二维码上传失败，未返回URL')
+          const width = Math.max(1, Number(image.width) || 320)
+          const height = Math.max(1, Number(image.height) || 320)
+          const markdown = [
+            `![二维码 #${width}px #${height}px](${image.url})`,
+            '',
+            '>请扫描二维码，或者使用手机 QQ 打开以下官方登录链接：',
+            '',
+            connectUrl
+          ].join('\n')
+          await this.reply({ type: 'markdown', data: markdown }, true)
+        },
+        onStatusChange: (status, message) => {
+          if (status === BindStatus.EXPIRED) Bot.makeLog('warn', ['QQBot扫码登录', message], this.e.self_id)
+        }
+      })
+      const { robotUin } = await getQQBotMeByCredentials(result.appId, result.clientSecret, this.e.self_id)
+      if (!robotUin) throw new Error('@me接口未返回机器人QQ号')
+
+      const accountText = `${robotUin}:${result.appId}:${result.clientSecret}:0`
+      const existingIndex = config.token.findIndex(value => {
+        const parsed = parseQQBotAccount(value)
+        return parsed.ok && parsed.account.selfId === robotUin
+      })
+      if (existingIndex >= 0) config.token[existingIndex] = accountText
+      else config.token.push(accountText)
+      await configSave()
+
+      const connection = await adapter.connect(accountText)
+      if (!connection?.ok) throw new Error(connection?.reason || '账号连接失败')
+      await this.reply(`登录成功(机器人QQ:${robotUin})，如果需要开启频道私域/删除配置，自行修改或者查看配置文件`, true)
+    } catch (err) {
+      const reason = getQQBotAuthError(err.response?.data) || err.response?.data?.message || err.response?.data?.msg || err.message || String(err)
+      await this.reply(`登录失败: ${reason}`, true)
+    }
   }
 
   async Token () {
-    const token = this.e.msg.replace(/^#q+bot设置/i, '').trim()
-    if (config.token.includes(token)) {
-      config.token = config.token.filter(item => item != token)
+    const input = this.e.msg.replace(/^#q+bot设置/i, '').trim()
+    const parsed = parseQQBotAccount(input)
+    if (!parsed.ok) {
+      await this.reply(`账号设置失败：${parsed.error}`, true)
+      return false
+    }
+    const account = parsed.account
+    const existingIndex = config.token.findIndex(value => {
+      const current = parseQQBotAccount(value)
+      return current.ok && current.account.text === account.text
+    })
+    if (existingIndex >= 0) {
+      config.token.splice(existingIndex, 1)
       this.reply(`账号已删除，重启后生效，共${config.token.length}个账号`, true)
     } else {
-      const validation = await validateQQBotToken(token)
+      const validation = await validateQQBotToken(account.text)
       if (!validation.ok) {
         this.reply(`账号验证失败，未写入配置文件：${validation.error}`, true)
         return false
       }
-      if (await adapter.connect(token)) {
-        config.token.push(token)
+      const connection = await adapter.connect(account.text)
+      if (connection?.ok) {
+        const updateIndex = config.token.findIndex(value => {
+          const current = parseQQBotAccount(value)
+          return current.ok && current.account.selfId === account.selfId
+        })
+        if (updateIndex >= 0) config.token[updateIndex] = account.text
+        else config.token.push(account.text)
         const warnText = validation.warnings?.length ? `\n警告：${validation.warnings.join('\n')}` : ''
         this.reply(`账号已验证并连接，共${config.token.length}个账号${warnText}`, true)
       } else {
-        this.reply('账号连接失败', true)
+        this.reply(`账号连接失败：${connection?.reason || '未知原因'}`, true)
         return false
       }
     }
@@ -6380,7 +6698,7 @@ export class QQBotAdapter extends plugin {
         const id = this.e.bot.dau.dauDB === 'level' ? `${this.e.self_id}${this.e.bot.adapter.sep}${key}` : key
         const sendMsg = await getMsg(id)
         if (!sendMsg?.length) continue
-        const sendRet = await this.e.bot.pickGroup(id).sendMsg(sendMsg)
+        const sendRet = await withQQBotInternalSend(() => this.e.bot.pickGroup(id).sendMsg(sendMsg))
         if (sendRet.error.length) {
           for (const i of sendRet.error) {
             if (i.message.includes('机器人非群成员')) {
@@ -6581,6 +6899,206 @@ export class QQBotAdapter extends plugin {
     setBotConfigValue(this.e.self_id, 'forceSilk', state)
     this.reply(`[${this.e.self_id}] 强制silk已${state ? '开启' : '关闭'}`, true)
     return configSave()
+  }
+
+  otherMenu () {
+    if (!this.guardOfficialBot()) return true
+    const botConfig = ensureBotConfig(this.e.self_id)
+    const suffix = ensureMessageSuffixConfig(this.e.self_id)
+    const rawMode = config.markdown?.[this.e.self_id] === 'raw'
+    const msg = [
+      `#[${this.e.self_id}] QQBot其他菜单`,
+      '',
+      `>转图片：${botConfig.toImg ? '开启' : '关闭'}`,
+      '',
+      `><qqbot-cmd-input text="#QQBot设置转图片${botConfig.toImg ? '关闭' : '开启'}" show="${botConfig.toImg ? '关闭' : '开启'}转图片"/>`,
+      '',
+      `>消息后缀（分离机器人）：${suffix.enabled ? '开启' : '关闭'}`,
+      '',
+      `>后缀内容：${suffix.markdown.trim() ? '已设置' : '未设置'}`,
+      '',
+      `>raw模式：${rawMode ? '可用' : '不可用'}`,
+      '',
+      '><qqbot-cmd-input text="#QQBot消息后缀菜单" show="消息后缀菜单"/>',
+      '',
+      `>接口：${getQQBotApiMode() === 'new' ? '新接口' : '老接口'}`,
+      '',
+      '><qqbot-cmd-input text="#QQBot接口切换菜单" show="接口切换菜单"/>'
+    ].join('\n')
+    return this.reply([
+      msg,
+      segment.button(
+        [
+          { text: `${botConfig.toImg ? '关闭' : '开启'}转图片`, callback: `#QQBot设置转图片${botConfig.toImg ? '关闭' : '开启'}` },
+          { text: '消息后缀', callback: '#QQBot消息后缀菜单' }
+        ],
+        [{ text: '接口切换', callback: '#QQBot接口切换菜单' }],
+        [{ text: '返回', callback: '#QQBot帮助' }]
+      )
+    ], true)
+  }
+
+  async apiSwitch () {
+    if (!this.guardOfficialBot()) return true
+    const command = String(this.e.msg || '')
+    const current = getQQBotApiMode()
+    const currentText = current === 'new' ? '新接口' : '老接口'
+    const target = current === 'new' ? 'old' : 'new'
+    const targetText = target === 'new' ? '新接口' : '老接口'
+    const operator = `${this.e.self_id}:${this.e.user_id || this.e.sender?.user_id || 'master'}`
+
+    if (/接口查看$/i.test(command)) {
+      await this.reply([
+        `当前使用:${currentText}\n\n><qqbot-cmd-input text="#QQBot接口切换菜单" show="接口切换菜单"/>`,
+        segment.button([{ text: '切换菜单', callback: '#QQBot接口切换菜单' }])
+      ], true)
+      return
+    }
+
+    if (/接口切换\s+确认$/i.test(command)) {
+      qqbotApiSwitchConfirmations.set(operator, { target, expires: Date.now() + 120000 })
+      await this.reply([
+        `当前使用:${currentText}\n\n确认后将切换到${targetText}\n\n><qqbot-cmd-input text="#QQBot接口切换 开始切换" show="开始切换"/>`,
+        segment.button(
+          [{ text: '开始切换', callback: '#QQBot接口切换 开始切换' }],
+          [{ text: '返回', callback: '#QQBot接口切换菜单' }]
+        )
+      ], true)
+      return
+    }
+
+    if (/接口切换\s+开始切换$/i.test(command)) {
+      const pending = qqbotApiSwitchConfirmations.get(operator)
+      qqbotApiSwitchConfirmations.delete(operator)
+      if (!pending || pending.expires < Date.now() || pending.target !== target) {
+        await this.reply('切换确认不存在或已过期，请先发送 #QQBot接口切换 确认', true)
+        return
+      }
+      config.apiMode = target
+      await configSave()
+      for (const id of Bot.uin) {
+        if (Bot[id]?.adapter?.name !== 'QQBot' || !Bot[id]?.sdk?.request?.defaults) continue
+        Bot[id].sdk.request.defaults.baseURL = getQQBotRequestBase(id)
+      }
+      await this.reply([
+        `已经切换${targetText}，重启或者ws自动重连生效(wss链接)，下次发消息(已经切换)将调用${targetText}\n\n><qqbot-cmd-input text="#QQBot接口查看" show="查看接口"/>\n\n><qqbot-cmd-input text="#QQBot接口切换菜单" show="接口切换菜单"/>`,
+        segment.button(
+          [
+            { text: '查看接口', callback: '#QQBot接口查看' },
+            { text: '切换菜单', callback: '#QQBot接口切换菜单' }
+          ]
+        )
+      ], true)
+      return
+    }
+
+    await this.reply([
+      `# QQBot接口切换\n\n>当前使用:${currentText}\n\n>即将切换:${targetText}\n\n><qqbot-cmd-input text="#QQBot接口切换 确认" show="确认切换"/>\n\n><qqbot-cmd-input text="#QQBot接口查看" show="查看接口"/>`,
+      segment.button(
+        [
+          { text: '确认切换', callback: '#QQBot接口切换 确认' },
+          { text: '查看接口', callback: '#QQBot接口查看' }
+        ],
+        [{ text: '返回', callback: '#QQBot其他菜单' }]
+      )
+    ], true)
+  }
+
+  async messageSuffixSetting () {
+    if (!this.guardOfficialBot()) return true
+    const selfId = this.e.self_id
+    const suffix = ensureMessageSuffixConfig(selfId)
+    const rawMode = config.markdown?.[selfId] === 'raw'
+    const command = String(this.e.msg || '').replace(/^#q+bot消息后缀\s*/i, '').trim()
+
+    if (/^设置md(?:\s|$)/i.test(command)) {
+      const markdown = getRawCommandArgs(this.e, /^#q+bot消息后缀\s+设置md\s+([\s\S]+)$/i) || command.replace(/^设置md\s*/i, '').trim()
+      if (!markdown) {
+        await this.reply(`[${selfId}] 后缀Markdown不能为空`, true)
+        return
+      }
+      suffix.markdown = markdown
+      await configSave()
+      await this.reply(`[${selfId}] 消息后缀Markdown已设置${rawMode ? '' : '，当前不是raw模式，暂不生效'}`, true)
+      return
+    }
+
+    if (command === '清空并关闭') {
+      suffix.enabled = false
+      suffix.markdown = ''
+      await configSave()
+      await this.reply(`[${selfId}] 消息后缀已清空并关闭`, true)
+      return
+    }
+
+    if (command === '开启') {
+      if (!suffix.markdown.trim()) {
+        suffix.enabled = false
+        await configSave()
+        await this.reply(`[${selfId}] 未设置后缀Markdown，无法开启`, true)
+        return
+      }
+      if (!rawMode) {
+        suffix.enabled = false
+        await configSave()
+        await this.reply(`[${selfId}] 消息后缀仅raw模式可用，已保持关闭`, true)
+        return
+      }
+      suffix.enabled = true
+      await configSave()
+      await this.reply(`[${selfId}] 消息后缀已开启`, true)
+      return
+    }
+
+    if (command === '关闭') {
+      suffix.enabled = false
+      await configSave()
+      await this.reply(`[${selfId}] 消息后缀已关闭，已保留Markdown内容`, true)
+      return
+    }
+
+    if (command === '预览') {
+      if (!suffix.markdown.trim()) {
+        await this.reply(`[${selfId}] 未设置后缀Markdown，无法预览`, true)
+        return
+      }
+      if (!rawMode) {
+        await this.reply(`[${selfId}] 消息后缀仅raw模式可用，无法预览`, true)
+        return
+      }
+      await this.reply({ type: 'markdown', data: suffix.markdown }, true)
+      return
+    }
+
+    const msg = [
+      `#[${selfId}] QQBot消息后缀配置`,
+      '',
+      `>状态：${suffix.enabled ? '开启' : '关闭'}`,
+      '',
+      `>raw模式：${rawMode ? '可用' : '不可用'}`,
+      '',
+      `>Markdown：${suffix.markdown.trim() ? '已设置' : '未设置'}`,
+      '',
+      '```text',
+      suffix.markdown.trim() || '未设置',
+      '```',
+      '',
+      '><qqbot-cmd-input text="#QQBot消息后缀 设置md " show="设置Markdown"/>'
+    ].join('\n')
+    return this.reply([
+      msg,
+      segment.button(
+        [
+          { text: suffix.enabled ? '关闭' : '开启', callback: `#QQBot消息后缀 ${suffix.enabled ? '关闭' : '开启'}` },
+          { text: '预览', callback: '#QQBot消息后缀 预览' }
+        ],
+        [
+          { text: '设置MD', input: '#QQBot消息后缀 设置md ' },
+          { text: '清空关闭', callback: '#QQBot消息后缀 清空并关闭' }
+        ],
+        [{ text: '返回', callback: '#QQBot其他菜单' }]
+      )
+    ], true)
   }
 
   getAdvancedSettingMsg () {

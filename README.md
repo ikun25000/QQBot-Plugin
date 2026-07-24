@@ -2,13 +2,15 @@
 
 # TRSS-Yunzai QQBot Plugin
 
-TRSS-Yunzai QQBot 嘿群主壳 插件
+TRSS-Yunzai QQBot 插件
 
 </div>
 
-# Tip
+# 说明
 
-建议使用TRSS原版,此版本为`嘿壳`版,会在`任意时间`直接进行罚壳,且`不会`与TRSS一致
+本文件是面向公开展示和部署的说明文档。历史原版说明已保存在 [READ.md](READ.md)，内容保持原样，仅供功能变更对照。
+
+请遵守 QQ 开放平台规则、适用法律及所在群的管理规则；不得将本插件用于骚扰、营销滥发、规避平台限制或收集与功能无关的用户信息。
 
 
 ---
@@ -50,6 +52,13 @@ TRSS-Yunzai QQBot 嘿群主壳 插件
 - 记录用户、群、群成员关系、拉黑、注销、最近发言、绑定全量缓存、全量事件检测状态。
 - 频道数据不参与用户管理拉黑、查询和群/好友缓存污染写入。
 
+### 数据与隐私
+
+- 数据仅用于机器人管理、消息功能和故障排查，存储在本地插件数据目录，管理员应自行控制服务器与备份的访问权限。
+- 用户 openid、群 openid、成员关系和发言记录属于业务数据；请仅在获得群管理者授权且确有功能需要时启用相关功能。
+- 建议按实际需要配置或定期清理发言缓存、绑定记录和管理记录，不要将导出的数据、原始事件或日志公开传播。
+- 机器人管理员应向群成员说明启用的记录、欢迎或管理功能，并提供可用的关闭、投诉或删除入口。
+
 ### 菜单入口
 
 ```text
@@ -73,17 +82,17 @@ TRSS-Yunzai QQBot 嘿群主壳 插件
 #QQBot注销管理 撤回 openid
 #QQBot注销管理 设置注销时间 7天
 #QQBot注销管理 设置注销拉黑时间 3650天
-#QQBot注销管理 强制注销 openid 理由
+#QQBot注销管理 管理注销 openid 理由
 ```
 
 - 注销为文案效果，不真实删除数据。
 - 普通注销需确认码，确认码 1 分钟有效；机器人主人不能注销自己。
 - 注销中和注销拉黑期会拦截外部插件命令，并提示撤回或剩余不可用天数。
-- 强制注销立即进入不可用状态，可附带理由；强制注销只有开发者可撤回。
+- 管理注销会立即进入不可用状态，可附带理由；仅开发者可以撤回。
 - `this.e.raw.iscancelled` 在注销中或注销拉黑期为 `true`，否则为 `false`。
 - `#QQBot`、`#qbot`、`#机器人用户注销` 相关内部命令不受注销拦截。
 
-![注销示例](cancel-example.jpg)
+注销流程示例请前往 [READ.md](READ.md) 查看，或下载其中的图片后本地查看。
 
 ### 拉黑
 
@@ -118,12 +127,12 @@ TRSS-Yunzai QQBot 嘿群主壳 插件
 #QQBot删除群最近发言 群openid 20
 #QQBot删除群最近发言 群openid 全部
 #QQBot备注群名称 群openid 群名
-#QQBot备注真实群号 群openid 群号
+#QQBot备注群标识 群openid 群号
 ```
 
 - 用户、群、群成员列表均支持分页，每页 10 条。
 - `#QQBot搜索用户` 支持按昵称、openid、所在群 openid 模糊搜索，每页 50 条，结果使用代码块输出；同一用户所在多个群会全部列出，未输入关键词会提示缺少参数。纯数字关键词会先只按昵称搜索，昵称无匹配时再提示输入更具体关键词，避免命中过多 openid。
-- 群列表支持备注群名、备注真实群号、全量群/非全量群标识、查看最近发言、拉黑/删黑快捷入口。
+- 群列表支持备注群名、备注群标识、全量群/非全量群标识、查看最近发言、拉黑/删黑快捷入口。
 - 单群最近发言支持分页查看，每页 20 条，也支持 `#seq` 查看对应记录的 `raw` JSON。
 - 所有群最近发言支持分页查看，每页 20 条，并可从所有群列表进入。
 - 群成员、最近发言、备注等命令缺少或传入无效群 openid 时会直接提示缺少有效参数。
@@ -137,7 +146,7 @@ TRSS-Yunzai QQBot 嘿群主壳 插件
 - `this.e.group.getChatHistory(seq, count)` 获取群聊历史。
 - `this.e.friend.getChatHistory(seq, count)` 和 `this.e.friendgetChatHistory(seq, count)` 获取私聊历史。
 - `count=0` 返回 `[]`，`count=1` 返回指定 `seq`，`count=2` 返回 `seq` 和 `seq-1`。
-- 历史记录保存完整 `raw_message`，不截断，并保存原始事件快照供 raw 查询。
+- 历史记录可保存消息内容和原始事件快照供管理与排障查询；请按最小必要原则启用并定期清理。
 
 ### UA 设置
 
@@ -169,7 +178,7 @@ TRSS-Yunzai QQBot 嘿群主壳 插件
 - `#` 可选，群号前空格可选；群号必须是 5 到 10 位纯数字，非法输入不会回显。
 - 未输入群号时提示“没有输入群号”，并返回 `我要开启全量` qbotcmd 与指令按钮，保留开启步骤说明。
 - 命令仅 QQ 群群主可用，非群主会提示当前身份：群主、管理员或群员。
-- 机器人主人可强制触发开启全量入口；非主人且非群主仍按普通用户提示。
+- 机器人主人可代为进入授权入口；非主人且非群主仍按普通用户提示。
 - 机器人 `self_id` 自动取当前机器人，无需用户输入。
 - 回复官方授权 Markdown，并带“点击开启全量”链接按钮，按钮仅触发者可点击。
 - 同一用户同一群只信任第一次输入的群号，绑定成功后后续错误输入不会覆盖缓存群号。
@@ -227,7 +236,7 @@ TRSS-Yunzai QQBot 嘿群主壳 插件
 - 返回结构与 `this.e.raw.chat` 一致，包含 `today / yesterday / week / month`。
 # QQBot 高级群欢迎
 
-高级群欢迎用于在用户入群事件触发时发送官方 Markdown 欢迎通知，主要解决群聊遗忘机器人后无法主动触达的问题。功能按机器人 QQ 分开配置，数据独立存储在 LevelDB，不依赖普通群事件开关。
+高级群欢迎用于在用户入群事件触发时发送官方 Markdown 服务通知。功能按机器人 QQ 分开配置，数据独立存储在 LevelDB，不依赖普通群事件开关。
 
 ## 入口
 
@@ -243,7 +252,7 @@ qbotcmd：`高级群欢迎菜单`
 
 ## 工作方式
 
-- 使用官方入群事件作为被动通知发送依据。
+- 使用官方入群事件作为被动服务通知发送依据；仅限群主或管理员明确授权的群使用。
 - 不受 `#QQBot普通设置 群事件 开启/关闭` 影响，该开关只控制外部插件群事件通知。
 - 按机器人 QQ 独立配置，多个 Bot 不互相影响。
 - 高频数据使用独立 LevelDB，路径为 `QQBot-Plugin/db/advancedWelcome`。
@@ -324,6 +333,7 @@ qbotcmd：`高级群欢迎菜单`
 - 发言限制只统计全量群消息 `GROUP_MESSAGE_CREATE`。
 - 不可用时仅显示“全量群消息状态: 不可用”；可用且统计次数大于 0 时才追加“已统计N次”。
 - 非全量群不会因为发言限制卡住发送。
+- 不得将本功能用于营销、诱导、骚扰或重复触达群成员。
 - 入群事件没有官方真实 `event_id` 时，高级群欢迎会直接拒绝发送，并记录错误群，错误理由为 `无event_id`。
 - 自动关闭菜单支持单群投诉次数自动关闭，以及单群连续错误次数自动关闭；连续错误默认阈值 50，默认关闭。
 - 投诉相关机器人回复会在 1 分钟后尝试撤回，避免刷屏。
@@ -434,16 +444,8 @@ qbotcmd：`高级群欢迎菜单`
 #QQBot召回配置 button 删除
 #QQBot召回查看
 #QQBot单独召回 用户openid
-#QQBot单独召回 用户openid 强制
-#QQBot单独召回 用户openid 主动
 #QQBot全部召回设置数量 数量
 #QQBot全部召回确认
-#QQBot全部召回确认 强制
-#QQBot全部召回确认 主动
-#QQBot召回不可召回主动
-#QQBot召回不可召回主动 1
-#QQBot召回不可召回主动 设置数量 数量
-#QQBot召回不可召回主动 确认
 #QQBot召回结果 1
 #QQBot召回成功 1
 #QQBot召回失败 1
@@ -455,16 +457,14 @@ qbotcmd：`高级群欢迎菜单`
 #QQBot召回结果删除 全部 确认
 ```
 
-- `主动` 与 `强制` 互斥；主动模式只影响当前单条消息或当前批量任务，不保存为默认配置。
-- `#QQBot开始召回` 集中提供全部召回、单独召回、不可召回主动和结果查看入口；召回菜单顶部也提供该按钮。
-- 主动模式不传 `event_id`、`is_wakeup` 或其他召回字段，也不会改变用户的可召回状态或写入召回周期。
-- `#QQBot全部召回设置数量` 只从可召回列表取指定数量，确认页可选择普通、强制或本次主动发送。
-- `#QQBot召回不可召回主动` 分页显示非删除好友的不可召回用户及原因；必须先用“设置数量”设置本次数量，才能确认主动发送。
+- `#QQBot开始召回` 集中提供可用对象的任务入口和结果查看；召回菜单顶部也提供该按钮。
+- 仅可向平台允许发送、已建立有效会话或已获得授权的对象发送消息；不得尝试绕过会话、事件或频率限制。
+- `#QQBot全部召回设置数量` 只从可发送列表取指定数量，确认后执行任务。
 - 默认每批并发发送 2 条，批次之间等待 1 秒；发送延迟和每批数量可在召回配置中修改。
-- 成功和失败结果按任务保存；失败详情每页 20 条。错误码 `40034100` 显示为“主动消息发送超过频控限制”。
+- 成功和失败结果按任务保存；失败详情每页 20 条。发送应遵守官方频率和会话规则，遇到频率限制时应降低频率或停止任务。
 - `#QQBot召回结果` 为每条任务提供按序号失败重发和删除结果 qbotcmd，也支持确认后删除全部结果；删除后剩余结果重新编号。
-- 失败重发沿用原任务的普通、强制或主动方式，只重发真正失败的用户，不重发已跳过项。
-- 删除好友事件或错误码 `40054004` 会标记为删除好友，普通、强制、主动和失败重发都直接跳过；用户重新添加好友后自动解除该标记。
+- 失败重发仅针对仍符合平台发送规则的失败项，不重发已跳过项。
+- 删除好友事件或错误码 `40054004` 会标记为删除好友并跳过；用户重新添加好友后自动解除该标记。
 - 批量结果优先回复确认命令的消息 ID；私聊 ID 按 1 小时、群聊 ID 按 5 分钟判断有效期，失败后依次尝试当前私聊召回、当前环境和主人通知。
 - 旧 `#QQBot召回设置` 命令继续兼容，但菜单统一使用 `#QQBot召回配置`。
 
@@ -492,8 +492,6 @@ qbotcmd：`高级群欢迎菜单`
 #QQBot召回配置 时间偏移 8
 #QQBot召回配置 发送延迟 1秒
 #QQBot召回配置 每批数量 2
-#QQBot单独召回 用户openid 主动
-#QQBot召回不可召回主动
 #QQBot召回结果
 #QQBot召回失败 1
 #QQBot普通设置 查看拉入排行
@@ -503,8 +501,8 @@ qbotcmd：`高级群欢迎菜单`
 
 
 
-## 自用人机群主版
-   - 新增QQ机器人认证错误处理，破冰，召回功能，发送语音适配官方文档
+## 运行与兼容性
+   - 新增 QQ 机器人认证错误处理、会话恢复和文件/语音发送适配
    - 新增只读错误、取消错误、WebSocket错误检测
    - 新增运行时定时器清理
    - 优化了ws超时的报错重连
@@ -555,25 +553,17 @@ const image = await Bot.uploadImage("https://example.com/a.png")
 const image = await Bot[3889000008].uploadImage("https://example.com/a.png")
 ```
 
->为了感谢龙虾，新增模拟龙虾在线。优化全量部分内容，优化多机器人配置，修复非本适配器可以触发命令的问题
+>优化多机器人配置、消息统计、原生 Markdown 与模板按钮，并修复回调按钮的消息 ID 权限校验。
 
->修复了dau无法统计的bug 修复了原生MD加模板按钮，单发按钮和原生MD的问题 修复了点击回调按钮msg_id越权的问题
-
->新增发送嘿壳的文件
-
->原生按钮开放，新增按钮生成器
-
->由于龙虾占用腾讯服务器，增加了ws断线检测和通知，24小时内没有次数了，机器人会被罚壳。已经增加嘿壳的自动重连(应该不会掉线？)
-
->新增掉线检测相关和全量消息相关命令，交互式按钮，请开启原生MD后使用 #qbot帮助查看
+>提供原生按钮生成、连接状态检测与异常重连能力。请按 QQ 开放平台规则使用消息事件和接口能力。
 
 ```javascript
 // 1. 网络文件，自动文件名
 segment.file("https://example.com/file.pdf")
 
-// 2. 网络文件，自定义文件名(利用机制发送嘿壳.jpg，嘿壳.mp3)
-segment.file("https://bbs.hycdn.cn/image/2026/01/24/500031/b3fcde82eed9639923cf532d84d6412e.jpg?a=https://嘿壳.jpg","无效参数.jpg")
-segment.file("http://game.gtimg.cn/images/up/act/a20170301pre/media/bg.mp3","嘿壳.mp3",1)
+// 2. 网络文件，自定义文件名；文件内容应与扩展名保持一致
+segment.file("https://example.com/document.pdf", "文档.pdf")
+segment.file("https://example.com/audio.mp3", "音频.mp3", 1)
 
 // 3. 本地文件，绝对路径
 segment.file("/root/yunzai/data/file.pdf", "文件.pdf")
@@ -584,14 +574,14 @@ segment.file("./data/file.pdf", "文件.pdf")
 // 5. file:// 协议本地文件
 segment.file("file:///root/yunzai/data/file.pdf", "文件.pdf")
 
-// 6. 强制分片上传
+// 6. 分片上传
 segment.file({
   file: "https://example.com/large.zip",
   name: "大文件.zip",
   force_chunk: 1
 })
 
-// 7. 不强制分片上传
+// 7. 自动选择上传方式
 segment.file({
   file: "https://example.com/file.pdf",
   name: "文件.pdf"
@@ -611,7 +601,7 @@ segment.file("https://example.com/file.pdf", "文档.pdf", 0, 20)
 // 参数说明：
 // 参数1: 文件URL或路径
 // 参数2: 文件名
-// 参数3: force_chunk (0=自动判断, 1=强制分片上传)
+// 参数3: force_chunk (0=自动判断, 1=分片上传)
 // 参数4: recall_time (撤回时间，单位：秒，0=不撤回)
 ```
 
@@ -620,11 +610,11 @@ segment.file("https://example.com/file.pdf", "文档.pdf", 0, 20)
 // 1. 普通文件，60秒后撤回
 segment.file("https://example.com/data.zip", "人机模块.zip", 0, 60)
 
-// 2. 强制分片上传，30秒后撤回
-segment.file("https://example.com/large.mp4", "人机视频.mp4", 1, 30)
+// 2. 分片上传，30秒后撤回
+segment.file("https://example.com/large.mp4", "视频.mp4", 1, 30)
 
 // 3. 本地文件，120秒后撤回
-segment.file("file:///data/report.xlsx", "人机群主.xlsx", 0, 120)
+segment.file("file:///data/report.xlsx", "报表.xlsx", 0, 120)
 
 // 4. 对象形式参数
 segment.file({
@@ -635,7 +625,7 @@ segment.file({
 })
 
 // 5. 私聊文件（自动分片），10秒后撤回
-segment.file("https://example.com/secret.doc", "机密的嘿壳模块.doc", 0, 10)
+segment.file("https://example.com/document.doc", "文档.doc", 0, 10)
 ```
 
 ### 注意事项
@@ -729,7 +719,7 @@ offlineDetect:
 1. 转发消息改为渲染成图片,需要安装`ws-plugin`
 2. `#QQBot设置转换开启`配合`#ws绑定`实现互通数据
 3. `#QQBotDAU` and `#QQBotDAUpro`
-4. `Model/template/groupIncreaseMsg_default.js`中`自定义入群发送主动消息`
+4. `Model/template/groupIncreaseMsg_default.js`中可配置入群服务通知模板；仅限群管理者授权的服务场景使用。
 5. `config/QQBot.yaml`中使用以下自定义模版,如果设置了全局md会优先使用自定义模版,配合`e.toQQBotMD = true`将特定消息`转换`成md,亦可在`全局md模式下`通过`e.toQQBotMD = false`将特定消息`不转换`成md
    - 方法1: 直接修改`config/QQBot.yaml` **(推荐)**
      ```yml
@@ -779,16 +769,15 @@ offlineDetect:
          # ... 最多10个
    ```
 9. `#QQBot用户统计`: 对比昨日的用户数据,默认关闭,`#QQBot设置用户统计开启`
-10. `config/QQBot.yaml`中使用前台日志消息过滤（~~自欺欺人大法~~），将会不在前台打印自定的消息内容，防log刷屏（~~比如修仙、宝可梦等~~），也可以使用`#QQBot添加/删除过滤日志垃圾机器人`
+10. `config/QQBot.yaml`中可配置本地控制台日志过滤，减少高频日志刷屏；也可以使用`#QQBot添加/删除过滤日志`。该设置仅影响本地控制台输出，不影响平台审核、消息记录或安全审计。
     - **自定义消息采取完整消息匹配，非关键词匹配**
     - **非必要不建议开启此项**
       > 注意：_只会过滤部分QQBot的日志_
     ```yml
     filterLog:
       BotQQ:
-        - 群主是机器人
-        - 垃圾bot
-        - 垃圾Bot
+         - 示例高频消息
+         - 示例机器人提示
         # ...
     ```
 11. `config/QQBot.yaml`中`simplifiedSdkLog`是否简化sdk日志,若设置为`true`则不会打印` recv from Group(xxx):  xxx`,并且会简化发送为`send to Group(xxx): <markdown><button>`
@@ -803,8 +792,8 @@ offlineDetect:
       - 优点: 大部分使用redis存储,不会缓存
       - 缺点: 没有缓存所以有些没统计
 16. 已适配YePanel,提供dau统计和设置功能
-17. `config/QQBot.yaml`中`bus`是否使用ws中转站
-- 使用ws中转站可以降低成本,只需要一台低性能云服务器即可通过IP白名单验证,后端可使用本地服务器
+17. `config/QQBot.yaml`中`bus`是否使用 WebSocket 中转部署
+ - 中转部署可用于网络连通性和公网入口管理；使用前请确保符合 QQ 开放平台、网络服务商及服务器所在地的安全要求。
 - 填写格式:
 ```
   bus: {
@@ -817,31 +806,61 @@ offlineDetect:
 
 1. 准备：[TRSS-Yunzai](../../../Yunzai)
 2. ~~输入：`#安装QQBot-Plugin`~~
-3. 打开：[QQ 收缩平台](https://q.qq.com) 创建 Bot：  
+3. 打开：[QQ 开放平台](https://q.qq.com) 创建 Bot：
    ① 创建机器人  
-   ② 开发设置 → 得到 `机器人QQ号:AppID:Token:AppSecret`
-4. 输入：`#QQBot设置机器人QQ号:AppID:Token:AppSecret:[01]:[01]`
+   ② 开发设置 → 得到 `机器人QQ号:AppID:AppSecret`
+4. 输入：`#QQBot设置机器人QQ号:AppID:AppSecret:[01]`
+
+最后一位表示是否启用频道私域，`1` 为启用，`0` 为关闭。群 Bot 能力已完全开放，不再需要配置开关；Token 已弃用，获取 access token 只使用 AppID 和 AppSecret。
 
 ## 格式示例
 
-- 机器人QQ号 `114` AppID `514` Token `1919` AppSecret `810` 群Bot 频道私域
+- 机器人QQ号 `114` AppID `514` AppSecret `810`，启用频道私域
 
 ```
-#QBot设置114:514:1919:810:1:1
+#QBot设置114:514:810:1
 ```
+
+旧格式仍可输入，例如 `#QBot设置114:514:1919:810:1:1`。旧格式中的 Token 和群 Bot 开关必须保留非空占位，但不会被使用或保存；插件启动时会自动迁移旧配置。
+
+### 扫码登录
+
+```text
+#QBot设置 扫码登录
+```
+
+扫码登录会重置 AppSecret，请确保机器人没有在其他地方使用。二维码通过当前 QQBot 图片上传通道发送，消息中也会附带官方登录直链，可扫描二维码或使用手机 QQ 打开链接。机器人 QQ 号会从 `/users/@me` 接口自动获取。扫码登录默认关闭频道私域；登录成功后如需开启频道私域或删除配置，请自行修改或查看 `config/QQBot.yaml`。请勿在截图、日志、聊天记录或公开仓库中泄露 AppSecret。
+
+### 新旧接口切换
+
+接口模式是全局配置，对所有 QQBot 生效，不按机器人分离。
+
+```text
+#QQBot接口切换菜单
+#QQBot接口查看
+#QQBot接口切换 确认
+#QQBot接口切换 开始切换
+```
+
+- 老接口使用 `api.sgroup.qq.com`，新接口使用 `api.bot.qq.com`。
+- REST 请求在切换后的下一次发消息时使用新配置。
+- WSS 地址在重启或 WebSocket 自动重连后生效。
+- `#QQBot其他菜单` 提供接口切换的 qbotcmd 和按钮入口。
 
 ## 高阶能力
 
 <details><summary>Markdown 消息</summary>
 
-已经嘿壳，感谢龙虾🦞
+支持原生 Markdown 消息能力，请按 QQ 开放平台规范配置和发送。
 
 </details>
 
 ## 使用教程
 
 - #QQBot账号
-- #QQBot设置 + `机器人QQ号:AppID:Token:AppSecret:是否群Bot:是否频道私域`（是1 否0）
+- #QQBot设置 + `机器人QQ号:AppID:AppSecret:是否频道私域`（是1 否0）
+- #QBot设置 扫码登录
+- #QQBot接口切换菜单
 - #QQBotMD + `机器人QQ号:模板ID`
 - #QQBotMD + `机器人QQ号:raw` 开启原生MD
 - #QQBotMD + `机器人QQ号:` 关闭原生MD
