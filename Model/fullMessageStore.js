@@ -4,6 +4,7 @@ import { pluginPath } from './common.js'
 
 const JSON_DATA_DIR = join(process.cwd(), 'data', 'QQBotFullMessage')
 const LEVEL_DATA_DIR = join(pluginPath, 'db', 'fullMessage')
+const MEMBER_NICKNAME_LIMIT = 20000
 
 class FullMessageStore {
   constructor () {
@@ -23,6 +24,7 @@ class FullMessageStore {
     this._metaWriteQueue = Promise.resolve()
     this._writeSeq = 0
     this._ready = false
+    this._memberNicknameOrder = new Map()
   }
 
   async init (type = 'json') {
@@ -38,18 +40,20 @@ class FullMessageStore {
       memberNicknames: {},
       blackGroups: {}
     }
+    this._memberNicknameOrder.clear()
 
     if (type === 'level') {
       try {
         const { default: Level } = await import('./level.js')
         fs.mkdirSync(LEVEL_DATA_DIR, { recursive: true })
         this._db = new Level(LEVEL_DATA_DIR)
-        await this._db.open()
+        await this._db.open({ cleanup: false })
         for await (const [key, value] of this._db.db.iterator()) {
           if (String(key).startsWith('__meta__')) continue
           this.records[key] = value
         }
         this.meta = await this._db.get('__meta__') || this.meta
+        if (this._rebuildMemberNicknameOrder()) this._scheduleMetaSave()
       } catch (err) {
         logger.error('[QQBot-Plugin] fullMessageStore LevelDB init failed, fallback to json:', err.message)
         this.type = 'json'
@@ -61,6 +65,7 @@ class FullMessageStore {
       fs.mkdirSync(JSON_DATA_DIR, { recursive: true })
       this._loadJson()
       this._loadMetaJson()
+      if (this._rebuildMemberNicknameOrder()) this._scheduleMetaSave()
     }
 
     this._ready = true
@@ -105,6 +110,18 @@ class FullMessageStore {
     }
   }
 
+  _rebuildMemberNicknameOrder () {
+    let changed = false
+    this._memberNicknameOrder = new Map(Object.keys(this.meta.memberNicknames || {}).map(key => [key, true]))
+    while (this._memberNicknameOrder.size > MEMBER_NICKNAME_LIMIT) {
+      const oldest = this._memberNicknameOrder.keys().next().value
+      this._memberNicknameOrder.delete(oldest)
+      delete this.meta.memberNicknames[oldest]
+      changed = true
+    }
+    return changed
+  }
+
   _scheduleJsonSave () {
     if (this._saveTimer) clearTimeout(this._saveTimer)
     this._saveTimer = setTimeout(() => {
@@ -114,10 +131,14 @@ class FullMessageStore {
   }
 
   _scheduleMetaSave () {
-    if (this._metaSaveTimer) clearTimeout(this._metaSaveTimer)
-    this._metaSaveTimer = setTimeout(() => {
-      this._writeJsonAtomic(this._metaJsonPath(), this.meta, '_metaWriteQueue')
+    if (this._metaSaveTimer) return
+    this._metaSaveTimer = setTimeout(async () => {
       this._metaSaveTimer = null
+      if (this.type === 'level' && this._db) {
+        try { await this._db.set('__meta__', this.meta, 0) } catch (err) { logger.error('[QQBot-Plugin] fullMessageStore meta save error:', err) }
+      } else {
+        this._writeJsonAtomic(this._metaJsonPath(), this.meta, '_metaWriteQueue')
+      }
     }, 1000)
   }
 
@@ -150,17 +171,20 @@ class FullMessageStore {
         return await fs.promises.open(lockFile, 'wx')
       } catch (err) {
         if (err.code !== 'EEXIST' || i === retry - 1) throw err
+        try {
+          const stat = await fs.promises.stat(lockFile)
+          if (Date.now() - stat.mtimeMs > 30000) {
+            await fs.promises.unlink(lockFile)
+            continue
+          }
+        } catch {}
         await new Promise(resolve => setTimeout(resolve, delayMs))
       }
     }
   }
 
   async saveMeta () {
-    if (this.type === 'level' && this._db) {
-      await this._db.set('__meta__', this.meta, 0)
-    } else {
-      this._scheduleMetaSave()
-    }
+    this._scheduleMetaSave()
   }
 
   async setRecord (key, value) {
@@ -223,11 +247,21 @@ class FullMessageStore {
     const key = `${selfId}:${memberOpenid}`
     const current = this.meta.memberNicknames[key]
     if (current?.nickname === nickname && current?.role === extra.role && current?.group_openid === extra.group_openid) return false
+    if (current) {
+      delete this.meta.memberNicknames[key]
+      this._memberNicknameOrder.delete(key)
+    }
     this.meta.memberNicknames[key] = {
       nickname,
       role: extra.role || current?.role || '',
       group_openid: extra.group_openid || current?.group_openid || '',
       updated_at: new Date().toISOString()
+    }
+    this._memberNicknameOrder.set(key, true)
+    while (this._memberNicknameOrder.size > MEMBER_NICKNAME_LIMIT) {
+      const oldest = this._memberNicknameOrder.keys().next().value
+      this._memberNicknameOrder.delete(oldest)
+      delete this.meta.memberNicknames[oldest]
     }
     await this.saveMeta()
     return true
@@ -384,6 +418,7 @@ class FullMessageStore {
       }
     }
     if (changed) await this.saveMeta()
+    if (changed) this._rebuildMemberNicknameOrder()
     return changed
   }
 
@@ -395,6 +430,9 @@ class FullMessageStore {
     if (this._metaSaveTimer) {
       clearTimeout(this._metaSaveTimer)
       this._metaSaveTimer = null
+    }
+    if (this.type === 'level' && this._db) {
+      try { await this._db.set('__meta__', this.meta, 0) } catch {}
     }
     if (this.type === 'json' && this._ready) {
       this._writeJsonAtomic(this._jsonPath(), this.records, '_jsonWriteQueue')

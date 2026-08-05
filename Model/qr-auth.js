@@ -9,6 +9,7 @@ const CONNECT_URL = `https://${PORTAL_HOST}/qqbot/openclaw/connect.html?task_id=
 const POLL_INTERVAL = 2000
 const REQUEST_TIMEOUT = 10000
 const MAX_REFRESHES = 3
+const QR_TIMEOUT_MS = 4 * 60 * 1000
 
 const BindStatus = {
   NONE: 0,
@@ -68,8 +69,8 @@ async function pollBindResult (taskId) {
   }
 }
 
-async function qrRegister ({ timeoutSeconds = 300, onQRCode, onStatusChange } = {}) {
-  const deadline = Date.now() + timeoutSeconds * 1000
+async function qrRegister ({ onQRCode, onStatusChange } = {}) {
+  const deadline = Date.now() + QR_TIMEOUT_MS
   let lastError = null
 
   for (let refreshCount = 0; refreshCount <= MAX_REFRESHES && Date.now() < deadline; refreshCount++) {

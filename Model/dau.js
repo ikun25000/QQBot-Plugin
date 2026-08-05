@@ -92,6 +92,8 @@ export default class Dau {
               case 'user_group_stats':
                 break
               case 'receive_msg_count':
+              case 'receive_msg_full_count':
+              case 'receive_msg_at_count':
               case 'send_msg_count':
                 redis.incr(`${prefix}${key}`)
                 break
@@ -105,7 +107,7 @@ export default class Dau {
       case 'level': {
         const path = join(process.cwd(), 'plugins', 'QQBot-Plugin', 'db', this.self_id)
         this.db = new Level(path)
-        await this.db.open()
+        await this.db.open({ cleanup: false })
         break
       }
       default:
@@ -463,7 +465,7 @@ export default class Dau {
       this.friend_delete = await this.getDB('friend_delete') || {}
       this.call_stats = await this.getDB('call_stats') || {}
     }
-    this.message_id_cache = {}
+    this.message_id_cache = new Map()
   }
 
   toDauMsg (data, num = 0) {
@@ -532,6 +534,7 @@ export default class Dau {
           this.group_decrease[group_id]++
           await this.setDB('group_decrease', this.group_decrease, 2)
         }
+        break
       case 'group_increase':
         if (this.dauDB === 'level') {
           if (!this.group_increase[group_id]) {
@@ -582,13 +585,19 @@ export default class Dau {
     if (logReg.test(logFnc)) logFnc = `[${logFnc.match(logReg)[1]}]`
 
     // 每个消息只记录一次
-    if (this.message_id_cache[message_id]) return
+    const cacheKey = message_id || `${user_id || ''}:${group_id || ''}:${logFnc}`
+    const now = Date.now()
+    const cachedAt = this.message_id_cache.get(cacheKey)
+    if (cachedAt && now - cachedAt < 5 * 60 * 1000) return
+    if (this.message_id_cache.size >= 10000) {
+      for (const [id, time] of this.message_id_cache) {
+        if (now - time >= 5 * 60 * 1000 || this.message_id_cache.size > 9000) this.message_id_cache.delete(id)
+      }
+    }
+    this.message_id_cache.set(cacheKey, now)
     if (!this.call_stats[logFnc]) this.call_stats[logFnc] = 0
     this.call_stats[logFnc]++
     await this.setDB('call_stats', this.call_stats, 2)
-    this.message_id_cache[message_id] = setTimeout(() => {
-      delete this.message_id_cache[message_id]
-    }, 60 * 5 * 1000)
     if (this.dauDB === 'level') {
       if (group_id) {
         if (!this.all_group[group_id]) {

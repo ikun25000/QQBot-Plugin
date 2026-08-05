@@ -4,6 +4,12 @@ import { pluginPath } from './common.js'
 
 const JSON_DATA_DIR = join(process.cwd(), 'data', 'QQBotAdvancedWelcome')
 const LEVEL_DATA_DIR = join(pluginPath, 'db', 'advancedWelcome')
+const MESSAGE_INDEX_TTL_MS = 24 * 60 * 60 * 1000
+const MESSAGE_INDEX_MAX_PER_BOT = 50000
+const LOCAL_MESSAGE_INDEX_MAX_PER_BOT = 20000
+const PENDING_COMPLAINT_MAX_PER_BOT = 1000
+const ACTUAL_MESSAGE_IDS_MAX = 100
+const CLEANUP_INTERVAL_MS = 5 * 60 * 1000
 
 function nowIso () { return new Date().toISOString() }
 function dayKey (date = new Date()) { return date.toISOString().slice(0, 10) }
@@ -25,6 +31,8 @@ class AdvancedWelcomeStore {
     this._saveTimer = null
     this._writeQueue = Promise.resolve()
     this._writeSeq = 0
+    this._indexCounts = { messageIds: new Map(), localMessageIds: new Map() }
+    this._lastCleanup = 0
   }
 
   _jsonPath () { return join(JSON_DATA_DIR, 'advancedWelcome.json') }
@@ -32,31 +40,178 @@ class AdvancedWelcomeStore {
   async init () {
     if (this._ready) return
     this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {} }
+    this._indexCounts = { messageIds: new Map(), localMessageIds: new Map() }
+    this._lastCleanup = Date.now()
     try {
       const { default: Level } = await import('./level.js')
       fs.mkdirSync(LEVEL_DATA_DIR, { recursive: true })
       this._db = new Level(LEVEL_DATA_DIR)
-      await this._db.open()
-      for await (const [key, value] of this._db.db.iterator()) this._setByKey(key, value)
+      await this._db.open({ cleanup: false })
+      const deletes = []
+      for (const prefix of ['group:', 'pending:']) {
+        for await (const [key, value] of this._db.db.iterator({ gte: prefix, lt: `${prefix}\uffff` })) {
+          if (this._isStoredRecordExpired(key, value)) deletes.push(String(key))
+          else this._setByKey(key, value)
+        }
+      }
+      for (const selfId of new Set(Object.values(this._data.pendingComplaints).map(item => item?.self_id || ''))) deletes.push(...this._prunePendingComplaints(selfId))
+      deletes.push(...this._pruneIndexStore('messageIds', MESSAGE_INDEX_MAX_PER_BOT), ...this._pruneIndexStore('localMessageIds', LOCAL_MESSAGE_INDEX_MAX_PER_BOT))
+      await this._persistDeletes(deletes)
     } catch (err) {
       logger.error('[QQBot-Plugin] advancedWelcomeStore LevelDB init failed, fallback to json:', err.message)
       this.type = 'json'
       if (this._db) { try { this._db.close() } catch {}; this._db = null }
+      this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {} }
+      this._indexCounts = { messageIds: new Map(), localMessageIds: new Map() }
       fs.mkdirSync(JSON_DATA_DIR, { recursive: true })
       try {
-        this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {}, ...JSON.parse(fs.readFileSync(this._jsonPath(), 'utf-8')) }
+        const data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {}, ...JSON.parse(fs.readFileSync(this._jsonPath(), 'utf-8')) }
+        this._data.groups = data.groups || {}
+        for (const [key, value] of Object.entries(data.pendingComplaints || {})) {
+          if (!this._isPendingExpired(value)) this._data.pendingComplaints[key] = value
+        }
+        for (const [key, value] of Object.entries(data.messageIds || {})) {
+          if (!this._isMessageIndexExpired(value)) this._setIndexItem('messageIds', key, value)
+        }
+        for (const [key, value] of Object.entries(data.localMessageIds || {})) {
+          if (!this._isMessageIndexExpired(value)) this._setIndexItem('localMessageIds', key, value)
+        }
+        const deletes = []
+        for (const selfId of new Set(Object.values(this._data.pendingComplaints).map(item => item?.self_id || ''))) deletes.push(...this._prunePendingComplaints(selfId))
+        deletes.push(...this._pruneIndexStore('messageIds', MESSAGE_INDEX_MAX_PER_BOT), ...this._pruneIndexStore('localMessageIds', LOCAL_MESSAGE_INDEX_MAX_PER_BOT))
+        if (deletes.length || Object.keys(data.pendingComplaints || {}).length !== Object.keys(this._data.pendingComplaints).length || Object.keys(data.messageIds || {}).length !== Object.keys(this._data.messageIds).length || Object.keys(data.localMessageIds || {}).length !== Object.keys(this._data.localMessageIds).length) this._scheduleSave()
       } catch {
         this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {} }
+        this._indexCounts = { messageIds: new Map(), localMessageIds: new Map() }
       }
     }
     this._ready = true
   }
 
   _setByKey (key, value) {
-    if (String(key).startsWith('group:')) this._data.groups[String(key).slice(6)] = value
+    if (String(key).startsWith('group:')) {
+      if (Array.isArray(value?.recent_message_ids) && value.recent_message_ids.length > 20) value.recent_message_ids = value.recent_message_ids.slice(-20)
+      this._data.groups[String(key).slice(6)] = value
+    }
     else if (String(key).startsWith('pending:')) this._data.pendingComplaints[String(key).slice(8)] = value
-    else if (String(key).startsWith('localmsg:')) this._data.localMessageIds[String(key).slice(9)] = value
-    else if (String(key).startsWith('msg:')) this._data.messageIds[String(key).slice(4)] = value
+    else if (String(key).startsWith('localmsg:')) this._setIndexItem('localMessageIds', String(key).slice(9), value)
+    else if (String(key).startsWith('msg:')) this._setIndexItem('messageIds', String(key).slice(4), value)
+  }
+
+  _indexTime (item) {
+    const expires = Number(item?.expire_at)
+    if (Number.isFinite(expires) && expires > 0) return expires - MESSAGE_INDEX_TTL_MS
+    const numeric = Number(item?.time)
+    if (Number.isFinite(numeric) && numeric > 0) return numeric < 10000000000 ? numeric * 1000 : numeric
+    return Date.parse(item?.time || '') || 0
+  }
+
+  _isMessageIndexExpired (item, now = Date.now()) {
+    const expires = Number(item?.expire_at)
+    if (Number.isFinite(expires) && expires > 0) return expires <= now
+    const time = this._indexTime(item)
+    return !time || now - time >= MESSAGE_INDEX_TTL_MS
+  }
+
+  _isPendingExpired (item, now = Date.now()) {
+    const expires = Number(item?.expire_at)
+    return !Number.isFinite(expires) || expires <= now
+  }
+
+  _isStoredRecordExpired (key, value, now = Date.now()) {
+    const storedKey = String(key)
+    if (storedKey.startsWith('pending:')) return this._isPendingExpired(value, now)
+    if (storedKey.startsWith('msg:') || storedKey.startsWith('localmsg:')) return this._isMessageIndexExpired(value, now)
+    return false
+  }
+
+  _setIndexItem (store, key, item) {
+    const old = this._data[store][key]
+    const oldBot = String(old?.self_id || '')
+    const bot = String(item?.self_id || '')
+    if (!old || oldBot !== bot) {
+      if (old) {
+        const oldCount = Math.max(0, (this._indexCounts[store].get(oldBot) || 1) - 1)
+        if (oldCount) this._indexCounts[store].set(oldBot, oldCount)
+        else this._indexCounts[store].delete(oldBot)
+      }
+      this._indexCounts[store].set(bot, (this._indexCounts[store].get(bot) || 0) + 1)
+    }
+    this._data[store][key] = item
+  }
+
+  _deleteIndexItem (store, key) {
+    const item = this._data[store][key]
+    if (!item) return
+    const bot = String(item.self_id || '')
+    const count = Math.max(0, (this._indexCounts[store].get(bot) || 1) - 1)
+    if (count) this._indexCounts[store].set(bot, count)
+    else this._indexCounts[store].delete(bot)
+    delete this._data[store][key]
+  }
+
+  _pruneIndexStore (store, max, selfId = '') {
+    const prefix = store === 'messageIds' ? 'msg:' : 'localmsg:'
+    const bots = selfId ? [String(selfId)] : [...this._indexCounts[store].keys()]
+    const deletes = []
+    for (const bot of bots) {
+      if ((this._indexCounts[store].get(bot) || 0) <= max) continue
+      const items = Object.entries(this._data[store])
+        .filter(([, item]) => String(item?.self_id || '') === bot)
+        .sort((a, b) => this._indexTime(b[1]) - this._indexTime(a[1]))
+      for (const [key] of items.slice(Math.floor(max * 0.9))) {
+        this._deleteIndexItem(store, key)
+        deletes.push(`${prefix}${key}`)
+      }
+    }
+    return deletes
+  }
+
+  _removeExpired (now = Date.now()) {
+    const deletes = []
+    for (const [key, item] of Object.entries(this._data.pendingComplaints)) {
+      if (!this._isPendingExpired(item, now)) continue
+      delete this._data.pendingComplaints[key]
+      deletes.push(`pending:${key}`)
+    }
+    for (const [store, prefix] of [['messageIds', 'msg:'], ['localMessageIds', 'localmsg:']]) {
+      for (const [key, item] of Object.entries(this._data[store])) {
+        if (!this._isMessageIndexExpired(item, now)) continue
+        this._deleteIndexItem(store, key)
+        deletes.push(`${prefix}${key}`)
+      }
+    }
+    return deletes
+  }
+
+  _prunePendingComplaints (selfId = '') {
+    const items = Object.entries(this._data.pendingComplaints)
+      .filter(([, item]) => item?.self_id === selfId)
+      .sort((a, b) => (Date.parse(b[1]?.created_at || '') || 0) - (Date.parse(a[1]?.created_at || '') || 0))
+    const deletes = []
+    for (const [key] of items.slice(PENDING_COMPLAINT_MAX_PER_BOT)) {
+      delete this._data.pendingComplaints[key]
+      deletes.push(`pending:${key}`)
+    }
+    return deletes
+  }
+
+  async _persistDeletes (keys) {
+    const unique = [...new Set(keys)]
+    if (!unique.length) return
+    if (this.type === 'level' && this._db) await this._db.db.batch(unique.map(key => ({ type: 'del', key })))
+    else this._scheduleSave()
+  }
+
+  _queueDeletes (keys) {
+    this._persistDeletes(keys).catch(err => logger.error('[QQBot-Plugin] advancedWelcomeStore cleanup error:', err))
+  }
+
+  _maybeCleanup () {
+    const now = Date.now()
+    if (now - this._lastCleanup < CLEANUP_INTERVAL_MS) return
+    this._lastCleanup = now
+    this._queueDeletes(this._removeExpired(now))
   }
 
   _scheduleSave () {
@@ -170,12 +325,12 @@ class AdvancedWelcomeStore {
   async recordSpeech (selfId = '', groupOpenid = '', messageId = '', fullMessageCreate = false) {
     if (!selfId || !groupOpenid) return false
     const item = this.getGroup(selfId, groupOpenid, true)
+    if (messageId && item.recent_message_ids.includes(messageId)) return false
     item.full_message_active = fullMessageCreate === true
     if (fullMessageCreate) item.full_message_create_count = (Number(item.full_message_create_count) || 0) + 1
     if (messageId) {
-      if (item.recent_message_ids.includes(messageId)) return false
       item.recent_message_ids.push(messageId)
-      if (item.recent_message_ids.length > 200) item.recent_message_ids.splice(0, item.recent_message_ids.length - 200)
+      if (item.recent_message_ids.length > 20) item.recent_message_ids.splice(0, item.recent_message_ids.length - 20)
     }
     if (fullMessageCreate) item.speech_since_sent = (Number(item.speech_since_sent) || 0) + 1
     else item.speech_since_sent = 0
@@ -239,26 +394,46 @@ class AdvancedWelcomeStore {
   _pendingKey (selfId, groupOpenid, userOpenid) { return `${selfId}:${groupOpenid}:${userOpenid}` }
 
   async setPendingComplaint (selfId = '', groupOpenid = '', userOpenid = '', code = '') {
+    const deletes = this._removeExpired()
     const key = this._pendingKey(selfId, groupOpenid, userOpenid)
     const item = { self_id: selfId, group_openid: groupOpenid, user_openid: userOpenid, code, expire_at: Date.now() + 60000, created_at: nowIso() }
     this._data.pendingComplaints[key] = item
     await this._save(`pending:${key}`, item)
+    deletes.push(...this._prunePendingComplaints(selfId))
+    const currentKey = `pending:${key}`
+    for (let i = deletes.length - 1; i >= 0; i--) if (deletes[i] === currentKey) deletes.splice(i, 1)
+    await this._persistDeletes(deletes)
     return item
   }
 
   getPendingComplaint (selfId = '', groupOpenid = '', userOpenid = '') {
     const key = this._pendingKey(selfId, groupOpenid, userOpenid)
     const item = this._data.pendingComplaints[key]
-    if (!item || Number(item.expire_at) < Date.now()) return null
+    if (!item) return null
+    if (this._isPendingExpired(item)) {
+      delete this._data.pendingComplaints[key]
+      this._queueDeletes([`pending:${key}`])
+      return null
+    }
     return item
   }
 
   findPendingComplaintByCode (selfId = '', groupOpenid = '', code = '') {
     const target = String(code || '')
     if (!target) return null
-    for (const item of Object.values(this._data.pendingComplaints)) {
-      if (item?.self_id === selfId && item?.group_openid === groupOpenid && item?.code === target && Number(item.expire_at) >= Date.now()) return item
+    const deletes = []
+    for (const [key, item] of Object.entries(this._data.pendingComplaints)) {
+      if (this._isPendingExpired(item)) {
+        delete this._data.pendingComplaints[key]
+        deletes.push(`pending:${key}`)
+        continue
+      }
+      if (item?.self_id === selfId && item?.group_openid === groupOpenid && item?.code === target) {
+        this._queueDeletes(deletes)
+        return item
+      }
     }
+    this._queueDeletes(deletes)
     return null
   }
 
@@ -309,35 +484,39 @@ class AdvancedWelcomeStore {
 
   async recordMessageIndex (record = {}) {
     if (!record.message_id) return false
-    const oldItem = this._data.messageIds[record.message_id]
+    this._maybeCleanup()
+    const storedItem = this._data.messageIds[record.message_id]
+    const oldItem = storedItem && !this._isMessageIndexExpired(storedItem) ? storedItem : null
     const sameContext = oldItem?.self_id === record.self_id && oldItem?.target_id === record.target_id && oldItem?.type === record.type
     const item = {
       ...record,
       local_bot: record.local_bot === true || (sameContext && oldItem.local_bot === true),
-      time: record.time || nowIso()
+      time: record.time || nowIso(),
+      expire_at: Date.now() + MESSAGE_INDEX_TTL_MS
     }
-    this._data.messageIds[record.message_id] = item
+    this._setIndexItem('messageIds', record.message_id, item)
     await this._save(`msg:${record.message_id}`, item)
     for (const alias of Array.isArray(record.aliases) ? record.aliases : []) {
       if (!alias || alias === record.message_id) continue
       const aliasItem = { ...item, message_id: alias, actual_message_id: record.message_id }
-      this._data.messageIds[alias] = aliasItem
+      this._setIndexItem('messageIds', alias, aliasItem)
       await this._save(`msg:${alias}`, aliasItem)
       if (record.self_id && record.target_id && record.type) {
         const scopedAlias = this._messageAliasKey(record.self_id, record.type, record.target_id, alias)
-        const oldScoped = this._data.messageIds[scopedAlias]
+        const storedScoped = this._data.messageIds[scopedAlias]
+        const oldScoped = storedScoped && !this._isMessageIndexExpired(storedScoped) ? storedScoped : null
         const oldActualId = oldScoped?.actual_message_id || oldScoped?.message_id || ''
-        const scopedItem = oldActualId && oldActualId !== record.message_id
-          ? {
-              ...aliasItem,
-              ambiguous: true,
-              actual_message_ids: [...new Set([...(oldScoped.actual_message_ids || [oldActualId]), record.message_id].filter(Boolean))]
-            }
-          : aliasItem
-        this._data.messageIds[scopedAlias] = scopedItem
+        const actualMessageIds = [...new Set([...(oldScoped?.actual_message_ids || [oldActualId]), record.message_id].filter(Boolean))].slice(-ACTUAL_MESSAGE_IDS_MAX)
+        const scopedItem = {
+          ...aliasItem,
+          ambiguous: actualMessageIds.length > 1,
+          actual_message_ids: actualMessageIds
+        }
+        this._setIndexItem('messageIds', scopedAlias, scopedItem)
         await this._save(`msg:${scopedAlias}`, scopedItem)
       }
     }
+    await this._persistDeletes(this._pruneIndexStore('messageIds', MESSAGE_INDEX_MAX_PER_BOT, record.self_id))
     return true
   }
 
@@ -351,49 +530,84 @@ class AdvancedWelcomeStore {
 
   async recordLocalMessageResponse (record = {}) {
     if (!record.message_id || !record.self_id || !record.type || !record.target_id) return false
+    this._maybeCleanup()
     const aliases = [...new Set([record.message_id, ...(record.aliases || [])].filter(Boolean).map(String))]
     for (const alias of aliases) {
       const key = this._localMessageKey(record.self_id, record.type, record.target_id, alias)
-      const old = this._data.localMessageIds[key]
+      const stored = this._data.localMessageIds[key]
+      const old = stored && !this._isMessageIndexExpired(stored) ? stored : null
       const actualMessageIds = [...new Set([
         ...(old?.actual_message_ids || []),
         old?.actual_message_id,
         record.message_id
-      ].filter(Boolean).map(String))]
+      ].filter(Boolean).map(String))].slice(-ACTUAL_MESSAGE_IDS_MAX)
       const item = {
         ...record,
         alias,
         actual_message_id: record.message_id,
         actual_message_ids: actualMessageIds,
         local_bot: true,
-        time: record.time || nowIso()
+        time: record.time || nowIso(),
+        expire_at: Date.now() + MESSAGE_INDEX_TTL_MS
       }
-      this._data.localMessageIds[key] = item
+      this._setIndexItem('localMessageIds', key, item)
       await this._save(`localmsg:${key}`, item)
     }
+    await this._persistDeletes(this._pruneIndexStore('localMessageIds', LOCAL_MESSAGE_INDEX_MAX_PER_BOT, record.self_id))
     return true
   }
 
-  getLocalMessageResponse (messageId = '', context = {}) {
+  async getLocalMessageResponse (messageId = '', context = {}) {
     if (!messageId || !context.selfId || !context.type || !context.targetId) return null
-    return this._data.localMessageIds[this._localMessageKey(context.selfId, context.type, context.targetId, messageId)] || null
+    this._maybeCleanup()
+    const key = this._localMessageKey(context.selfId, context.type, context.targetId, messageId)
+    let item = this._data.localMessageIds[key] || null
+    if (!item && this.type === 'level' && this._db) {
+      item = await this._db.get(`localmsg:${key}`)
+      if (item) this._setIndexItem('localMessageIds', key, item)
+    }
+    if (item && this._isMessageIndexExpired(item)) {
+      this._deleteIndexItem('localMessageIds', key)
+      this._queueDeletes([`localmsg:${key}`])
+      return null
+    }
+    return item
   }
 
-  getMessageIndex (messageId = '', context = {}) {
+  async getMessageIndex (messageId = '', context = {}) {
     if (!messageId) return null
+    this._maybeCleanup()
     if (context.selfId && context.type && context.targetId) {
-      const scoped = this._data.messageIds[this._messageAliasKey(context.selfId, context.type, context.targetId, messageId)]
-      if (scoped) return scoped.ambiguous ? null : scoped
+      const scopedKey = this._messageAliasKey(context.selfId, context.type, context.targetId, messageId)
+      let scoped = this._data.messageIds[scopedKey]
+      if (!scoped && this.type === 'level' && this._db) {
+        scoped = await this._db.get(`msg:${scopedKey}`)
+        if (scoped) this._setIndexItem('messageIds', scopedKey, scoped)
+      }
+      if (scoped && this._isMessageIndexExpired(scoped)) {
+        this._deleteIndexItem('messageIds', scopedKey)
+        this._queueDeletes([`msg:${scopedKey}`])
+      } else if (scoped) return scoped.ambiguous ? null : scoped
     }
-    const item = this._data.messageIds[messageId] || null
+    let item = this._data.messageIds[messageId] || null
+    if (!item && this.type === 'level' && this._db) {
+      item = await this._db.get(`msg:${messageId}`)
+      if (item) this._setIndexItem('messageIds', messageId, item)
+    }
     if (!item) return null
+    if (this._isMessageIndexExpired(item)) {
+      this._deleteIndexItem('messageIds', messageId)
+      this._queueDeletes([`msg:${messageId}`])
+      return null
+    }
     if (context.selfId && item.self_id !== context.selfId) return null
     if (context.type && item.type !== context.type) return null
     if (context.targetId && item.target_id !== context.targetId) return null
     return item
   }
 
-  findRecallCandidatesByContent (selfId = '', targetId = '', content = '', options = {}) {
+  async findRecallCandidatesByContent (selfId = '', targetId = '', content = '', options = {}) {
+    this._maybeCleanup()
     const text = String(content || '').replace(/\s+/g, ' ').trim()
     if (!selfId || !targetId || !text) return { items: [], total: 0, truncated: false }
     const beforeTime = Number(options.beforeTime) || Date.now()
@@ -401,7 +615,16 @@ class AdvancedWelcomeStore {
     const limitMs = Math.max(1, Number(options.limitMs) || 10 * 60 * 1000)
     const limit = Math.max(1, Number(options.limit) || 20)
     const excludedIds = new Set((options.excludeMessageIds || []).filter(Boolean).map(String))
-    const candidates = Object.values(this._data.messageIds)
+    let source = Object.values(this._data.messageIds)
+    if (this.type === 'level' && this._db) {
+      source = []
+      for await (const [key, item] of this._db.db.iterator({ gte: 'msg:', lt: 'msg:\uffff' })) {
+        if (this._isMessageIndexExpired(item)) continue
+        source.push(item)
+        if (source.length > 50000) source.shift()
+      }
+    }
+    const candidates = source
       .filter(item => {
         if (!item || item.actual_message_id || item.self_id !== selfId || item.target_id !== targetId || item.type !== 'group') return false
         if (excludedIds.has(String(item.message_id || ''))) return false
@@ -422,13 +645,22 @@ class AdvancedWelcomeStore {
     }
   }
 
-  findRecentMessageByContent (selfId = '', targetId = '', content = '', options = {}) {
+  async findRecentMessageByContent (selfId = '', targetId = '', content = '', options = {}) {
+    this._maybeCleanup()
     const text = String(content || '').trim()
     if (!selfId || !targetId || !text) return null
     const limitMs = Number(options.limitMs) || 10 * 60 * 1000
     const authorBot = options.bot
     const now = Date.now()
-    const items = Object.values(this._data.messageIds)
+    let source = Object.values(this._data.messageIds)
+    if (this.type === 'level' && this._db) {
+      source = []
+      for await (const [, item] of this._db.db.iterator({ gte: 'msg:', lt: 'msg:\uffff' })) {
+        if (!this._isMessageIndexExpired(item)) source.push(item)
+        if (source.length > 50000) source.shift()
+      }
+    }
+    const items = source
       .filter(item => {
         if (!item || item.actual_message_id) return false
         if (item.self_id !== selfId || item.target_id !== targetId || item.type !== 'group') return false

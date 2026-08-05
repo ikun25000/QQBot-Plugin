@@ -89,6 +89,74 @@ const qqbotInternalSendStorage = new AsyncLocalStorage()
 const qqbotMessageSuffixApplied = new WeakSet()
 const qqbotMessageSuffixExcluded = new WeakSet()
 const qqbotApiSwitchConfirmations = new Map()
+const qqbotTimedMapExpiries = new Map()
+let qqbotStoresReady = Promise.resolve()
+let qqbotStoreInitError = null
+const qqbotMessageQueues = new Map()
+const QQBOT_MESSAGE_CONCURRENCY = 8
+const QQBOT_MESSAGE_QUEUE_LIMIT = 500
+const QQBOT_PRIORITY_QUEUE_LIMIT = 1000
+
+function isPassiveQQBotFullMessage (event = {}) {
+  if (event._qqbotFullMessageCreate !== true && event.raw?._qqbotFullMessageCreate !== true) return false
+  const mentions = event._mentions || event.mentions || event.raw?._mentions || event.raw?.mentions || []
+  return !mentions.some(item => item?.bot === true && item?.is_you === true)
+}
+
+function isQQBotLikelyCommandEvent (event = {}) {
+  const text = event.raw_message || event.content || event.raw?.content || ''
+  return /^\s*[#/]/.test(String(text))
+}
+
+function enqueueQQBotMessage (adapter, id, event) {
+  let state = qqbotMessageQueues.get(id)
+  if (!state) {
+    state = { active: 0, queue: [], lastWarnAt: 0 }
+    qqbotMessageQueues.set(id, state)
+  }
+  const runNext = () => {
+    while (state.active < QQBOT_MESSAGE_CONCURRENCY && state.queue.length) {
+      const next = state.queue.shift()
+      state.active++
+      Promise.resolve(adapter.makeMessage(id, next)).catch(err => {
+        Bot.makeLog('error', [`[${id}] 消息处理失败`, err.message || String(err)], id)
+      }).finally(() => {
+        state.active--
+        if (!state.active && !state.queue.length) qqbotMessageQueues.delete(id)
+        else runNext()
+      })
+    }
+  }
+  if (state.active >= QQBOT_MESSAGE_CONCURRENCY) {
+    if (state.queue.length >= QQBOT_MESSAGE_QUEUE_LIMIT) {
+      if (isPassiveQQBotFullMessage(event)) {
+        if (Date.now() - state.lastWarnAt > 60000) {
+          state.lastWarnAt = Date.now()
+          Bot.makeLog('warn', [`[${id}] 消息处理队列已满，丢弃被动全量消息以保护内存`, { active: state.active, queued: state.queue.length }], id)
+        }
+        return false
+      }
+      const passiveIndex = state.queue.findIndex(isPassiveQQBotFullMessage)
+      if (passiveIndex >= 0) state.queue.splice(passiveIndex, 1)
+      else if (state.queue.length >= QQBOT_PRIORITY_QUEUE_LIMIT) {
+        const replaceIndex = isQQBotLikelyCommandEvent(event) ? state.queue.findIndex(item => !isQQBotLikelyCommandEvent(item)) : -1
+        if (replaceIndex >= 0) state.queue.splice(replaceIndex, 1)
+        else {
+          if (Date.now() - state.lastWarnAt > 60000) {
+            state.lastWarnAt = Date.now()
+            Bot.makeLog('error', [`[${id}] 高优先级消息处理队列已达硬上限，拒绝新消息`, { active: state.active, queued: state.queue.length }], id)
+          }
+          return false
+        }
+      }
+    }
+    state.queue.push(event)
+  } else {
+    state.queue.push(event)
+  }
+  runNext()
+  return true
+}
 
 function stripAttachmentPlaceholders (text) {
   if (typeof text !== 'string' || !text.includes('<')) return text
@@ -96,6 +164,36 @@ function stripAttachmentPlaceholders (text) {
     .replace(/\s*<attachmentType\s*=\s*"[^"]+"\s*,\s*attachmentIndex\s*=\s*\d+(?:\s*,\s*description\s*=\s*"[^"]*")?\s*>/ig, '')
     .replace(/\s*<(?:image|video|audio)(?:,[^>]*)?>/ig, '')
     .trim()
+}
+
+function setQQBotTimedMapValue (mapName, key, value, ttlMs, maxSize) {
+  if (!globalThis[mapName]) globalThis[mapName] = new Map()
+  const map = globalThis[mapName]
+  const now = Date.now()
+  let scanned = 0
+  for (const existingKey of map.keys()) {
+    const expiryKey = `${mapName}:${existingKey}`
+    if ((qqbotTimedMapExpiries.get(expiryKey) || 0) <= now || map.size >= maxSize) {
+      map.delete(existingKey)
+      qqbotTimedMapExpiries.delete(expiryKey)
+    }
+    if (++scanned >= 1000 && map.size < maxSize) break
+  }
+  map.delete(key)
+  map.set(key, value)
+  qqbotTimedMapExpiries.set(`${mapName}:${key}`, now + ttlMs)
+}
+
+function getQQBotTimedMapValue (mapName, key) {
+  const map = globalThis[mapName]
+  if (!map?.has?.(key)) return undefined
+  const expiryKey = `${mapName}:${key}`
+  if ((qqbotTimedMapExpiries.get(expiryKey) || 0) <= Date.now()) {
+    map.delete(key)
+    qqbotTimedMapExpiries.delete(expiryKey)
+    return undefined
+  }
+  return map.get(key)
 }
 
 function getQQBotMemberRoleTag (role = '', isBot = false) {
@@ -277,16 +375,14 @@ function cacheQQBotReplyRefContent (payload = {}, selfId = '', groupOpenid = '')
   if (!/^(?:REFIDX_|TMP_)/i.test(String(ref || ''))) return
   const content = getQQBotQuotedContentFingerprint(payload)
   if (!content) return
-  if (!globalThis.__qqbotRefContentMap) globalThis.__qqbotRefContentMap = new Map()
   const key = getQQBotRefMapKey(selfId, 'group', groupOpenid, ref)
-  globalThis.__qqbotRefContentMap.set(key, {
+  setQQBotTimedMapValue('__qqbotRefContentMap', key, {
     self_id: selfId,
     group_openid: groupOpenid,
     content,
     bot: getQQBotQuotedAuthorBot(payload),
     time: Date.now()
-  })
-  setTimeout(() => globalThis.__qqbotRefContentMap?.delete?.(key), 10 * 60 * 1000)
+  }, 10 * 60 * 1000, 5000)
 }
 
 function stringifyQQBotRecallDetail (value) {
@@ -603,6 +699,10 @@ function withQQBotInternalSend (fn) {
   return qqbotInternalSendStorage.run(true, fn)
 }
 
+function sendQQBotInternalMasterMsg (message) {
+  return withQQBotInternalSend(() => Bot.sendMasterMsg(message))
+}
+
 function isQQBotInternalSend () {
   return qqbotInternalSendStorage.getStore() === true
 }
@@ -684,8 +784,38 @@ function ensureUserManageConfig (selfId = '') {
   if (typeof item.uaEnabled !== 'boolean') item.uaEnabled = false
   if (typeof item.ua !== 'string') item.ua = ''
   if (typeof item.blackReply !== 'boolean') item.blackReply = true
+  if (typeof item.allowGroup !== 'boolean') item.allowGroup = true
+  if (typeof item.allowFriend !== 'boolean') item.allowFriend = true
+  if (typeof item.allowGuild !== 'boolean') item.allowGuild = true
+  if (!item.allowGroup && !item.allowFriend) {
+    item.allowGroup = true
+    item.allowFriend = true
+    item.allowGuild = true
+    Bot.makeLog?.('warn', [`[${selfId}] 用户管理使用范围中的群聊和好友私聊均被关闭，已自动恢复为全部开启`], selfId)
+    Promise.resolve().then(() => configSave()).catch(err => Bot.makeLog?.('error', [`[${selfId}] 自动修复用户管理使用范围保存失败`, err.message], selfId))
+  }
   item.timeOffsetHours = Number(item.timeOffsetHours) || 0
   return item
+}
+
+function getQQBotUsageScope (data = {}) {
+  if (data.message_type === 'private' && !String(data.user_id || '').startsWith('qg_')) return { key: 'allowFriend', name: '好友私聊' }
+  if (data.message_type === 'direct' || data.message_type === 'guild' || String(data.group_id || '').startsWith('qg_') || String(data.user_id || '').startsWith('qg_')) return { key: 'allowGuild', name: '频道' }
+  if (data.message_type === 'group') return { key: 'allowGroup', name: '群聊' }
+  return null
+}
+
+function isInternalQQBotCommandEvent (data = {}) {
+  const texts = [data.raw_message, ...(Array.isArray(data.message) ? data.message.filter(item => item?.type === 'text').map(item => item.text) : [])]
+  return texts.some(text => /^#(?:q+bot|QQBot|机器人用户注销)/i.test(String(text || '').replace(/^\[回复：[^\]]+\]\s*/, '')))
+}
+
+async function blockDisabledQQBotUsageScope (data = {}, internal = false) {
+  if (internal) return false
+  const scope = getQQBotUsageScope(data)
+  if (!scope || ensureUserManageConfig(data.self_id)[scope.key]) return false
+  await withQQBotInternalSend(() => data.reply?.(`本机器人无法在${scope.name}使用\n如果你是管理员，请使用命令 #QQBot用户管理菜单 使用范围 来解除`))
+  return true
 }
 
 function getQQBotUserAgent (selfId = '') {
@@ -715,6 +845,8 @@ function getQRCodeRegExp (selfId = '') {
 }
 
 const botAuthorLimitBuckets = new Map()
+const BOT_AUTHOR_BUCKET_MAX = 10000
+let botAuthorBucketWrites = 0
 const VIRTUAL_AT_ID_VERSION = 3
 
 function isGroupBotAuthorEvent (event) {
@@ -795,6 +927,13 @@ function shouldLimitBotAuthorMessage (config, event, selfId = '') {
   const userId = event.author?.id || event.raw?.author?.id || event.sender?.user_id || event.raw?.sender?.user_id || ''
   const key = `${selfId}:${groupId}:${userId}`
   const now = Date.now()
+  if (++botAuthorBucketWrites % 1000 === 0 || botAuthorLimitBuckets.size > BOT_AUTHOR_BUCKET_MAX) {
+    for (const [bucketKey, times] of botAuthorLimitBuckets) {
+      if (!Array.isArray(times) || !times.some(time => now - time < windowMs)) botAuthorLimitBuckets.delete(bucketKey)
+      if (botAuthorLimitBuckets.size <= BOT_AUTHOR_BUCKET_MAX) continue
+      botAuthorLimitBuckets.delete(bucketKey)
+    }
+  }
   const bucket = (botAuthorLimitBuckets.get(key) || []).filter(time => now - time < windowMs)
 
   if (bucket.length >= count) {
@@ -1403,7 +1542,15 @@ patchGroupMessageCreateEvent()
 const startTime = new Date()
 logger.info(logger.yellow('- 正在加载 QQBot 适配器插件'))
 
-const userIdCache = {}
+const userIdCache = new Map()
+const USER_ID_CACHE_LIMIT = 10000
+
+function cacheQQBotUserId (key, value) {
+  if (!key || !value) return
+  userIdCache.delete(key)
+  userIdCache.set(key, value)
+  while (userIdCache.size > USER_ID_CACHE_LIMIT) userIdCache.delete(userIdCache.keys().next().value)
+}
 const markdown_template = await importJS('Model/template/markdownTemplate.js', 'default')
 const TmplPkg = await importJS('templates/index.js')
 
@@ -1773,11 +1920,10 @@ const adapter = new class QQBotAdapter {
     const isReferenceIndex = value => /^(?:REFIDX_|TMP_)/i.test(String(value || ''))
     const contextTargetId = targetId || getRawQQBotGroupId(data, data.self_id, this.sep)
     const contextType = normalizeRecallType(targetType) || (data.message_type === 'group' || data.notice_type === 'group' ? 'group' : data.message_type === 'private' ? 'user' : '')
-    const refMap = globalThis.__qqbotRefMsgIdMap
     const scopedRefKey = getQQBotRefMapKey(data.self_id, contextType, contextTargetId, messageId)
     const findRecord = async () => {
       if (isReferenceIndex(messageId) && contextType === 'group' && !contextTargetId) return null
-      const local = advancedWelcomeStore.getLocalMessageResponse(messageId, {
+      const local = await advancedWelcomeStore.getLocalMessageResponse(messageId, {
         selfId: data.self_id,
         targetId: contextTargetId,
         type: contextType
@@ -1795,9 +1941,10 @@ const adapter = new class QQBotAdapter {
     } catch (err) {
       return { ok: false, code: 'MESSAGE_INDEX_TIMEOUT', input_message_id: originalMessageId, message_id: messageId, message: err.message }
     }
-    if (!record && isReferenceIndex(messageId) && contextTargetId && refMap?.get?.(scopedRefKey)) {
-      messageId = refMap.get(scopedRefKey)
-      record = advancedWelcomeStore.getMessageIndex(messageId, {
+    const cachedMessageId = getQQBotTimedMapValue('__qqbotRefMsgIdMap', scopedRefKey)
+    if (!record && isReferenceIndex(messageId) && contextTargetId && cachedMessageId) {
+      messageId = cachedMessageId
+      record = await advancedWelcomeStore.getMessageIndex(messageId, {
         selfId: data.self_id,
         targetId: contextTargetId,
         type: contextType
@@ -1805,11 +1952,11 @@ const adapter = new class QQBotAdapter {
     }
     if (!record && isReferenceIndex(messageId) && data.message_type === 'group') {
       const targetOpenid = contextTargetId
-      record = advancedWelcomeStore.getMessageIndex(messageId, { selfId: data.self_id, targetId: targetOpenid, type: 'group' })
+      record = await advancedWelcomeStore.getMessageIndex(messageId, { selfId: data.self_id, targetId: targetOpenid, type: 'group' })
       if (record) messageId = record.actual_message_id || record.message_id
     }
     if (!record && isReferenceIndex(messageId) && data.message_type === 'group' && contextTargetId) {
-      const history = userManageStore.findUniqueHistoryByMessageId(data.self_id, contextTargetId, messageId)
+      const history = await userManageStore.findUniqueHistoryByMessageId(data.self_id, contextTargetId, messageId)
       if (/^ROBOT\d+\.\d+_/i.test(String(history?.message_id || '')) && (history.bot !== true || history.local_bot === true)) {
         record = {
           message_id: messageId,
@@ -1825,11 +1972,11 @@ const adapter = new class QQBotAdapter {
       }
     }
     if (!record && isReferenceIndex(messageId) && data.message_type === 'group') {
-      const cachedRef = globalThis.__qqbotRefContentMap?.get?.(getQQBotRefMapKey(data.self_id, 'group', contextTargetId, originalMessageId)) || globalThis.__qqbotRefContentMap?.get?.(getQQBotRefMapKey(data.self_id, 'group', contextTargetId, messageId))
+      const cachedRef = getQQBotTimedMapValue('__qqbotRefContentMap', getQQBotRefMapKey(data.self_id, 'group', contextTargetId, originalMessageId)) || getQQBotTimedMapValue('__qqbotRefContentMap', getQQBotRefMapKey(data.self_id, 'group', contextTargetId, messageId))
       const quotedContent = cachedRef?.content || getQQBotQuotedContentFingerprint(data.raw || {})
       if (quotedContent) {
         const targetOpenid = contextTargetId || cachedRef?.group_openid || getRawQQBotGroupId(data.raw || {}, data.self_id, this.sep)
-        const candidateResult = advancedWelcomeStore.findRecallCandidatesByContent(data.self_id, targetOpenid, quotedContent, {
+        const candidateResult = await advancedWelcomeStore.findRecallCandidatesByContent(data.self_id, targetOpenid, quotedContent, {
           beforeTime: getQQBotEventTime(data.raw || data),
           beforeSeq: data.seq || data.raw?.seq || 0,
           limitMs: 10 * 60 * 1000,
@@ -2430,7 +2577,7 @@ const adapter = new class QQBotAdapter {
         msg.action.permission.specify_user_ids = []
         if (!Array.isArray(button.permission)) button.permission = [button.permission]
         for (let id of button.permission) {
-          if (getBotConfigValue(data.self_id, 'toQQUin') && userIdCache[id]) id = userIdCache[id]
+          if (getBotConfigValue(data.self_id, 'toQQUin') && userIdCache.has(id)) id = userIdCache.get(id)
           msg.action.permission.specify_user_ids.push(id.replace(`${data.self_id}${this.sep}`, ''))
         }
       }
@@ -2752,7 +2899,7 @@ const adapter = new class QQBotAdapter {
         case 'at':
           if (i.qq == 'all') content += '@everyone'
           else {
-            if (getBotConfigValue(data.self_id, 'toQQUin') && userIdCache[i.qq]) i.qq = userIdCache[i.qq]
+            if (getBotConfigValue(data.self_id, 'toQQUin') && userIdCache.has(i.qq)) i.qq = userIdCache.get(i.qq)
             content += `<@${i.qq?.replace?.(`${data.self_id}${this.sep}`, '')}>`
           }
           break
@@ -3102,12 +3249,10 @@ const adapter = new class QQBotAdapter {
             }
           }
           if (ret.id && ret.ext_info?.ref_idx) {
-            if (!globalThis.__qqbotRefMsgIdMap) globalThis.__qqbotRefMsgIdMap = new Map()
             const refKey = getQQBotRefMapKey(data.self_id, data.group_id ? 'group' : 'user', data.group_id ? getRawQQBotGroupId(data, data.self_id, this.sep) : String(data.user_id || '').replace(`${data.self_id}${this.sep}`, ''), ret.ext_info.ref_idx)
-            globalThis.__qqbotRefMsgIdMap.set(refKey, ret.id)
-            setTimeout(() => globalThis.__qqbotRefMsgIdMap?.delete?.(refKey), 24 * 60 * 60 * 1000)
+            setQQBotTimedMapValue('__qqbotRefMsgIdMap', refKey, ret.id, 24 * 60 * 60 * 1000, 10000)
           }
-          Bot[data.self_id].dau.setDau('send_msg', data)
+          await Bot[data.self_id].dau.setDau('send_msg', data)
         } catch (err) {
           logger.error(data.self_id, '发送消息错误', i, err)
           rets.error.push(err)
@@ -3331,11 +3476,9 @@ const adapter = new class QQBotAdapter {
           rets.data.push(ret)
           if (ret.id) rets.message_id.push(ret.id)
           if (ret.id && ret.ext_info?.ref_idx) {
-            if (!globalThis.__qqbotRefMsgIdMap) globalThis.__qqbotRefMsgIdMap = new Map()
-            globalThis.__qqbotRefMsgIdMap.set(ret.ext_info.ref_idx, ret.id)
-            setTimeout(() => globalThis.__qqbotRefMsgIdMap?.delete?.(ret.ext_info.ref_idx), 24 * 60 * 60 * 1000)
+            setQQBotTimedMapValue('__qqbotRefMsgIdMap', ret.ext_info.ref_idx, ret.id, 24 * 60 * 60 * 1000, 10000)
           }
-          Bot[data.self_id].dau.setDau('send_msg', data)
+          await Bot[data.self_id].dau.setDau('send_msg', data)
         } catch (err) {
           logger.error(data.self_id, '发送消息错误', i, err)
           rets.error.push(err)
@@ -3411,7 +3554,7 @@ const adapter = new class QQBotAdapter {
   }
 
   pickFriend (id, user_id) {
-    if (getBotConfigValue(id, 'toQQUin') && userIdCache[user_id]) user_id = userIdCache[user_id]
+    if (getBotConfigValue(id, 'toQQUin') && userIdCache.has(user_id)) user_id = userIdCache.get(user_id)
     if (user_id.startsWith('qg_')) return this.pickGuildFriend(id, user_id)
 
     const i = {
@@ -3429,8 +3572,8 @@ const adapter = new class QQBotAdapter {
   }
 
   pickMember (id, group_id, user_id) {
-    if (getBotConfigValue(id, 'toQQUin') && userIdCache[user_id]) {
-      user_id = userIdCache[user_id]
+    if (getBotConfigValue(id, 'toQQUin') && userIdCache.has(user_id)) {
+      user_id = userIdCache.get(user_id)
     }
     if (user_id.startsWith('qg_')) { return this.pickGuildMember(id, group_id, user_id) }
     const i = {
@@ -3530,13 +3673,13 @@ const adapter = new class QQBotAdapter {
       inviteStore.recordC2cUser(data.self_id, rawUserOpenid, event.event_id || '', event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '')
       await userManageStore.recordUser(data.self_id, rawUserOpenid, { nickname: event.sender?.nickname || event.author?.username || '' })
       const historyAliases = getQQBotMessageAliases(event).filter(Boolean).filter(id => id !== data.message_id)
-      data.seq = await userManageStore.recordHistory(data.self_id, rawUserOpenid, { type: 'user', message_id: data.message_id || event.id || '', aliases: historyAliases, user_openid: rawUserOpenid, nickname: event.sender?.nickname || event.author?.username || '', bot: false, raw_message: data.raw_message, raw: event, time: event.event_id || event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '' })
+      data.seq = await userManageStore.recordHistory(data.self_id, rawUserOpenid, { type: 'user', message_id: data.message_id || event.id || '', aliases: historyAliases, user_openid: rawUserOpenid, nickname: event.sender?.nickname || event.author?.username || '', bot: false, raw_message: data.raw_message, raw: event, time: event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '' })
       if (data.raw) data.raw.seq = data.seq
     }
     // 注入 raw.invite
     if (rawUserOpenid) {
       data.raw.invite = this._makeInviteRaw(data.self_id, rawUserOpenid)
-      const chatStats = await chatStore.recordUserMessage(data.self_id, rawUserOpenid, 'private', '', event.event_id || event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '')
+      const chatStats = await chatStore.recordUserMessage(data.self_id, rawUserOpenid, 'private', '', event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '')
       if (chatStats) data.raw.chat = chatStats
     }
     if (data.message_id && rawUserOpenid) {
@@ -3553,7 +3696,7 @@ const adapter = new class QQBotAdapter {
     if (getBotConfigValue(data.self_id, 'toQQUin') && Handler.has('ws.tool.findUserId')) {
       const user_id = await Handler.call('ws.tool.findUserId', { user_id: data.user_id })
       if (user_id?.custom) {
-        userIdCache[user_id.custom] = data.user_id
+        cacheQQBotUserId(user_id.custom, data.user_id)
         data.sender.user_id = user_id.custom
       }
     }
@@ -3582,7 +3725,9 @@ const adapter = new class QQBotAdapter {
       await userManageStore.recordGroup(data.self_id, data.group_openid, { name: event.group_name || event.raw?.group_name || '' })
       data.seq = await userManageStore.recordHistory(data.self_id, data.group_openid, { message_id: data.message_id || event.id || '', aliases: historyAliases, user_openid: rawUserOpenid, nickname: event.author?.username || event.sender?.nickname || '', bot: event.author?.bot === true, raw_message: data.raw_message, raw: event, time: event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '' })
       if (data.raw) data.raw.seq = data.seq
-      await advancedWelcomeStore.recordSpeech(data.self_id, data.group_openid, data.message_id || event.id || '', event._qqbotFullMessageCreate === true)
+      if (ensureAdvancedWelcomeConfig(config, data.self_id).enabled) {
+        await advancedWelcomeStore.recordSpeech(data.self_id, data.group_openid, data.message_id || event.id || '', event._qqbotFullMessageCreate === true)
+      }
       if (!event._qqbotFullMessageCreate) {
         await chatStore.recordGroupRank(data.self_id, data.group_openid, rawUserOpenid, event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '', {
           nickname: event.author?.username || event.sender?.nickname || '',
@@ -3663,7 +3808,7 @@ const adapter = new class QQBotAdapter {
       if (mentionState.shouldNotifyAll) {
         Bot.makeLog('info', `[${data.self_id}] 全量消息@全体通知：[${data.group_id}, ${data.group_openid || '-'}, ${data.user_id}] ${data.raw_message}`, data.self_id)
         try {
-          await Bot.sendMasterMsg(getFullMessageAllNotifyMsg(data))
+          await sendQQBotInternalMasterMsg(getFullMessageAllNotifyMsg(data))
         } catch (err) {
           Bot.makeLog('error', ['全量消息@全体通知发送失败', err.message], data.self_id)
         }
@@ -3709,7 +3854,7 @@ const adapter = new class QQBotAdapter {
     if (getBotConfigValue(data.self_id, 'toQQUin') && Handler.has('ws.tool.findUserId')) {
       const user_id = await Handler.call('ws.tool.findUserId', { user_id: data.user_id })
       if (user_id?.custom) {
-        userIdCache[user_id.custom] = data.user_id
+        cacheQQBotUserId(user_id.custom, data.user_id)
         data.sender.user_id = user_id.custom
       }
     }
@@ -3907,11 +4052,11 @@ const adapter = new class QQBotAdapter {
       data.raw._qqbotFullMessageRecorded = isFullMessageGroupRecorded(id, event.group_openid || event.raw?.group_openid || '')
     }
     data.recallMsg = (messageId, targetId, targetType) => this.simpleRecallMsg(data, messageId, targetId, targetType)
-    data.chatrank = groupOpenid => {
+    const getChatRank = async groupOpenid => {
       const target = groupOpenid || data.group_openid || event.group_openid || event.raw?.group_openid || ''
       if (data.message_type !== 'group' || !target || String(data.group_id || '').startsWith('qg_')) return undefined
-      const withoutBot = chatStore.getGroupRank(data.self_id, target, false, data.self_id)
-      const withBot = chatStore.getGroupRank(data.self_id, target, true, data.self_id)
+      const withoutBot = await chatStore.getGroupRank(data.self_id, target, false, data.self_id)
+      const withBot = await chatStore.getGroupRank(data.self_id, target, true, data.self_id)
       return {
         today: withoutBot?.today || [],
         yesterday: withoutBot?.yesterday || [],
@@ -3923,11 +4068,25 @@ const adapter = new class QQBotAdapter {
         monthWithBot: withBot?.month || []
       }
     }
-    data.otherchat = (userOpenid, groupOpenid) => {
+    let chatRankCache = null
+    data.chatrank = groupOpenid => {
+      const target = groupOpenid || data.group_openid || event.group_openid || event.raw?.group_openid || ''
+      if (chatRankCache?.target === target) return chatRankCache.value
+      return getChatRank(groupOpenid)
+    }
+    const getOtherChat = async (userOpenid, groupOpenid) => {
       const user = String(userOpenid || '').trim()
       const target = String(groupOpenid || data.group_openid || event.group_openid || event.raw?.group_openid || '').trim()
       if (!user) return null
       return chatStore.getUserStats(data.self_id, user, target ? 'group' : '', target)
+    }
+    const otherChatCache = new Map()
+    data.otherchat = (userOpenid, groupOpenid) => {
+      const user = String(userOpenid || '').trim()
+      const target = String(groupOpenid || data.group_openid || event.group_openid || event.raw?.group_openid || '').trim()
+      const key = `${user}:${target}`
+      if (otherChatCache.has(key)) return otherChatCache.get(key)
+      return getOtherChat(userOpenid, groupOpenid)
     }
 
     data.reply_id = event.reply_id || getReplyMessageIdFromPayload(event)
@@ -3987,8 +4146,8 @@ const adapter = new class QQBotAdapter {
       data.group.getChatHistory = (seq = data.seq || 0, count = 20) => userManageStore.getHistory(data.self_id, data.group_openid, seq, count)
       if (data.source && data.reply_id) {
         const refIds = [data.reply_id, getQQBotReplyRefId(event), event.reply_id, event.ref_msg_idx, event.raw?.reply_id, event.raw?.ref_msg_idx]
-        const byId = userManageStore.findHistoryByAnyId(data.self_id, data.group_openid, refIds)
-        const byContent = byId ? null : userManageStore.findRecentHistoryByContent(data.self_id, data.group_openid, getQQBotQuotedContentFingerprint(event), getQQBotQuotedAuthorBot(event))
+        const byId = await userManageStore.findHistoryByAnyId(data.self_id, data.group_openid, refIds)
+        const byContent = byId ? null : await userManageStore.findRecentHistoryByContent(data.self_id, data.group_openid, getQQBotQuotedContentFingerprint(event), getQQBotQuotedAuthorBot(event))
         data.source.seq = byId?.seq || byContent?.seq || 0
       }
     } else if (data.message_type === 'private' && data.sub_type === 'friend') {
@@ -3997,8 +4156,8 @@ const adapter = new class QQBotAdapter {
       data.friendgetChatHistory = (seq = data.seq || 0, count = 20) => userManageStore.getHistory(data.self_id, privateOpenid, seq, count, 'user')
       if (data.source && data.reply_id && privateOpenid) {
         const refIds = [data.reply_id, getQQBotReplyRefId(event), event.reply_id, event.ref_msg_idx, event.raw?.reply_id, event.raw?.ref_msg_idx]
-        const byId = userManageStore.findHistoryByAnyId(data.self_id, privateOpenid, refIds, 'user')
-        const byContent = byId ? null : userManageStore.findRecentHistoryByContent(data.self_id, privateOpenid, getQQBotQuotedContentFingerprint(event), getQQBotQuotedAuthorBot(event), 'user')
+        const byId = await userManageStore.findHistoryByAnyId(data.self_id, privateOpenid, refIds, 'user')
+        const byContent = byId ? null : await userManageStore.findRecentHistoryByContent(data.self_id, privateOpenid, getQQBotQuotedContentFingerprint(event), getQQBotQuotedAuthorBot(event), 'user')
         data.source.seq = byId?.seq || byContent?.seq || 0
       }
     }
@@ -4009,7 +4168,8 @@ const adapter = new class QQBotAdapter {
     const activeCancelState = cancelState && Date.now() < Number(cancelState.block_until || Infinity)
     if (data.raw) data.raw.iscancelled = !!activeCancelState
     const isGuildLikeMessage = data.message_type === 'direct' || data.message_type === 'guild' || String(data.group_id || '').startsWith('qg_') || String(data.user_id || '').startsWith('qg_')
-    const isInternalQQBotCommand = /^#(?:q+bot|QQBot|机器人用户注销)/i.test(String(data.raw_message || ''))
+    const isInternalQQBotCommand = isInternalQQBotCommandEvent(data)
+    if (await blockDisabledQQBotUsageScope(data, isInternalQQBotCommand)) return
     const blackUserState = userManageStore.getBlackUser(data.self_id, eventUserOpenid)
     const blackGroupState = eventGroupOpenid ? userManageStore.getBlackGroup(data.self_id, eventGroupOpenid) : null
     if (!isInternalQQBotCommand && !isGuildLikeMessage && (blackUserState || blackGroupState)) {
@@ -4032,8 +4192,20 @@ const adapter = new class QQBotAdapter {
       return
     }
 
+    if (data.message_type === 'group' && /^(?:#)?(?:天|周|月)发言榜$/i.test(String(data.raw_message || '').trim())) {
+      const target = data.group_openid || event.group_openid || event.raw?.group_openid || ''
+      chatRankCache = { target, value: await getChatRank(target) }
+    } else if (data.message_type === 'group' && /^(?:#)?(?:他|她|它)的发言$/i.test(String(data.raw_message || '').trim())) {
+      const mention = (event._mentions || event.mentions || []).find(item => item?.is_you !== true)
+      const user = mention?.id || mention?.member_openid || mention?.user_openid || ''
+      const target = data.group_openid || event.group_openid || event.raw?.group_openid || ''
+      if (user) {
+        otherChatCache.set(`${user}:${target}`, await getOtherChat(user, target))
+      }
+    }
+
     data.bot.stat.recv_msg_cnt++
-    Bot[data.self_id].dau.setDau('receive_msg', data)
+    await Bot[data.self_id].dau.setDau('receive_msg', data)
     Bot.em(`${data.post_type}.${data.message_type}.${data.sub_type}`, data)
   }
 
@@ -4135,7 +4307,8 @@ const adapter = new class QQBotAdapter {
     const callbackActiveCancel = callbackCancelState && Date.now() < Number(callbackCancelState.block_until || Infinity)
     if (data.raw) data.raw.iscancelled = !!callbackActiveCancel
     const callbackIsGuildLike = data.message_type === 'direct' || data.message_type === 'guild' || String(data.group_id || '').startsWith('qg_') || String(data.user_id || '').startsWith('qg_')
-    const callbackIsInternalQQBotCommand = /^#(?:q+bot|QQBot|机器人用户注销)/i.test(String(data.raw_message || ''))
+    const callbackIsInternalQQBotCommand = isInternalQQBotCommandEvent(data)
+    if (await blockDisabledQQBotUsageScope(data, callbackIsInternalQQBotCommand)) return
     const callbackBlackUser = userManageStore.getBlackUser(data.self_id, callbackUserOpenid)
     const callbackBlackGroup = callbackGroupOpenid ? userManageStore.getBlackGroup(data.self_id, callbackGroupOpenid) : null
     if (!callbackIsInternalQQBotCommand && !callbackIsGuildLike && (callbackBlackUser || callbackBlackGroup)) {
@@ -4434,7 +4607,7 @@ const adapter = new class QQBotAdapter {
     }
   }
 
-  makeNotice (id, event) {
+  async makeNotice (id, event) {
     const data = {
       raw: event,
       bot: Bot[id],
@@ -4463,8 +4636,8 @@ const adapter = new class QQBotAdapter {
       case 'action':
         return this.makeCallback(id, event)
       case 'increase':
-        if (event.notice_type === 'group') Bot[data.self_id].dau.setDau('group_increase', data)
-        if (event.notice_type === 'friend') Bot[data.self_id].dau.setDau('friend_add', data)
+        if (event.notice_type === 'group') await Bot[data.self_id].dau.setDau('group_increase', data)
+        if (event.notice_type === 'friend') await Bot[data.self_id].dau.setDau('friend_add', data)
         if (event.notice_type === 'group') {
           // GROUP_ADD_ROBOT: 记录 invite + 破冰
           const inviterOpenid = event.operator_id || ''
@@ -4510,8 +4683,8 @@ const adapter = new class QQBotAdapter {
         if (event.notice_type === 'friend') Bot.em(`${data.post_type}.${data.notice_type}.${data.sub_type}`, data)
         return
       case 'decrease':
-        if (event.notice_type === 'group') Bot[data.self_id].dau.setDau('group_decrease', data)
-        if (event.notice_type === 'friend') Bot[data.self_id].dau.setDau('friend_delete', data)
+        if (event.notice_type === 'group') await Bot[data.self_id].dau.setDau('group_decrease', data)
+        if (event.notice_type === 'friend') await Bot[data.self_id].dau.setDau('friend_delete', data)
         if (event.notice_type === 'group') {
           // GROUP_DEL_ROBOT: 记录 kick
           const kickerOpenid = event.operator_id || ''
@@ -4539,7 +4712,7 @@ const adapter = new class QQBotAdapter {
             if (event.sub_type === 'add') inviteStore.recordC2cUser(data.self_id, userOpenid, event.raw?.event_id || event.event_id || '', timestamp)
             else inviteStore.markC2cFriendDeleted(data.self_id, userOpenid, timestamp)
           }
-          Bot[data.self_id].dau.setDau(event.sub_type === 'add' ? 'friend_add' : 'friend_delete', data)
+          await Bot[data.self_id].dau.setDau(event.sub_type === 'add' ? 'friend_add' : 'friend_delete', data)
           Bot.em(`${data.post_type}.${data.notice_type}.${data.sub_type}`, data)
         }
         break
@@ -4565,7 +4738,7 @@ const adapter = new class QQBotAdapter {
             }
           }
         }
-        Bot[data.self_id].dau.setDau('group_increase', data)
+        await Bot[data.self_id].dau.setDau('group_increase', data)
         Bot.em(`${data.post_type}.${data.notice_type}.${data.sub_type}`, data)
         Bot.em(`${data.post_type}.${data.notice_type}.increase`, { ...data, sub_type: 'increase' })
         break
@@ -4591,7 +4764,7 @@ const adapter = new class QQBotAdapter {
             }
           }
         }
-        Bot[data.self_id].dau.setDau('group_decrease', data)
+        await Bot[data.self_id].dau.setDau('group_decrease', data)
         Bot.em(`${data.post_type}.${data.notice_type}.${data.sub_type}`, data)
         Bot.em(`${data.post_type}.${data.notice_type}.decrease`, { ...data, sub_type: 'decrease' })
         break
@@ -4804,7 +4977,7 @@ const adapter = new class QQBotAdapter {
     if (offlineDetect.notify) {
       const notifyMsg = `[${id}] 账号下线：[下线通知]你的帐号当前登录已失效，请${resetStr}后重新登录。\n发送 /Bot上线${id} 重新登录`
       try {
-        await Bot.sendMasterMsg(notifyMsg)
+        await sendQQBotInternalMasterMsg(notifyMsg)
       } catch (err) {
         Bot.makeLog('error', ['发送掉线通知失败', err.message], id)
       }
@@ -4976,7 +5149,7 @@ const adapter = new class QQBotAdapter {
             Bot.makeLog('warn', [`[${id}] 心跳超时 (${heartbeatTimeoutMs / 1000}s 无ACK)，判定为掉线`], id)
             if (offlineDetect.notify) {
               try {
-                await Bot.sendMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效，正在重连(已经${bot.reconnectCount}次)`)
+                await sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效，正在重连(已经${bot.reconnectCount}次)`)
               } catch (err) {
                 Bot.makeLog('error', ['发送心跳超时通知失败', err.message], id)
               }
@@ -5005,7 +5178,7 @@ const adapter = new class QQBotAdapter {
 
     if (offlineDetect.notify) {
       try {
-        await Bot.sendMasterMsg(`[${id}] 账号重连成功！`)
+        await sendQQBotInternalMasterMsg(`[${id}] 账号重连成功！`)
       } catch (err) {
         Bot.makeLog('error', ['发送重连成功通知失败', err.message], id)
       }
@@ -5041,7 +5214,7 @@ const adapter = new class QQBotAdapter {
       
       if (offlineDetect.notify) {
         try {
-          await Bot.sendMasterMsg(`[${id}] 自动重连失败：已达最大重试次数 (${maxRetries === Infinity ? '无限制' : maxRetries})，请手动处理`)
+          await sendQQBotInternalMasterMsg(`[${id}] 自动重连失败：已达最大重试次数 (${maxRetries === Infinity ? '无限制' : maxRetries})，请手动处理`)
         } catch (e) {
           Bot.makeLog('error', ['发送重连失败通知失败', e.message], id)
         }
@@ -5065,10 +5238,13 @@ const adapter = new class QQBotAdapter {
   // ========== 掉线检测结束 ==========
 
 async connect (token) {
+  await qqbotStoresReady
+  if (qqbotStoreInitError) return { ok: false, reason: `存储初始化失败: ${qqbotStoreInitError.message}` }
   const parsed = parseQQBotAccount(token)
   if (!parsed.ok) return { ok: false, reason: parsed.error }
   const account = parsed.account
   const id = account.selfId
+  ensureUserManageConfig(id)
   const existingBot = Bot[id]
   if (existingBot) {
     this.stopOfflineCheck(id)
@@ -5693,7 +5869,7 @@ async connect (token) {
             const offlineDetect = getOfflineDetectConfig(id)
             if (offlineDetect.notify) {
               try {
-                await Bot.sendMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前token已失效，(已经${totalFailures}次失败)，${Math.min(delays[i] + 2, maxDelay)}s后继续`)
+                await sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前token已失效，(已经${totalFailures}次失败)，${Math.min(delays[i] + 2, maxDelay)}s后继续`)
               } catch {}
             }
           }
@@ -5703,7 +5879,7 @@ async connect (token) {
             this.bot.logger.error(`[TOKEN] 获取 access_token 失败已达上限 (${totalFailures}次)，放弃连接`)
             if (getOfflineDetectConfig(id).notify) {
               try {
-                await Bot.sendMasterMsg(`[${id}] 获取token失败已达上限 (${totalFailures}次)，请手动处理`)
+                await sendQQBotInternalMasterMsg(`[${id}] 获取token失败已达上限 (${totalFailures}次)，请手动处理`)
               } catch {}
             }
             throw new Error(`getAccessToken failed after ${totalFailures} retries`)
@@ -5786,8 +5962,8 @@ async connect (token) {
   
   await Bot[id].dau.init()
 
-  Bot[id].sdk.on('message', event => this.makeMessage(id, event))
-  Bot[id].sdk.on('notice', event => this.makeNotice(id, event))
+  Bot[id].sdk.on('message', event => enqueueQQBotMessage(this, id, event))
+  Bot[id].sdk.on('notice', event => this.makeNotice(id, event).catch(err => Bot.makeLog('error', [`[${id}] 通知处理失败`, err.message], id)))
 
   // ===== 心跳超时检测 =====
   const heartbeatTimeoutMs = Number(getOfflineDetectConfig(id).heartbeatTimeout) || 60000  // 默认60秒
@@ -5856,7 +6032,7 @@ async connect (token) {
         const offlineDetect = getOfflineDetectConfig(id)
         if (offlineDetect.notify) {
           try {
-            await Bot.sendMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效，正在重连(已经${Bot[id].reconnectCount}次)`)
+            await sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效，正在重连(已经${Bot[id].reconnectCount}次)`)
           } catch (err) {
             Bot.makeLog('error', ['发送心跳超时通知失败', err.message], id)
           }
@@ -5917,7 +6093,7 @@ async connect (token) {
             const offlineDetect = getOfflineDetectConfig(id)
             if (offlineDetect.notify) {
               try {
-                await Bot.sendMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效，正在重连(已经${Bot[id].reconnectCount}次)`)
+                await sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效，正在重连(已经${Bot[id].reconnectCount}次)`)
               } catch (err) {
                 Bot.makeLog('error', ['发送心跳超时通知失败', err.message], id)
               }
@@ -5943,22 +6119,16 @@ async connect (token) {
 }
 
   async load () {
-    for (const token of config.token) {
-      await new Promise(resolve => {
-        adapter.connect(token).then(result => {
-          if (!result?.ok) Bot.makeLog('error', ['QQBot账号启动连接失败', result?.reason || '未知原因'], 'QQBot-Plugin')
-          resolve(result)
-        }).catch(err => {
-          Bot.makeLog('error', ['QQBot账号启动连接失败', getQQBotSdkErrorSummary(err)], 'QQBot-Plugin')
-          resolve({ ok: false, reason: err.message })
-        })
-        setTimeout(resolve, 5000)
-      })
-    }
+    await qqbotStoresReady
+    await Promise.all(config.token.map(token => adapter.connect(token).then(result => {
+      if (!result?.ok) Bot.makeLog('error', ['QQBot账号启动连接失败', result?.reason || '未知原因'], 'QQBot-Plugin')
+      return result
+    }).catch(err => {
+      Bot.makeLog('error', ['QQBot账号启动连接失败', getQQBotSdkErrorSummary(err)], 'QQBot-Plugin')
+      return { ok: false, reason: err.message }
+    })))
   }
 }()
-
-Bot.adapter.push(adapter)
 
 const cleanedBotConfig = migrateLegacyBotConfig()
 const cleanedSuffixConfig = removeLegacySuffixConfig()
@@ -5972,25 +6142,31 @@ if (migratedAccountConfig) {
   }
 }
 
-initFullMessageStore(config).then(cleanedConfig => {
-  if (cleanedConfig || cleanedBotConfig || cleanedSuffixConfig) configSave()
+const timedStoreInit = async (name, init) => {
+  const startedAt = Date.now()
+  try {
+    return await init()
+  } finally {
+    Bot.makeLog?.('info', [`QQBot存储初始化完成: ${name} ${Date.now() - startedAt}ms`], 'QQBot-Plugin')
+  }
+}
+
+qqbotStoresReady = Promise.allSettled([
+  timedStoreInit('fullMessage', () => initFullMessageStore(config)).then(cleanedConfig => {
+    if (cleanedConfig || cleanedBotConfig || cleanedSuffixConfig) return configSave()
+  }),
+  timedStoreInit('invite', () => initInviteStore(config)),
+  timedStoreInit('chat', () => chatStore.init()),
+  timedStoreInit('advancedWelcome', () => advancedWelcomeStore.init()),
+  timedStoreInit('userManage', () => userManageStore.init())
+]).then(results => {
+  const failures = results.filter(result => result.status === 'rejected').map(result => result.reason?.message || String(result.reason))
+  if (!failures.length) return
+  qqbotStoreInitError = new Error(failures.join('; '))
+  Bot.makeLog?.('error', ['QQBot存储初始化失败，已停止账号连接', qqbotStoreInitError.message], 'QQBot-Plugin')
 })
 
-initInviteStore(config).catch(err => {
-  Bot.makeLog?.('error', ['inviteStore 初始化失败', err.message], 'QQBot-Plugin')
-})
-
-chatStore.init().catch(err => {
-  Bot.makeLog?.('error', ['chatStore 初始化失败', err.message], 'QQBot-Plugin')
-})
-
-advancedWelcomeStore.init().catch(err => {
-  Bot.makeLog?.('error', ['advancedWelcomeStore 初始化失败', err.message], 'QQBot-Plugin')
-})
-
-userManageStore.init().catch(err => {
-  Bot.makeLog?.('error', ['userManageStore 初始化失败', err.message], 'QQBot-Plugin')
-})
+Bot.adapter.push(adapter)
 
 const setMap = {
   二维码: 'toQRCode',
@@ -6155,7 +6331,7 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
-          reg: /^#q+bot用户管理菜单(?:\s*(注销菜单|拉黑菜单|查询菜单|删除群聊缓存发言(?:\s+确认)?|时间加\s*-?\d+(?:\.\d+)?))?$/i,
+          reg: /^#q+bot用户管理菜单(?:\s*(注销菜单|拉黑菜单|查询菜单|使用范围|删除群聊缓存发言(?:\s+确认)?|时间加\s*-?\d+(?:\.\d+)?))?$/i,
           fnc: 'userManageMenu',
           permission: config.permission
         },
@@ -6170,8 +6346,13 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
-          reg: /^#q+bot(?:查看所有用户|搜索用户(?:\s+.+)?|查看用户所在群\s+\S+|查看所有群|查看所有群最近发言|查看群成员(?:\s+\S+)?|查看群最近发言(?:\s+\S+(?:\s+(?:\d+|#\d+))?)?|备注群名称\s+\S+\s+.+|备注真实群号\s+\S+\s+.+)(?:\s+\d+)?$/i,
+          reg: /^#q+bot(?:查看最近发言|查看所有用户|查看所有好友|查看所有用户最近发言|搜索用户(?:\s+.+)?|查看用户所在群\s+\S+|查看所有群|查看所有群最近发言|查看群成员(?:\s+\S+)?|查看群最近发言(?:\s+\S+(?:\s+(?:\d+|#\d+))?)?|查看私聊最近发言(?:\s+\S+(?:\s+(?:\d+|#\d+))?)?|备注群名称\s+\S+\s+.+|备注真实群号\s+\S+\s+.+)(?:\s+\d+)?$/i,
           fnc: 'userQueryCommand',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot使用范围\s+(群聊|好友|私聊|频道)\s+(开启|关闭)$/i,
+          fnc: 'userManageScopeCommand',
           permission: config.permission
         },
         {
@@ -6527,22 +6708,35 @@ export class QQBotAdapter extends plugin {
   async QRLogin () {
     const riskText = '扫码登录会重置appsecret，请确保机器人没有在其他地方使用。'
     await this.reply(riskText, true)
+    const eventAdapter = this.e?.bot?.adapter
+    const isQQBotEvent = (eventAdapter === adapter || eventAdapter?.id === 'QQBot' || this.e?.adapter_id === 'QQBot') && this.isOfficialBotEvent()
     try {
       const result = await qrRegister({
-        timeoutSeconds: 300,
         onQRCode: async (imageBuffer, connectUrl) => {
-          const image = await adapter.uploadImage(imageBuffer, this.e.self_id, { summary: '二维码' })
-          if (!image?.url) throw new Error('二维码上传失败，未返回URL')
-          const width = Math.max(1, Number(image.width) || 320)
-          const height = Math.max(1, Number(image.height) || 320)
-          const markdown = [
-            `![二维码 #${width}px #${height}px](${image.url})`,
-            '',
-            '>请扫描二维码，或者使用手机 QQ 打开以下官方登录链接：',
-            '',
-            connectUrl
-          ].join('\n')
-          await this.reply({ type: 'markdown', data: markdown }, true)
+          if (!isQQBotEvent) {
+            await this.reply([
+              segment.image(imageBuffer),
+              `请扫描二维码，或使用手机 QQ 打开官方登录链接：\n${connectUrl}`
+            ], true)
+            return
+          }
+          try {
+            const image = await adapter.uploadImage(imageBuffer, this.e.self_id, { summary: '二维码' })
+            if (!image?.url) throw new Error('二维码上传失败，未返回URL')
+            const width = Math.max(1, Number(image.width) || 320)
+            const height = Math.max(1, Number(image.height) || 320)
+            const markdown = [
+              `![二维码 #${width}px #${height}px](${image.url})`,
+              '',
+              '>请扫描二维码，或者使用手机 QQ 打开以下官方登录链接：',
+              '',
+              `[点击登录](${connectUrl})`
+            ].join('\n')
+            await this.reply({ type: 'markdown', data: markdown }, true)
+          } catch (err) {
+            Bot.makeLog('warn', ['QQBot扫码二维码发送失败，已改发文本链接', err.message], this.e.self_id)
+            await this.reply(`二维码发送失败，请使用手机 QQ 打开官方登录链接：\n点击登录：${connectUrl}`, true)
+          }
         },
         onStatusChange: (status, message) => {
           if (status === BindStatus.EXPIRED) Bot.makeLog('warn', ['QQBot扫码登录', message], this.e.self_id)
@@ -6779,7 +6973,7 @@ export class QQBotAdapter extends plugin {
     }
   }
 
-  getInviteRankData (type = 'number', page = 1, pageSize = 20) {
+  async getInviteRankData (type = 'number', page = 1, pageSize = 20) {
     const isKick = type === 'kick'
     const data = inviteStore.getInviteRankPage(this.e.self_id, isKick ? 'kick' : 'number', page, pageSize)
     const rc = ensureRecallConfig(config, this.e.self_id)
@@ -6795,10 +6989,11 @@ export class QQBotAdapter extends plugin {
       lines.push('>暂无记录')
     } else {
       lines.push('```text')
-      data.list.forEach((item, index) => {
-        const nickname = String(getMemberNicknameFromStore(this.e.self_id, item.openid) || userManageStore.getUser(this.e.self_id, item.openid)?.nickname || '').replace(/\s+/g, ' ').trim()
+      for (const [index, item] of data.list.entries()) {
+        const user = await userManageStore.getUser(this.e.self_id, item.openid)
+        const nickname = String(getMemberNicknameFromStore(this.e.self_id, item.openid) || user?.nickname || '').replace(/\s+/g, ' ').trim()
         lines.push(`${data.start + index + 1}. ${nickname ? `${nickname} ${item.openid}` : item.openid} ${item.count}次 ${formatRankTime(item.time)}`)
-      })
+      }
       lines.push('```')
     }
     return { msg: lines.join('\n'), ...data }
@@ -6819,7 +7014,7 @@ export class QQBotAdapter extends plugin {
     return segment.button(...rows)
   }
 
-  normalSetting () {
+  async normalSetting () {
     if (!this.guardOfficialBot()) return true
     const match = /^#q+bot普通设置(?:\s*(强制silk\s*(?:开启|关闭)|群事件\s*(?:开启|关闭)|查看(?:踢出|拉入)排行(?:\s+\d+)?))?$/i.exec(this.e.msg)
     const botConfig = ensureBotConfig(this.e.self_id)
@@ -6828,7 +7023,7 @@ export class QQBotAdapter extends plugin {
     if (/^查看(?:踢出|拉入)排行/i.test(action)) {
       const isKick = action.includes('踢出')
       const page = Number(action.match(/\s+(\d+)\s*$/)?.[1]) || 1
-      const rank = this.getInviteRankData(isKick ? 'kick' : 'number', page, 20)
+      const rank = await this.getInviteRankData(isKick ? 'kick' : 'number', page, 20)
       this.reply([
         rank.msg,
         this.getInviteRankButtons(isKick ? 'kick' : 'number', rank.page, rank.maxPage)
@@ -6956,6 +7151,9 @@ export class QQBotAdapter extends plugin {
     }
 
     if (/接口切换\s+确认$/i.test(command)) {
+      for (const [key, value] of qqbotApiSwitchConfirmations) {
+        if (Number(value?.expires) <= Date.now() || qqbotApiSwitchConfirmations.size >= 1000) qqbotApiSwitchConfirmations.delete(key)
+      }
       qqbotApiSwitchConfirmations.set(operator, { target, expires: Date.now() + 120000 })
       await this.reply([
         `当前使用:${currentText}\n\n确认后将切换到${targetText}\n\n><qqbot-cmd-input text="#QQBot接口切换 开始切换" show="开始切换"/>`,
@@ -7237,6 +7435,22 @@ export class QQBotAdapter extends plugin {
       this.reply(`用户管理时间偏移已设置为 ${um.timeOffsetHours} 小时${um.timeOffsetHours === 0 ? '，已关闭' : ''}`, true)
       return
     }
+    if (/使用范围/i.test(msg)) {
+      this.reply([
+        [
+          `#[${this.e.self_id}] 使用范围`, '',
+          `>群聊: ${um.allowGroup ? '允许' : '禁止'}`, '',
+          `>好友私聊: ${um.allowFriend ? '允许' : '禁止'}`, '',
+          `>频道: ${um.allowGuild ? '允许' : '禁止'}`, '',
+          '>群聊和好友私聊至少需要允许一个；内部 QQBot 管理命令不受限制。'
+        ].join('\n'),
+        segment.button(
+          [{ text: `${um.allowGroup ? '禁' : '开'}群聊`, callback: `#QQBot使用范围 群聊 ${um.allowGroup ? '关闭' : '开启'}` }, { text: `${um.allowFriend ? '禁' : '开'}好友`, callback: `#QQBot使用范围 好友 ${um.allowFriend ? '关闭' : '开启'}` }],
+          [{ text: `${um.allowGuild ? '禁' : '开'}频道`, callback: `#QQBot使用范围 频道 ${um.allowGuild ? '关闭' : '开启'}` }, { text: '返回', callback: '#QQBot用户管理菜单' }]
+        )
+      ], true)
+      return
+    }
     if (/注销菜单/i.test(msg)) {
       this.reply([
         [
@@ -7295,7 +7509,7 @@ export class QQBotAdapter extends plugin {
           '><qqbot-cmd-input text="#QQBot查看用户所在群 openid" show="用户群"/>', '',
           '><qqbot-cmd-input text="#QQBot查看所有群 1" show="所有群"/>', '',
           '><qqbot-cmd-input text="#QQBot查看群成员 群openid 1" show="群成员"/>', '',
-          '><qqbot-cmd-input text="#QQBot查看群最近发言 群openid 1" show="最近发言"/>', '',
+          '><qqbot-cmd-input text="#QQBot查看最近发言" show="最近发言"/>', '',
           '><qqbot-cmd-input text="#QQBot备注群名称 群openid 群名" show="备注群名"/>', '',
           '><qqbot-cmd-input text="#QQBot备注真实群号 群openid 群号" show="备注群号"/>', '',
           '><qqbot-cmd-input text="#QQBot查看用户绑定全量 1" show="查绑定全量"/>'
@@ -7303,7 +7517,7 @@ export class QQBotAdapter extends plugin {
         segment.button(
           [{ text: '所有用户', callback: '#QQBot查看所有用户 1' }, { text: '所有群', callback: '#QQBot查看所有群 1' }],
           [{ text: '搜索用户', input: '#QQBot搜索用户 ' }, { text: '用户群', input: '#QQBot查看用户所在群 ' }],
-          [{ text: '群成员', input: '#QQBot查看群成员 ' }, { text: '最近发言', input: '#QQBot查看群最近发言 ' }],
+          [{ text: '群成员', input: '#QQBot查看群成员 ' }, { text: '最近发言', callback: '#QQBot查看最近发言' }],
           [{ text: '备注群名', input: '#QQBot备注群名称 ' }, { text: '备注群号', input: '#QQBot备注真实群号 ' }],
           [{ text: '查绑定全量', callback: '#QQBot查看用户绑定全量 1' }, { text: '返回', callback: '#QQBot用户管理菜单' }]
         )
@@ -7353,6 +7567,7 @@ export class QQBotAdapter extends plugin {
         '><qqbot-cmd-input text="#QQBot用户管理菜单 注销菜单" show="注销菜单"/>', '',
         '><qqbot-cmd-input text="#QQBot用户管理菜单 拉黑菜单" show="拉黑菜单"/>', '',
         '><qqbot-cmd-input text="#QQBot用户管理菜单 查询菜单" show="查询菜单"/>', '',
+        '><qqbot-cmd-input text="#QQBot用户管理菜单 使用范围" show="使用范围"/>', '',
         '><qqbot-cmd-input text="#QQBot用户管理菜单 删除群聊缓存发言" show="删发言缓存"/>', '',
         '><qqbot-cmd-input text="#QQBot用户管理菜单 时间加 0" show="时间加0"/>', '',
         '><qqbot-cmd-input text="#QQBot用户管理菜单 时间加 8" show="时间加8"/>', '',
@@ -7361,9 +7576,10 @@ export class QQBotAdapter extends plugin {
       ].join('\n'),
       segment.button(
         [{ text: '注销菜单', callback: '#QQBot用户管理菜单 注销菜单' }, { text: '拉黑菜单', callback: '#QQBot用户管理菜单 拉黑菜单' }],
-        [{ text: '查询菜单', callback: '#QQBot用户管理菜单 查询菜单' }, { text: '删缓存', callback: '#QQBot用户管理菜单 删除群聊缓存发言' }],
-        [{ text: '时间+0', callback: '#QQBot用户管理菜单 时间加 0' }, { text: '时间+8', callback: '#QQBot用户管理菜单 时间加 8' }],
-        [{ text: `${um.uaEnabled ? '关' : '开'}UA`, callback: `#QQBot用户管理 ua${um.uaEnabled ? '关闭' : '开启'}` }, { text: '设置UA', input: '#QQBot用户管理 设置ua ' }]
+        [{ text: '查询菜单', callback: '#QQBot用户管理菜单 查询菜单' }, { text: '使用范围', callback: '#QQBot用户管理菜单 使用范围' }],
+        [{ text: '删缓存', callback: '#QQBot用户管理菜单 删除群聊缓存发言' }, { text: '时间+0', callback: '#QQBot用户管理菜单 时间加 0' }],
+        [{ text: '时间+8', callback: '#QQBot用户管理菜单 时间加 8' }, { text: `${um.uaEnabled ? '关' : '开'}UA`, callback: `#QQBot用户管理 ua${um.uaEnabled ? '关闭' : '开启'}` }],
+        [{ text: '设置UA', input: '#QQBot用户管理 设置ua ' }]
       )
     ], true)
   }
@@ -7383,6 +7599,25 @@ export class QQBotAdapter extends plugin {
     if (um.uaEnabled && !um.ua) um.ua = 'QQBotPlugin/9.9.9 (Node/20.11.0; Linux; QQbot/1.0.19)'
     await configSave()
     this.reply(`UA已${um.uaEnabled ? '开启' : '关闭'}，重启框架或等待WS机制重连后生效`, true)
+  }
+
+  async userManageScopeCommand () {
+    if (!this.guardOfficialBot()) return true
+    const match = /^#q+bot使用范围\s+(群聊|好友|私聊|频道)\s+(开启|关闭)$/i.exec(String(this.e.msg || ''))
+    if (!match) return
+    const um = ensureUserManageConfig(this.e.self_id)
+    const key = match[1] === '群聊' ? 'allowGroup' : match[1] === '频道' ? 'allowGuild' : 'allowFriend'
+    const enabled = match[2] === '开启'
+    if (!enabled && ((key === 'allowGroup' && !um.allowFriend) || (key === 'allowFriend' && !um.allowGroup))) {
+      await this.reply('群聊和好友私聊至少需要开启一个，无法全部关闭', true)
+      return
+    }
+    um[key] = enabled
+    await configSave()
+    await this.reply([
+      `${match[1]}使用范围已${match[2]}`,
+      segment.button([{ text: '使用范围', callback: '#QQBot用户管理菜单 使用范围' }])
+    ], true)
   }
 
   async cancelManageCommand () {
@@ -7468,10 +7703,27 @@ export class QQBotAdapter extends plugin {
   async userQueryCommand () {
     if (!this.guardOfficialBot()) return true
     const msg = String(this.e.msg || '')
+    if (/^#q+bot查看最近发言$/i.test(msg)) {
+      return this.reply([
+        `#[${this.e.self_id}] 最近发言`,
+        segment.button(
+          [{ text: '私聊发言', input: '#QQBot查看私聊最近发言 ' }, { text: '群聊发言', input: '#QQBot查看群最近发言 ' }],
+          [{ text: '返回', callback: '#QQBot用户管理菜单 查询菜单' }]
+        )
+      ], true)
+    }
     let m = /^#q+bot查看所有用户(?:\s+(\d+))?$/i.exec(msg)
-    if (m) return this._replyUserPage(userManageStore.listUsers(this.e.self_id, m[1] || 1, 10), '所有用户')
+    if (m) return this._replyUserPage(await userManageStore.listUsers(this.e.self_id, m[1] || 1, 10), '所有用户')
+    m = /^#q+bot查看所有好友(?:\s+(\d+))?$/i.exec(msg)
+    if (m) return this._replyFriendPage(inviteStore.getC2cFriendPage(this.e.self_id, m[1] || 1, 10))
+    m = /^#q+bot查看所有用户最近发言(?:\s+(\d+))?$/i.exec(msg)
+    if (m) {
+      const pageNo = Number(m[1]) || 1
+      if (pageNo > 500) return this.reply('所有用户最近发言最多查看 500 页', true)
+      return this._replyAllUserRecentHistory(await userManageStore.listRecentUserHistories(this.e.self_id, pageNo, 20))
+    }
     m = /^#q+bot查看所有群(?:\s+(\d+))?$/i.exec(msg)
-    if (m) return this._replyGroupPage(userManageStore.listGroups(this.e.self_id, m[1] || 1, 10), '所有群')
+    if (m) return this._replyGroupPage(await userManageStore.listGroups(this.e.self_id, m[1] || 1, 10), '所有群')
     if (/^#q+bot搜索用户\s*$/i.test(msg)) return this.reply('缺少参数: 用户名/openid/群openid', true)
     m = /^#q+bot搜索用户\s+(.+)$/i.exec(msg)
     if (m) {
@@ -7483,30 +7735,40 @@ export class QQBotAdapter extends plugin {
         pageNo = Number(pageMatch[2]) || 1
       }
       const page = /^\d+$/.test(keyword)
-        ? userManageStore.searchUsersByNicknamePage(this.e.self_id, keyword, pageNo, 50)
-        : userManageStore.searchUsersPage(this.e.self_id, keyword, pageNo, 50)
+        ? await userManageStore.searchUsersByNicknamePage(this.e.self_id, keyword, pageNo, 50)
+        : await userManageStore.searchUsersPage(this.e.self_id, keyword, pageNo, 50)
       if (/^\d+$/.test(keyword) && !page.total) return this.reply('数字关键词未匹配到昵称，请输入更具体的昵称或openid片段', true)
       const body = page.list.map((i, idx) => [
-        `${(page.page - 1) * 50 + idx + 1}. ${i.nickname || '-'}`,
+        `${(page.page - 1) * 50 + idx + 1}. ${i.nickname || i.openid}`,
         `openid: ${i.openid}`,
         '群:',
         ...(Object.keys(i.groups || {}).length ? Object.keys(i.groups || {}).map(groupOpenid => `- ${groupOpenid}`) : ['- -'])
       ].join('\n')).join('\n\n') || '无匹配用户'
       const rows = [
         ...this._pageButtonRows(`#QQBot搜索用户 ${keyword}`, page),
+        ...(page.list[0]
+          ? [[
+              { text: '查询发言', callback: `#QQBot查看私聊最近发言 ${page.list[0].openid} 1` },
+              { text: '快速拉黑', callback: `#QQBot拉黑用户 ${page.list[0].openid}` }
+            ]]
+          : []),
         [{ text: '查询菜单', callback: '#QQBot用户管理菜单 查询菜单' }]
       ].slice(0, 5)
       return this.reply([`#[${this.e.self_id}] 搜索用户: ${keyword} ${page.page}/${page.pageCount}\n\n\`\`\`text\n${body}\n\`\`\``, segment.button(...rows)], true)
     }
     m = /^#q+bot查看用户所在群\s+(\S+)$/i.exec(msg)
-    if (m) { const u = userManageStore.getUser(this.e.self_id, m[1]); return this.reply((u ? Object.keys(u.groups || {}).join('\n') : '') || '暂无记录', true) }
+    if (m) { const u = await userManageStore.getUser(this.e.self_id, m[1]); return this.reply((u ? Object.keys(u.groups || {}).join('\n') : '') || '暂无记录', true) }
     m = /^#q+bot查看所有群最近发言(?:\s+(\d+))?$/i.exec(msg)
-    if (m) return this._replyAllGroupRecentHistory(userManageStore.listRecentGroupHistories(this.e.self_id, m[1] || 1, 20))
+    if (m) {
+      const pageNo = Number(m[1]) || 1
+      if (pageNo > 500) return this.reply('所有群最近发言最多查看 500 页', true)
+      return this._replyAllGroupRecentHistory(await userManageStore.listRecentGroupHistories(this.e.self_id, pageNo, 20))
+    }
     if (/^#q+bot查看群成员\s*$/i.test(msg)) return this.reply('缺少参数: 群openid', true)
     m = /^#q+bot查看群成员\s+(\S+)(?:\s+(\d+))?$/i.exec(msg)
     if (m) {
       if (!this._isValidGroupOpenid(m[1])) return this.reply('缺少参数: 有效群openid', true)
-      return this._replyUserPage(userManageStore.getGroupMembers(this.e.self_id, m[1], m[2] || 1, 10), `群成员 ${m[1]}`)
+      return this._replyUserPage(await userManageStore.getGroupMembers(this.e.self_id, m[1], m[2] || 1, 10), `群成员 ${m[1]}`)
     }
     if (/^#q+bot查看群最近发言\s*$/i.test(msg)) return this.reply('缺少参数: 群openid', true)
     m = /^#q+bot查看群最近发言\s+(\S+)(?:\s+(\d+|#\d+))?$/i.exec(msg)
@@ -7514,14 +7776,14 @@ export class QQBotAdapter extends plugin {
       const groupOpenid = m[1]
       if (!this._isValidGroupOpenid(groupOpenid)) return this.reply('缺少参数: 有效群openid', true)
       if (String(m[2] || '').startsWith('#')) {
-        const item = userManageStore.findHistoryBySeq(this.e.self_id, groupOpenid, m[2])
+        const item = await userManageStore.findHistoryBySeq(this.e.self_id, groupOpenid, m[2])
         const rawText = item?.raw ? JSON.stringify(item.raw, null, 2) : ''
         return this.reply([
           rawText ? `#[${this.e.self_id}] 群发言 raw #${item.seq}\n\n\`\`\`json\n${rawText}\n\`\`\`` : `#[${this.e.self_id}] 群发言 raw\n\n>暂无记录或该记录未保存 raw`,
           segment.button([{ text: '返回发言', callback: `#QQBot查看群最近发言 ${groupOpenid} 1` }, { text: '返回群列', callback: '#QQBot查看所有群 1' }])
         ], true)
       }
-      const page = userManageStore.getRecentHistoryPage(this.e.self_id, groupOpenid, m[2] || 1, 20)
+      const page = await userManageStore.getRecentHistoryPage(this.e.self_id, groupOpenid, m[2] || 1, 20)
       const maxSeq = page.list.reduce((max, item) => Math.max(max, Number(item.seq) || 0), 0)
       const body = page.list.length
         ? page.list.map(i => [
@@ -7538,6 +7800,36 @@ export class QQBotAdapter extends plugin {
           [{ text: '返回群列', callback: '#QQBot查看所有群 1' }, { text: '群成员', input: `#QQBot查看群成员 ${groupOpenid} 1` }],
           [{ text: '备注群名', input: `#QQBot备注群名称 ${groupOpenid} ` }, { text: '备注群号', input: `#QQBot备注真实群号 ${groupOpenid} ` }],
           ...(maxSeq ? [[{ text: '查看raw', callback: `#QQBot查看群最近发言 ${groupOpenid} #${maxSeq}` }, { text: '删除发言', callback: `#QQBot删除群最近发言 ${groupOpenid} 20` }]] : [])
+        )
+      ], true)
+    }
+    if (/^#q+bot查看私聊最近发言\s*$/i.test(msg)) return this.reply('缺少参数: 用户openid', true)
+    m = /^#q+bot查看私聊最近发言\s+(\S+)(?:\s+(\d+|#\d+))?$/i.exec(msg)
+    if (m) {
+      const userOpenid = m[1]
+      if (String(m[2] || '').startsWith('#')) {
+        const item = await userManageStore.findHistoryBySeq(this.e.self_id, userOpenid, m[2], 'user')
+        const rawText = item?.raw ? JSON.stringify(item.raw, null, 2) : ''
+        return this.reply([
+          rawText ? `#[${this.e.self_id}] 私聊发言 raw #${item.seq}\n\n\`\`\`json\n${rawText}\n\`\`\`` : `#[${this.e.self_id}] 私聊发言 raw\n\n>暂无记录或该记录未保存 raw`,
+          segment.button([{ text: '返回发言', callback: `#QQBot查看私聊最近发言 ${userOpenid} 1` }, { text: '返回菜单', callback: '#QQBot查看最近发言' }])
+        ], true)
+      }
+      const page = await userManageStore.getRecentHistoryPage(this.e.self_id, userOpenid, m[2] || 1, 20, 'user')
+      const maxSeq = page.list.reduce((max, item) => Math.max(max, Number(item.seq) || 0), 0)
+      const body = page.list.length
+        ? page.list.map(i => [
+          '```text',
+          `#${i.seq} [${this._formatUserManageTime(i.time)}] ${i.bot ? '[BOT] ' : ''}${i.nickname || i.user_openid}: ${String(i.raw_message || '').replace(/```/g, '`\u200b``')}`,
+          '```'
+        ].join('\n')).join('\n\n')
+        : '>暂无记录'
+      return this.reply([
+        `#[${this.e.self_id}] 私聊最近发言 ${page.page}/${page.pageCount}\n\n>${userOpenid}\n\n${body}`,
+        segment.button(
+          ...this._pageButtonRows(`#QQBot查看私聊最近发言 ${userOpenid}`, page),
+          [{ text: '最近发言', callback: '#QQBot查看最近发言' }, { text: '所有用户', callback: '#QQBot查看所有用户 1' }],
+          ...(maxSeq ? [[{ text: '查看raw', callback: `#QQBot查看私聊最近发言 ${userOpenid} #${maxSeq}` }]] : [])
         )
       ], true)
     }
@@ -7565,7 +7857,8 @@ export class QQBotAdapter extends plugin {
     const lines = page.list.map(i => {
       const blacked = userManageStore.isBlackUser(this.e.self_id, i.openid)
       return [
-        `>${i.nickname || '-'} ${i.openid}`,
+        `>${i.nickname ? `${i.nickname} ` : ''}${i.openid}`,
+        `><qqbot-cmd-input text="#QQBot查看私聊最近发言 ${i.openid} 1" show="私聊发言"/>`,
         blacked
           ? `><qqbot-cmd-input text="#QQBot删黑用户 ${i.openid}" show="删黑用户"/>`
           : `><qqbot-cmd-input text="#QQBot拉黑用户 ${i.openid}" show="拉黑用户"/>`
@@ -7574,18 +7867,60 @@ export class QQBotAdapter extends plugin {
     const first = page.list[0]
     const firstBlacked = first ? userManageStore.isBlackUser(this.e.self_id, first.openid) : false
     const actionRows = first
-      ? [[firstBlacked ? { text: '删黑用户', input: `#QQBot删黑用户 ${first.openid}` } : { text: '拉黑用户', input: `#QQBot拉黑用户 ${first.openid}` }]]
+      ? [[{ text: '私聊发言', callback: `#QQBot查看私聊最近发言 ${first.openid} 1` }, firstBlacked ? { text: '删黑用户', input: `#QQBot删黑用户 ${first.openid}` } : { text: '拉黑用户', input: `#QQBot拉黑用户 ${first.openid}` }]]
       : []
-    const allRows = [...rows, ...actionRows].slice(0, 5)
-    const msg = `#[${this.e.self_id}] ${title} ${page.page}/${page.pageCount}\n\n${lines}`
+    const isAllUsers = title === '所有用户'
+    const allRows = [...rows, ...(isAllUsers ? [[{ text: '所有好友', callback: '#QQBot查看所有好友 1' }, { text: '用户发言', callback: '#QQBot查看所有用户最近发言 1' }]] : []), ...actionRows].slice(0, 5)
+    const extra = isAllUsers ? '\n\n><qqbot-cmd-input text="#QQBot查看所有好友 1" show="有好友关系的用户"/>\n\n><qqbot-cmd-input text="#QQBot查看所有用户最近发言 1" show="所有用户发言"/>' : ''
+    const msg = `#[${this.e.self_id}] ${title} ${page.page}/${page.pageCount}${extra}\n\n${lines}`
     this.reply(allRows.length ? [msg, segment.button(...allRows)] : msg, true)
+  }
+
+  async _replyFriendPage (page) {
+    const users = await Promise.all(page.list.map(async item => ({ ...item, user: await userManageStore.getUser(this.e.self_id, item.openid) })))
+    const lines = users.map(item => {
+      const blacked = userManageStore.isBlackUser(this.e.self_id, item.openid)
+      return [
+        `>${item.user?.nickname ? `${item.user.nickname} ` : ''}${item.openid}`,
+        `>最近活跃: ${this._formatUserManageTime(item.lastActive)}`,
+        `><qqbot-cmd-input text="#QQBot查看私聊最近发言 ${item.openid} 1" show="私聊发言"/>`,
+        blacked
+          ? `><qqbot-cmd-input text="#QQBot删黑用户 ${item.openid}" show="删黑用户"/>`
+          : `><qqbot-cmd-input text="#QQBot拉黑用户 ${item.openid}" show="拉黑用户"/>`
+      ].join('\n')
+    }).join('\n\n') || '>暂无好友'
+    const first = users[0]
+    const firstBlacked = first ? userManageStore.isBlackUser(this.e.self_id, first.openid) : false
+    const rows = [
+      ...this._pageButtonRows('#QQBot查看所有好友', page),
+      ...(first ? [[
+          { text: '私聊发言', callback: `#QQBot查看私聊最近发言 ${first.openid} 1` },
+          firstBlacked ? { text: '删除拉黑', callback: `#QQBot删黑用户 ${first.openid}` } : { text: '快速拉黑', callback: `#QQBot拉黑用户 ${first.openid}` }
+        ]] : []),
+      [{ text: '所有用户', callback: '#QQBot查看所有用户 1' }, { text: '查询菜单', callback: '#QQBot用户管理菜单 查询菜单' }]
+    ].slice(0, 5)
+    this.reply([`#[${this.e.self_id}] 所有好友 ${page.page}/${page.pageCount}\n\n${lines}`, segment.button(...rows)], true)
+  }
+
+  _replyAllUserRecentHistory (page) {
+    const body = page.list.map(i => [
+      '```text',
+      `${i.target_user_openid} #${i.seq} [${this._formatUserManageTime(i.time)}] ${i.bot ? '[BOT] ' : ''}${i.nickname || i.user_openid}: ${String(i.raw_message || '').replace(/```/g, '`\u200b``')}`,
+      '```',
+      `><qqbot-cmd-input text="#QQBot查看私聊最近发言 ${i.target_user_openid} #${i.seq}" show="查看raw"/>`
+    ].join('\n')).join('\n\n') || '>暂无记录'
+    const rows = [
+      ...this._pageButtonRows('#QQBot查看所有用户最近发言', page),
+      [{ text: '所有用户', callback: '#QQBot查看所有用户 1' }, { text: '最近发言', callback: '#QQBot查看最近发言' }]
+    ].slice(0, 5)
+    this.reply([`#[${this.e.self_id}] 所有用户最近发言 ${page.page}/${page.pageCount}\n\n${body}`, segment.button(...rows)], true)
   }
 
   _replyGroupPage (page, title) {
     const groupLines = page.list.map(i => {
       const blacked = userManageStore.isBlackGroup(this.e.self_id, i.openid)
       return [
-        `>${i.remark_name || i.name || '-'} ${i.openid}${i.real_group_id ? ` (${i.real_group_id})` : ''}(${userManageStore.isFullGroupEventSeen(this.e.self_id, i.openid) || isFullMessageGroupRecorded(this.e.self_id, i.openid) ? '全量群' : '非全量群'})`,
+        `>${(i.remark_name || i.name) ? `${i.remark_name || i.name} ` : ''}${i.openid}${i.real_group_id ? ` (${i.real_group_id})` : ''}(${userManageStore.isFullGroupEventSeen(this.e.self_id, i.openid) || isFullMessageGroupRecorded(this.e.self_id, i.openid) ? '全量群' : '非全量群'})`,
         `>最近记录: ${this._formatUserManageTime(i.last_seen_at)}`,
         '',
         `><qqbot-cmd-input text="#QQBot查看群最近发言 ${i.openid} 1" show="最近发言"/>`,
@@ -8866,7 +9201,7 @@ export class QQBotAdapter extends plugin {
       }
     }
     try {
-      await Bot.sendMasterMsg(summary)
+      await sendQQBotInternalMasterMsg(summary)
       return true
     } catch (err) {
       Bot.makeLog('error', ['召回结果通知主人失败', err.message], context.selfId)

@@ -45,7 +45,7 @@ class InviteStore {
         const { default: Level } = await import('./level.js')
         fs.mkdirSync(LEVEL_DATA_DIR, { recursive: true })
         this._db = new Level(LEVEL_DATA_DIR)
-        await this._db.open()
+        await this._db.open({ cleanup: false })
         for await (const [key, value] of this._db.db.iterator()) {
           if (String(key).startsWith('__c2c__')) {
             const selfId = String(key).replace('__c2c__', '')
@@ -320,6 +320,23 @@ class InviteStore {
 
   getC2cUser (selfId, userOpenid) {
     return this._c2c[selfId]?.[userOpenid] || null
+  }
+
+  getC2cFriendPage (selfId, page = 1, pageSize = 10) {
+    const size = Math.max(1, Math.min(100, Number(pageSize) || 10))
+    const list = Object.entries(this._c2c[selfId] || {})
+      .filter(([, info]) => info?.friendDeleted !== true)
+      .map(([openid, info]) => ({ openid, ...info }))
+      .sort((a, b) => new Date(b.lastActive || 0) - new Date(a.lastActive || 0))
+    const total = list.length
+    const pageCount = Math.max(1, Math.ceil(total / size))
+    const current = Math.min(Math.max(1, Number(page) || 1), pageCount)
+    return {
+      list: list.slice((current - 1) * size, current * size),
+      page: current,
+      pageCount,
+      total
+    }
   }
 
   getAtVirtualId (selfId, openid) {

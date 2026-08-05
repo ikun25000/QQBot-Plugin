@@ -27,9 +27,9 @@ export default class level {
     })
   }
 
-  async open () {
+  async open (options = {}) {
     await this.db.open()
-    await this.cleanup()
+    if (options.cleanup !== false) await this.cleanup()
   }
 
   /**
