@@ -886,3 +886,780 @@ offlineDetect:
 - #QQBotMD + `机器人QQ号:模板ID`
 - #QQBotMD + `机器人QQ号:raw` 开启原生MD
 - #QQBotMD + `机器人QQ号:` 关闭原生MD
+
+---
+
+# 附录：事件对象与本次8月大更新
+
+
+---
+
+## 一、dau.js 修复
+
+### 1. 时间口径修复
+
+- 移除 `import { getTime } from './common.js'`。
+- 新增本地辅助函数：
+
+```js
+const getDauDate = (offset = 0) => moment().add(offset, 'day').format('YYYY-MM-DD')
+```
+
+- `init()` 中：
+
+```js
+this.today = getDauDate()
+this.yesterday = getDauDate(-1)
+```
+
+- `ensureCurrentDay()` 中：
+
+```js
+const currentDay = getDauDate()
+```
+
+- 行为变化：DAU 不再使用 `getTime()`（该函数在系统时间上额外 +8 小时）。现在 DAU 与 `node-schedule` 的 `0 0 0 * * ?` 使用同一本地时间口径。生产环境时区为北京时间（UTC+8），`node-schedule` 零点即北京时间零点，DAU 日期与之一致，不会出现“昨天数据累加到今天”的边界错误。
+- 每次 `setDau()` 写入前仍会调用 `ensureCurrentDay()`，即使零点任务延迟或进程暂停，跨日后第一次写入也会先归档旧日数据并初始化新日。
+
+### 2. numToChinese 补充
+
+- 原来只有 1~30，补全到 31（日期最大 31，无需更高）：
+
+```js
+31: '三十一'
+```
+
+- 影响：`#QQBotdau` 的“最近XX天平均”在 31 天时显示中文（`三十一`），不会再显示英文数字。
+
+---
+
+## 二、this.e 事件对象完整字段(可能部分无法调用)
+
+> 事件对象由插件构造后交给 Yunzai loader 统一补字段。下面按“插件注入 → loader 补全 → 按事件类型存在”三部分列全。标了“条件”的字段只在对应事件/配置下存在。
+
+### 1. 插件在 makeMessage 中注入的字段（所有消息事件）
+
+| 字段 | 说明 |
+| --- | --- |
+| `this.e.raw` | 官方 SDK 原始事件对象，插件会追加缓存/兼容字段（见第三节） |
+| `this.e.bot` | 当前机器人对象（见第六节） |
+| `this.e.client` | bot 的兼容客户端对象，额外提供 `getSystemMsg()`（见第八节） |
+| `this.e.self_id` | 当前机器人 QQ |
+| `this.e.post_type` | 事件类型，消息为 `message` |
+| `this.e.message_type` | `private` / `group` / `guild` / `direct` |
+| `this.e.sub_type` | 如 `friend`、`callback` 等 |
+| `this.e.message_id` | 当前消息 ID |
+| `this.e.user_id` | getter，返回 `this.e.sender.user_id` |
+| `this.e.message` | 标准 segment 消息数组 |
+| `this.e.raw_message` | 规范化纯文本消息 |
+| `this.e.reply` | 回复当前会话：`this.e.reply(msg, quote?, data?)` |
+| `this.e.recallMsg` | 撤回：`this.e.recallMsg(messageId, targetId?, targetType?)` |
+| `this.e.chatrank` | 函数：`this.e.chatrank(groupOpenid?)`，返回 `{ today, yesterday, week, month, todayWithBot, yesterdayWithBot, weekWithBot, monthWithBot }`，均为数组 |
+| `this.e.otherchat` | 函数：`this.e.otherchat(userOpenid, groupOpenid?)`，返回该用户在私聊/群聊的发言统计 |
+| `this.e.reply_id` | 被引用消息 ID（无引用为空） |
+| `this.e.getReply` | 异步函数：`await this.e.getReply()` 返回 `{ message_id }` 或 `null` |
+| `this.e.source` | 存在引用时为 `{ seq }`；`seq` 为本地最近发言序号，匹配后更新 |
+| `this.e.at` | 条件：全量群消息或好友私聊且被 @ 时存在，为虚拟 @ 用户 ID |
+| `this.e.seq` | 条件：消息被本地记录后存在，为发言记录序号 |
+| `this.e.full_message` | 条件：GROUP_MESSAGE_CREATE 全量群消息存在，为过滤/判定结果对象 |
+| `this.e.atBot` | 条件：全量群消息判定应分发时为 `true` |
+| `this.e.recall` | loader 绑定：`this.e.recall()` 撤回当前消息（群聊/私聊，有 `message_id` 且有 `friend/group.recallMsg` 时） |
+
+### 2. loader 统一补全的字段（dealEvent / prepareEvent）
+
+| 字段 | 说明 |
+| --- | --- |
+| `this.e.msg` | 拼接后的文本消息（多行合并），`xml`/`json` 段也会拼入 |
+| `this.e.img` | 图片 URL 数组（`image` 段） |
+| `this.e.file` | 文件段对象（`file` 段） |
+| `this.e.atBot` | 是否 @ 了机器人（`at` 段且 `qq === self_id`） |
+| `this.e.at` | 最后被 @ 的用户（loader 从 `at` 段补充） |
+| `this.e.reply_id` | loader 从 `reply` 段补充 |
+| `this.e.getReply` | loader 补充：`this.e.group.getMsg?.(id)` 或 `friend.getMsg?.(id)`，若存在 |
+| `this.e.isPrivate` | 私聊或好友通知时为 `true` |
+| `this.e.isGroup` | 群聊或群通知时为 `true` |
+| `this.e.isMaster` | 用户是否为该机器人的主人（来自 `config.other.master`） |
+| `this.e.hasAlias` | 群聊中以机器人别名开头时，别名被移除且为 `true` |
+| `this.e.only_reply_at` | 是否仅回复 @ 消息 |
+| `this.e.logText` | 日志用户串 |
+| `this.e.logFnc` | 日志方法串（发送统计使用） |
+| `this.e.sender` | 发送人对象（见第四节） |
+| `this.e.group_name` | 群名（无则 fallback） |
+| `this.e.adapter_id` | 适配器 ID |
+| `this.e.adapter_name` | 适配器名称，QQBot 为 `QQBot` |
+| `this.e.friend` | 好友对象（见第五节） |
+| `this.e.group` | 群对象（见第七节） |
+| `this.e.member` | 群成员对象（见第七节群成员部分） |
+
+### 3. 群聊消息追加
+
+| 字段 | 说明 |
+| --- | --- |
+| `this.e.group_id` | 群标识，官方群格式为 `机器人QQ:群openid`，频道为 `qg_频道ID-子频道ID` |
+| `this.e.group_openid` | 官方群 openid（32 位十六进制），频道无 |
+| `this.e.group` | `this.e.bot.pickGroup(this.e.group_id)` 结果 |
+| `this.e.member` | 群成员对象（含官方作者信息） |
+| `this.e.sender.role` | 成员角色（`owner` / `admin` / `member`） |
+| `this.e.sender.permission` | 同 role |
+
+### 4. 私聊消息追加
+
+| 字段 | 说明 |
+| --- | --- |
+| `this.e.friend` | `this.e.bot.pickFriend(this.e.user_id)` 结果 |
+| `this.e.friend.getChatHistory(seq?, count?)` | 读取该好友的本地发言记录 |
+| `this.e.friendgetChatHistory(seq?, count?)` | 同上的兼容别名（仅好友私聊） |
+
+### 5. 群对象追加（makeMessage 后）
+
+| 字段 | 说明 |
+| --- | --- |
+| `this.e.group.getChatHistory(seq?, count?)` | 读取该群的本地发言记录 |
+
+### 6. this.e.raw 的插件追加字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `this.e.raw.self_openid` | 机器人自身 self openid（getter，来自配置缓存） |
+| `this.e.raw._qqbotFullMessageCreate` | 是否 GROUP_MESSAGE_CREATE 全量消息 |
+| `this.e.raw._qqbotFullMessageRecorded` | 是否已记录为全量群 |
+| `this.e.raw.seq` | 本地发言序号 |
+| `this.e.raw.reply_id` | 被引用消息 ID |
+| `this.e.raw.at_id` | 虚拟 @ 用户 ID |
+| `this.e.raw.v_id` | 用户虚拟 @ ID |
+| `this.e.raw.is_has_new_join_request` | 该机器人是否有未读加群申请 |
+| `this.e.raw.iscancelled` | 用户是否处于注销/封禁 |
+| `this.e.raw.invite` | 邀请/好友/召回本地状态（群聊、私聊、通知事件） |
+| `this.e.raw.chat` | 用户/群发言统计（全量群消息、好友私聊） |
+| `this.e.raw.qqbot_group_info` | 群 info 官方缓存 |
+| `this.e.raw.qqbot_bot_state` | bot_state 官方缓存 |
+| `this.e.raw.group_name` | 缓存群名 |
+| `this.e.raw.group_member_num` | 缓存群人数 |
+| `this.e.raw.member_openid` | 机器人群内 openid |
+| `this.e.raw.member_role` | 机器人群角色 |
+| `this.e.raw.allow_proactive_msg` | 是否允许主动消息 |
+| `this.e.raw.qqbot_group_cache_status` | `{ info: 'ok'\|'missing'\|'error', bot_state: 'ok'\|'missing'\|'error'\|'不是管理员' }` |
+
+### 7. 按钮回调事件（sub_type = 'callback'）
+
+| 字段 | 说明 |
+| --- | --- |
+| `this.e.raw` / `this.e.bot` / `this.e.self_id` | 同消息事件 |
+| `this.e.post_type` | `message` |
+| `this.e.message_id` | 按钮绑定的消息 ID |
+| `this.e.message_type` | `private` / `group` 等 |
+| `this.e.sub_type` | `callback` |
+| `this.e.sender` / `this.e.user_id` | 点击者 |
+| `this.e.message` | `[reply段, text段]`，text 为按钮命令 |
+| `this.e.raw_message` | 按钮命令文本 |
+| `this.e.reply` | 回复回调（带 event_id 引用） |
+| `this.e.friend` / `this.e.group` | 按事件类型存在 |
+| `this.e.group_id` / `this.e.group_openid` | 群按钮回调存在 |
+
+### 8. 通知事件对象（经 Bot.em 发射，字段按类型存在）
+
+| 字段 | 说明 |
+| --- | --- |
+| `this.e.raw` / `this.e.bot` / `this.e.self_id` | 同消息事件 |
+| `this.e.post_type` | `notice` |
+| `this.e.notice_type` | `group` / `friend` / `guild` / `channel` / `forum` 等 |
+| `this.e.sub_type` | `increase` / `decrease` / `member.increase` / `member.decrease` / `receive_open` / `receive_close` 等 |
+| `this.e.notice_id` | 通知 ID |
+| `this.e.group_id` / `this.e.group_openid` | 群通知存在 |
+| `this.e.user_id` / `this.e.member_openid` | 相关用户 |
+| `this.e.sender` / `this.e.member` | 部分通知存在 |
+| `this.e.reply` | 部分群通知注入（可回复原会话） |
+| `this.e.raw.invite` | 群成员进出、好友增删时存在 |
+| `this.e.raw._qqbotFullMessageRecorded` | 机器人进群通知时存在 |
+
+### 9. 消息审核通知（主动消息审核）
+
+| 字段 | 说明 |
+| --- | --- |
+| `this.e.post_type` | `notice` |
+| `this.e.notice_type` | `message_audit` |
+| `this.e.sub_type` | `pass` / `reject` |
+| `this.e.notice_id` / `this.e.audit_id` | 审核 ID |
+| `this.e.message_id` | 被审核消息 ID |
+| `this.e.audit_time` / `this.e.create_time` | 时间 |
+| `this.e.is_passed` | 是否通过 |
+| `this.e.group_id` / `this.e.user_id` | 相关群/用户 |
+
+---
+
+## 三、this.e.sender
+
+| 字段 | 说明 |
+| --- | --- |
+| `this.e.sender.user_id` | 发送者用户 ID |
+| `this.e.sender.nickname` | 昵称 |
+| `this.e.sender.card` | 群名片（群聊） |
+| `this.e.sender.avatar` | 头像（部分事件） |
+| `this.e.sender.role` / `this.e.sender.permission` | 群聊时为成员角色 |
+| `this.e.sender.guild_id` / `this.e.sender.channel_id` | 频道事件 |
+| `this.e.sender.src_guild_id` / `this.e.sender.src_channel_id` | 频道私聊来源 |
+
+---
+
+## 四、this.e.group（pickGroup 返回，含全部方法）
+
+字段：
+
+```js
+this.e.group.self_id
+this.e.group.bot
+this.e.group.group_id
+this.e.group.group_openid
+this.e.group.group_name
+this.e.group.group_finger_memo
+this.e.group.group_class_text
+this.e.group.group_tags
+this.e.group.group_member_num
+this.e.group.bot_state        // { member_openid, joined_at, allow_proactive_msg, recv_msg_setting, member_role, fetched_at, error }
+this.e.group.info             // { group_openid, group_name, group_finger_memo, group_class_text, group_tags, group_member_num, fetched_at, error }
+```
+
+方法：
+
+```js
+this.e.group.sendMsg(message)                 // 发消息
+this.e.group.sendFile(file, name?)            // 发文件（loader 补全）
+this.e.group.makeForwardMsg(message)          // 构造转发（loader 补全）
+this.e.group.sendForwardMsg(message)          // 发送转发（loader 补全）
+this.e.group.getInfo()                        // 返回缓存对象（loader 补全）
+this.e.group.pickMember(userOpenid)
+this.e.group.recallMsg(messageId, targetId?, targetType?)
+this.e.group.getMemberMap()                   // 群成员 Map
+this.e.group.getChatHistory(seq?, count?)     // 本地发言记录（官方群消息后存在）
+
+this.e.group.getjoinMsg(force?)               // 加群申请：false/0 读缓存，true/1 刷新官方接口
+this.e.group.setGroupAddRequest(flagOrSequence, approve, reason?, block?)  // 审批加群
+this.e.group.getMuteMemberList()              // 禁言列表
+this.e.group.muteMember(userOpenid, duration?)// 禁言/解禁（duration 秒，0 解禁）
+
+this.e.group.getGroupInfo()                   // 刷新群 info 接口并返回缓存
+this.e.group.getBotState()                    // 刷新 bot_state 接口并返回缓存
+this.e.group.refreshInfo()                    // 刷新 info + bot_state 并返回缓存
+this.e.group.getinfo()                        // 读取当前缓存，不改动
+this.e.group.refreshinfo()                    // 强制刷新 info + bot_state；同类请求在途时复用，不重复请求
+```
+
+### getinfo() 返回结构
+
+```js
+{
+  self_id,
+  group_openid,
+  created_at,
+  last_seen_at,
+  pending_refresh: { reason, options, created_at } | null,
+  info: { group_openid, group_name, group_finger_memo, group_class_text, group_tags, group_member_num, fetched_at, error },
+  bot_state: { member_openid, joined_at, allow_proactive_msg, recv_msg_setting, member_role, fetched_at, error }
+}
+```
+
+`error` 结构：`{ status?, code?, err_code?, message, trace_id?, at }`；`bot_state.error.message` 为 `不是管理员` 表示机器人在该群不是管理员（不是致命错误）。
+
+---
+
+## 五、this.e.member（pickMember 返回）
+
+字段：
+
+```js
+this.e.member.self_id
+this.e.member.bot
+this.e.member.group_id
+this.e.member.group_openid
+this.e.member.user_id
+this.e.member.user_openid
+this.e.member.member_openid
+this.e.member.nickname
+this.e.member.card
+this.e.member.avatar
+this.e.member.bot            // 是否机器人
+this.e.member.role           // owner / admin / member
+this.e.member.permission     // 同 role
+this.e.member.is_owner       // role === 'owner'
+this.e.member.is_admin       // role === 'admin' || role === 'owner'
+```
+
+方法：
+
+```js
+this.e.member.sendMsg(message)
+this.e.member.sendFile(file, name?)
+this.e.member.makeForwardMsg(message)
+this.e.member.sendForwardMsg(message)
+this.e.member.getInfo()
+this.e.member.recallMsg(messageId, targetId?, targetType?)
+this.e.member.getAvatarUrl()
+this.e.member.muteMember(duration?)       // 禁言/解禁
+this.e.member.getMuteMemberList()
+```
+
+---
+
+## 六、this.e.friend（pickFriend 返回）
+
+字段：
+
+```js
+this.e.friend.self_id
+this.e.friend.bot
+this.e.friend.user_id
+this.e.friend.nickname
+this.e.friend.avatar
+```
+
+方法：
+
+```js
+this.e.friend.sendMsg(message)
+this.e.friend.sendFile(file, name?)
+this.e.friend.makeForwardMsg(message)
+this.e.friend.sendForwardMsg(message)
+this.e.friend.getInfo()
+this.e.friend.recallMsg(messageId, targetId?, targetType?)
+this.e.friend.getAvatarUrl()
+this.e.friend.getChatHistory(seq?, count?)   // 好友私聊消息后存在
+```
+
+---
+
+## 七、this.e.bot（机器人对象，插件构造）
+
+稳定字段：
+
+```js
+this.e.bot.adapter          // QQBotAdapter 实例
+this.e.bot.sdk              // qq-official-bot 实例
+this.e.bot.uin              // 机器人 QQ
+this.e.bot.info             // { id, ...连接配置 }
+this.e.bot.nickname         // SDK nickname getter
+this.e.bot.avatar           // QQ 头像 URL getter
+this.e.bot.version          // { id, name, version }
+this.e.bot.stat             // { start_time, recv_msg_cnt }
+this.e.bot.fl               // 好友 Map
+this.e.bot.gl               // 群 Map
+this.e.bot.gml              // 群成员 Map
+this.e.bot.dau              // DAU 实例
+this.e.bot.callback         // 按钮回调暂存表
+```
+
+方法：
+
+```js
+this.e.bot.login()
+this.e.bot.logout()
+this.e.bot.pickFriend(userOpenid)
+this.e.bot.pickUser          // 同 pickFriend
+this.e.bot.pickMember(groupOpenid, userOpenid)
+this.e.bot.pickGroup(groupOpenid)
+this.e.bot.getFriendMap()
+this.e.bot.getGroupMap()
+this.e.bot.getSystemMsg()
+this.e.bot.setGroupAddRequest(flagOrSequence, approve, reason?, block?)
+this.e.bot.setGroupBan(groupOpenid, userOpenid, duration?)
+this.e.bot.getMuteMemberList(groupOpenid)
+this.e.bot.uploadImage(file, opts?)
+```
+
+运行态标志（不建议作为长期 API 依赖）：
+
+```js
+this.e.bot.heartbeatTimer
+this.e.bot.reconnectCount
+this.e.bot.isReconnecting
+this.e.bot.lastHeartbeatTime
+this.e.bot._heartbeatMessageListener
+this.e.bot._heartbeatMessageWs
+this.e.bot.tokenExpireTime
+this.e.bot.tokenRefreshPromise
+this.e.bot.readOnlyMode
+this.e.bot.defaultWsMode
+this.e.bot.gatewayRateLimitedMode
+this.e.bot.gatewayNetworkFallbackMode
+this.e.bot.gatewayBusyFallbackMode
+this.e.bot.disabledRuntime
+this.e.bot.disabledReason
+```
+
+---
+
+## 八、this.e.bot.sdk（qq-official-bot 实例）
+
+稳定字段：
+
+```js
+this.e.bot.sdk.config          // { appid, secret, sandbox, timeout, maxRetry, dataDir, removeAt, delay, intents, logLevel }
+this.e.bot.sdk.sessionManager  // 见第九节
+this.e.bot.sdk.request         // axios 实例（interceptor 自动带 QQBot 鉴权头）
+this.e.bot.sdk.ws              // WebSocket 实例
+this.e.bot.sdk.self_id
+this.e.bot.sdk.nickname
+this.e.bot.sdk.status
+this.e.bot.sdk.logger          // trace/debug/info/mark/warn/error/fatal
+```
+
+事件方法：
+
+```js
+this.e.bot.sdk.on(event, cb)
+this.e.bot.sdk.once(event, cb)
+this.e.bot.sdk.off(event, cb)
+this.e.bot.sdk.emit(event, ...args)
+this.e.bot.sdk.start()
+this.e.bot.sdk.stop()
+```
+
+官方方法：
+
+```js
+this.e.bot.sdk.getSelfInfo()
+this.e.bot.sdk.uploadMedia(target_id, target_type, file_data, file_type, decode?)
+
+this.e.bot.sdk.sendPrivateMessage(user_id, message, source?)
+this.e.bot.sdk.recallPrivateMessage(user_id, message_id)
+this.e.bot.sdk.sendGroupMessage(group_id, message, source?)
+this.e.bot.sdk.recallGroupMessage(group_id, message_id)
+
+// 频道（guild）
+this.e.bot.sdk.getGuildList()
+this.e.bot.sdk.getGuildInfo(guild_id)
+this.e.bot.sdk.getGuildMessage(channel_id, message_id)
+this.e.bot.sdk.getGuildMemberList(guild_id)
+this.e.bot.sdk.getGuildMemberInfo(guild_id, member_id)
+this.e.bot.sdk.getChannelList(guild_id)
+this.e.bot.sdk.getChannelInfo(channel_id)
+this.e.bot.sdk.createDirectSession(guild_id, user_id)
+this.e.bot.sdk.sendDirectMessage(guild_id, message, source?)
+this.e.bot.sdk.getDirectMessage(guild_id, message_id)
+this.e.bot.sdk.recallDirectMessage(guild_id, message_id, hidetip?)
+this.e.bot.sdk.sendGuildMessage(channel_id, message, source?)
+this.e.bot.sdk.recallGuildMessage(channel_id, message_id, hidetip?)
+this.e.bot.sdk.addGuildMessageReaction(channel_id, message_id, type, id)
+this.e.bot.sdk.reactionGuildMessage(channel_id, message_id, type, id)
+this.e.bot.sdk.deleteGuildMessageReaction(channel_id, message_id, type, id)
+this.e.bot.sdk.getGuildMessageReactionMembers(channel_id, message_id, type, id)
+this.e.bot.sdk.getChannelSchedules(channel_id, since?)
+this.e.bot.sdk.getChannelScheduleInfo(channel_id, schedule_id)
+this.e.bot.sdk.createChannelSchedule(channel_id, schedule)
+this.e.bot.sdk.updateChannelSchedule(channel_id, schedule_id, schedule)
+this.e.bot.sdk.deleteChannelSchedule(channel_id, schedule_id)
+this.e.bot.sdk.controlChannelAudio(channel_id, audio_control)
+this.e.bot.sdk.setOnlineMic(channel_id)
+this.e.bot.sdk.setOfflineMic(channel_id)
+this.e.bot.sdk.getChannelThreads(channel_id)
+this.e.bot.sdk.getChannelThreadInfo(channel_id, thread_id)
+this.e.bot.sdk.publishThread(channel_id, title, content, format?)
+this.e.bot.sdk.deleteThread(channel_id, thread_id)
+this.e.bot.sdk.replyAction(action_id, code?)
+```
+
+SDK 中会抛 UnsupportedMethodError 的方法（官方群/好友不支持）：
+
+```js
+this.e.bot.sdk.getGroupMemberList(group_id)   // 抛错
+this.e.bot.sdk.getGroupMemberInfo(group_id, member_id)  // 抛错
+this.e.bot.sdk.getFriendList()                // 抛错
+this.e.bot.sdk.getFriendInfo(friend_id)       // 抛错
+```
+
+插件额外挂到 sdk 的兼容方法：
+
+```js
+this.e.bot.sdk.pickFriend(userOpenid)
+this.e.bot.sdk.pickGroup(groupOpenid)
+this.e.bot.sdk.pickMember(groupOpenid, userOpenid)
+this.e.bot.sdk.getSystemMsg()
+this.e.bot.sdk.setGroupAddRequest(flagOrSequence, approve, reason?, block?)
+this.e.bot.sdk.setGroupBan(groupOpenid, userOpenid, duration?)
+this.e.bot.sdk.getMuteMemberList(groupOpenid)
+this.e.bot.sdk.recallPrivateMessage(userOpenid, messageId)
+this.e.bot.sdk.recallGroupMessage(groupOpenid, messageId)
+```
+
+---
+
+## 九、this.e.bot.sdk.sessionManager
+
+字段：
+
+```js
+sessionManager.access_token
+sessionManager.wsUrl
+sessionManager.retry
+sessionManager.alive
+sessionManager.heartbeatInterval
+sessionManager.isReconnect
+sessionManager.userClose
+sessionManager.sessionRecord      // { sessionID, seq }
+sessionManager.heartbeatParam     // { op, d }
+```
+
+方法：
+
+```js
+sessionManager.getAccessToken()
+sessionManager.getWsUrl()
+sessionManager.getValidIntends()
+sessionManager.start()
+sessionManager.stop()
+sessionManager.connect()
+sessionManager.reconnectWs()
+sessionManager.sendWs(msg)
+sessionManager.authWs()
+sessionManager.startListen()
+```
+
+---
+
+## 十、this.e.client
+
+- `this.e.client` 是 bot 的兼容客户端对象（原型继承 `this.e.bot`），额外提供：
+
+```js
+this.e.client.getSystemMsg()   // 汇总所有机器人的加群申请（只轮询管理员/群主的群）
+```
+
+---
+
+## 十一、安全边界
+
+以下字段包含敏感凭证，禁止出现在群消息、日志、截图、图片、外部插件、任何公开位置：
+
+```js
+this.e.bot.sdk.config.secret
+this.e.bot.sdk.config.appid
+this.e.bot.sdk.sessionManager.access_token
+this.e.bot.sdk.request.defaults.headers.Authorization
+this.e.bot.sdk.ws 的握手鉴权头
+```
+
+
+---
+## A1. 群管菜单
+
+```text
+#QQBot用户管理菜单 群管菜单
+```
+
+菜单内含命令与按钮：
+
+| 命令 | 说明 |
+| --- | --- |
+| `#QQBot刷新已保存群聊昵称` | 批量刷新所有已记录群的官方群名（只刷新 info），按钮“刷新所有昵称” |
+| `#QQBot刷新所有群身份` | 批量刷新所有群的 bot_state（只刷新身份），按钮“刷新所有群身份” |
+| `#QQBot刷新所有群` | 同时刷新 info + bot_state |
+| `#QQBot刷新全量群` | 只刷新全量已记录群的 bot_state |
+| `#QQBot刷新群名 群openid` | 单个群刷新官方群名 |
+| `#QQBot查看机器管理 页码` | 分页展示机器人为管理员/群主的群（每页 20 个） |
+| `#QQBot群人数排行 页码` | 全部缓存群按人数从多到少分页，每页 20 个，无人数显示“未知人” |
+| `#QQBot加群通知 开启/关闭` | 加群通知总开关 |
+| `#QQBot加群通知方式` | 通知方式配置（见 A3） |
+
+批量刷新规则：
+
+- 同一机器人、同一类型（info / bot_state）只允许一个批量刷新队列；重复发送相同命令会拒绝并提示“已有……刷新队列正在执行，请等待完成后再试”。
+- info 与 bot_state 是独立队列，可同时运行；`#QQBot刷新所有群` 同时占用两者，任一被占用即拒绝。
+- 刷新完成后更新缓存并同步运行时 `Bot.gl`，`pickGroup()` 立即看到新数据。
+- 每个群每类接口 10 分钟最多刷新一次（TTL）；`e.group.refreshinfo()` 忽略 TTL 强制刷新。
+
+## A2. 群资料与机器人状态缓存（info / bot_state）
+
+官方接口：
+
+- `GET /v2/groups/{group_openid}/info`：群名、简介、分类、标签、成员数。
+- `GET /v2/groups/{group_openid}/bot_state`：机器人 member_openid、入群时间、主动消息权限、收消息设置、角色。
+
+缓存结构（`this.e.raw.qqbot_group_info` / `this.e.raw.qqbot_bot_state`）：
+
+```js
+info: {
+  group_openid, group_name, group_finger_memo,
+  group_class_text, group_tags, group_member_num,
+  fetched_at, error
+}
+bot_state: {
+  member_openid, joined_at, allow_proactive_msg,
+  recv_msg_setting, member_role,
+  fetched_at, error
+}
+```
+
+`error` 结构：`{ status?, code?, err_code?, message, trace_id?, at }`。`bot_state.error.message === '不是管理员'` 表示机器人在该群不是管理员（非致命，缓存保留旧数据）。
+
+自动刷新触发：
+
+- info：机器人入群；普通群累计 20 条消息、全量群累计 200 条；首次收到 `GROUP_MSG_RECEIVE` / `INTERACTION_CREATE` / `GROUP_AT_MESSAGE_CREATE` / `GROUP_MESSAGE_CREATE`；群成员首次变动及累计 20 次；机器人首次发言及累计 10 次。每群每接口 10 分钟最多一次。
+- bot_state：首次禁言、首次读取禁言列表、首次撤回非自身消息、首次主动获取加群申请、首次收到全量消息、群聊消息时缓存缺少机器人本体 openid。
+- 接口无权限或不是管理员时保留旧缓存并标记 `error`，不影响原数据。
+
+所有内部命令与事件通知显示群 openid 时同时显示缓存官方群名，格式 `官方群名(群openid)`。
+
+## A3. 加群申请系统
+
+事件：`GROUP_JOIN_REQUEST`，映射为 `request.group.add`，`unhandled event` 日志会带事件名。
+
+注意：该事件**不能被动回复消息**（官方 `event_id` 回复会报 40034027），只用于记录与审批。
+
+### 加群申请菜单
+
+```text
+#QQBot查看加群申请
+#QQBot查看加群申请 待处理 1
+#QQBot查看加群申请 已通过 1
+#QQBot查看加群申请 已拒绝 1
+#QQBot查看加群申请 无法处理 1
+#QQBot查看加群申请 已失效 1
+#QQBot查看加群申请 已过期 1
+#QQBot查看加群申请 全部 1
+#QQBot查看加群申请详情 序号/flag
+#QQBot清空加群申请
+#QQBot清空加群申请确认
+```
+
+- 状态：`pending`（待处理）、`approved`（已通过）、`declined`（已拒绝）、`unprocessable`（无法处理）、`invalidated`（已失效）、`expired`（已过期）。
+- 每条记录有稳定 `store_order` 序号，重启不变；审批和详情均支持“序号”或完整 `join_request_id`。
+- 详情页展示本地审批状态 JSON 和官方原始 JSON（`official_payload`，独立保存并递归合并多次来源字段）。
+- 待处理列表页对首条提供“同意首条 / 拒绝首条”快捷按钮。
+
+### 审批
+
+```text
+#QQBot审批加群 序号/flag 通过
+#QQBot审批加群 序号/flag 拒绝 [理由]
+#QQBot审批加群 序号/flag 拒绝并拉黑 [理由]
+```
+
+- 官方审批接口 `POST /v2/groups/{group_openid}/approval_join_request/{member_openid}`。
+- 错误映射：
+  - `11293` / “机器人非群成员” → 记录状态 `unprocessable`，回复“无法处理：机器人非群成员”。
+  - `120162002` / `already agree` → 记录状态 `approved`，回复“已通过加群申请（官方已通过该申请）”。
+- 审批命令发错机器人时，会查找记录归属并提示目标机器人 QQ 与 `@me` 返回的跳转链接：
+  ```text
+  该加群申请属于机器人xxx(名称)，请前往机器人xxx处理
+  [点击前往](@me share_url 或 https://q.qq.com/qqbot/profile/?robot_uin=机器人QQ)
+  ```
+  `/users/@me` 结果按机器人缓存到进程重启（`qqbotMeInfoPromises`）。
+- 同一个人同一群重复申请：只要同意了最新一个，其他 pending 立即失效（invalidated）。
+
+### 兼容 API
+
+```js
+this.e.client.getSystemMsg()                 // 全部机器人的申请（只轮询缓存角色为 admin/owner 的群）
+Bot[xxx].getSystemMsg()                      // 单机器人
+e.group.getjoinMsg() / (false) / (0)         // 仅本群已收到的被动事件
+e.group.getjoinMsg(true) / (1)               // 强制请求本群 join_request_list
+Bot.pickGroup(xxx).getjoinMsg(force?)        // 同 pickGroup
+Bot[xxx].setGroupAddRequest(flag, approve, reason?, block?)   // 审批；approve/decline、true/false、1/0、yes/no
+this.e.bot.sdk.getSystemMsg() / setGroupAddRequest(...)       // sdk 同样挂载
+```
+
+- 申请列表接口无权限时静默处理：先刷新 bot_state 确认管理员，再最多重试一次，仍失败就跳过，不再报 `11703 not group admin`。
+- 本地无记录时只对“7 天内活跃且缓存角色为 admin/owner”的群补拉列表。
+
+### 加群通知（默认关闭）
+
+```text
+#QQBot加群通知 开启/关闭
+#QQBot加群通知方式
+#QQBot加群通知方式 群内
+#QQBot加群通知方式 本人私信
+#QQBot加群通知方式 所有主人
+```
+
+- 群内（默认）：优先发送到申请所在群；群不允许主动消息或发送失败时降级 `sendMasterMsg` 通知所有主人。
+- 本人私信：主动私信执行设置命令的管理者 openid；失败或未设置接收人时降级所有主人。
+- 所有主人：直接 `sendMasterMsg`。
+- 通知为原生 Markdown（非代码块），带 `qqbot-cmd-input`（详情/待处理/同意/拒绝/拒绝并拉黑）与两排按钮；群名、用户、验证信息转义 Markdown 特殊字符。
+- 通知正文包含“官方原始JSON”代码块，以及字段名含 risk/warning/danger/security/fraud/abuse/blacklist 的风险相关字段代码块。
+- 通知显示 `[机器人QQ]` 与 `@me` 缓存机器人名称。
+- 通知为内部发送，不附加“消息后缀”配置，不走外部模板钩子。
+
+## A4. 群聊主动消息
+
+```text
+#QQBot普通设置 群聊主动菜单
+#QQBot群聊主动菜单
+#QQBot群聊主动配置
+#QQBot群聊主动配置 Markdown 内容
+#QQBot群聊主动配置 button JSON
+#QQBot群聊主动预览
+#QQBot群聊主动发送 数量
+#QQBot群聊主动结果 1
+#QQBot群聊主动查看可主动群 页码
+```
+
+- 只向缓存 `allow_proactive_msg === true` 的群发送，间隔 2 秒，结果按运行保存最多 100 次。
+- 可主动群列表分页展示官方群名、openid、机器人角色。
+- 平台禁止单发按钮：必须先设置消息内容才能开启按钮。
+
+## A5. 官方接口记录
+
+```text
+#QQBot查看官方接口记录 页码
+```
+
+- 只枚举全量消息已记录的群，输出 `groupInfoStore` 保存的完整 `bot_state` JSON（即 `#QQBot刷新所有群身份` 的结果），统一放在一个 `text` 代码块内，每页 10 个。
+- 按钮：刷新身份（`#QQBot刷新全量群`）、返回清查记录。
+
+## A6. 高级搜索
+
+```text
+#QQBot高级搜索 内容
+#QQBot高级搜索 内容 页码
+```
+
+- 原 `#QQBot搜索用户` / `#QQBot全局搜索` 入口统一改为 `#QQBot高级搜索`。
+- 群结果优先使用 `groupInfoStore` 官方缓存显示官方群名、成员数、群简介；用户结果保留昵称、openid、所在群列表（带群名）。
+- 首条为群时快捷按钮为“群聊发言 + 拉黑群”，首条为用户时为“私聊发言 + 拉黑用户”。
+
+## A7. 所有群最近发言快照
+
+- `#QQBot查看所有群最近发言` 取消 500 页硬上限，改为最多 5000 页。
+- 每 500 页为一个窗口，窗口首次加载时生成 2 分钟快照（`RECENT_GROUP_SNAPSHOT_TTL`）；缓存期内同一机器人同一窗口页码结果一致。
+- 第 501 页起才懒加载后续历史，不预读全部。
+- 删除发言、清空缓存会立即失效对应机器人快照。
+
+## A8. DAU 增强
+
+- `GROUP_DEL_ROBOT` 正确计入“减少群数”（按群 openid 去重，同一群多次退按一个群）。
+- `/qbotdau`、`/qbotdaupro` 支持日期输入：`08-10`、`0810`（支持 `/`、`.` 分隔）。
+  - 只允许查询最近一年内（含今天）的日期。
+  - 未来日期、格式错误、超过一年、无历史数据分别提示。
+- `#QQBotdau` 按钮：私聊触发所有人可点；群聊按钮仅命令触发人可点。
+- `#QQBot调用统计`、`#QQBot用户统计` 未开启时回复“未开启”，不再静默。
+- DAU 日期口径修复（见第一节）：不再使用 `getTime()` 的 +8 小时，与 node-schedule 本地（北京时间）零点一致；写入前自检跨日归档，昨天不会累加到今天。
+- `numToChinese` 补全到 31（“最近三十一天”）；DAU 天数最大 31（取 30 天窗口时不会出现 31 以上）。
+
+## A9. 禁言与兼容 API
+
+```js
+e.group.muteMember(userOpenid, duration?)       // 当前群禁言，duration 秒，0 解禁
+Bot[xxx].setGroupBan(group_openid, user_openid, duration?)
+Bot[xxx].pickGroup(x).pickMember(y).muteMember(duration?)
+e.group.getMuteMemberList()                     // 禁言列表
+Bot[xxx].getMuteMemberList(group_openid)
+this.e.bot.sdk.setGroupBan(...) / getMuteMemberList(...)
+```
+
+- 时长范围 0~2592000 秒（30 天），按系统时间生成 RFC3339 到期时间。
+- 时长为 0 解禁：先 `del`，失败则 `update` 且到期时间为当前时间。
+- 官方限制：禁言设置 60 QPM，禁言列表 30 QPM。
+
+## A10. segment.txt 与帮助 raw 模式
+
+- `segment.txt("文本")`：原生 Markdown 模式下发送普通文本；只能与 `segment.image` 组合成图文，与其他 segment 混用时不处理。
+- `#qbot帮助`：每次重启后首次触发且当前不是 raw 原生 Markdown 时，默认尝试用 raw 模式发送；成功则额外发送“已自动开启原生 Markdown”提示与恢复按钮；失败回退到下次重启前不再尝试。
+
+## A11. 其他实现项
+
+- `this.e.raw.v_id`：群聊/私聊事件取触发用户 openid 计算虚拟 ID（复用缓存），频道事件不写；无 @ 时不改变 `this.e.at` / `this.e.raw.at_id`。
+- `this.e.raw.is_has_new_join_request`：收到新加群申请且未查看时为 `true`；调用 `getjoinMsg` / `getSystemMsg` 后清除。
+- 群消息附件 `attachments` 映射为图片 segment，`this.e.img` 可获取群/私聊图片 URL 数组。
+- `#QQBot全量查看` 展示机器人角色、允许主动消息、机器人 member_openid 与缓存状态。
+- `#QQBot全量消息设置` 显示机器人 member_openid。
+- `#QQBot全量清/查记录` 菜单增加“刷新全量群”（刷新全量已记录群的 bot_state）。
+- 按钮回调（INTERACTION_CREATE）触发群 info 刷新。

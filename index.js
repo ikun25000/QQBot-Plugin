@@ -63,6 +63,8 @@ import {
   switchInviteDB,
   inviteStore,
   userManageStore,
+  joinRequestStore,
+  groupInfoStore,
   advancedWelcomeStore,
   buttonTextWarnings,
   checkAdvancedWelcomeSend,
@@ -83,13 +85,18 @@ import {
 import { createRequire } from 'module'
 import { Bot as QQBot } from 'qq-official-bot'
 import { BindStatus, qrRegister } from './Model/qr-auth.js'
+import fullMessageStore from './Model/fullMessageStore.js'
 const require = createRequire(import.meta.url)
 const qqbotOriginalEventMap = new WeakMap()
 const qqbotInternalSendStorage = new AsyncLocalStorage()
 const qqbotMessageSuffixApplied = new WeakSet()
 const qqbotMessageSuffixExcluded = new WeakSet()
+const qqbotHelpMarkdownTried = new Set()
+const qqbotHelpMarkdownRestore = new Map()
 const qqbotApiSwitchConfirmations = new Map()
 const qqbotTimedMapExpiries = new Map()
+const qqbotMeInfoPromises = new Map()
+const qqbotGroupRefreshBatches = new Map()
 let qqbotStoresReady = Promise.resolve()
 let qqbotStoreInitError = null
 const qqbotMessageQueues = new Map()
@@ -494,6 +501,269 @@ function getVirtualAtIdFromEvent (selfId = '', event = {}) {
   return ''
 }
 
+function getQQBotGroupOpenid (selfId = '', value = '') {
+  let id = String(value || '').trim()
+  const prefix = `${selfId}${adapter?.sep || ':'}`
+  if (id.startsWith(prefix)) id = id.slice(prefix.length)
+  return /^[A-F0-9]{32}$/i.test(id) ? id : ''
+}
+
+function getQQBotGroupDisplayName (selfId = '', groupOpenid = '') {
+  return groupInfoStore.getInfo(selfId, groupOpenid)?.group_name || ''
+}
+
+function getQQBotDisplayName (selfId = '') {
+  return getBotNicknameFromConfigOrStore(config, selfId) || Bot[selfId]?.nickname || Bot[selfId]?._qqbotNickname || String(selfId || '')
+}
+
+function getQQBotProfileUrl (selfId = '', me = {}) {
+  const officialUrl = [me.share_url, me.profile_url, me.robot_url].find(value => /^https?:\/\//i.test(String(value || '')))
+  return officialUrl || `https://q.qq.com/qqbot/profile/?robot_uin=${encodeURIComponent(selfId)}`
+}
+
+async function getQQBotMeInfo (selfId = '') {
+  const bot = Bot[selfId]
+  if (!bot?.sdk?.request) return { name: getQQBotDisplayName(selfId), link: getQQBotProfileUrl(selfId), data: null }
+  if (!qqbotMeInfoPromises.has(selfId)) {
+    const task = bot.sdk.request.get('/users/@me')
+      .then(({ data }) => {
+        const name = String(data?.username || '').trim()
+        if (name) bot._qqbotNickname = name
+        return { name: name || getQQBotDisplayName(selfId), link: getQQBotProfileUrl(selfId, data), data: data || null }
+      })
+      .catch(() => ({ name: getQQBotDisplayName(selfId), link: getQQBotProfileUrl(selfId), data: null }))
+    qqbotMeInfoPromises.set(selfId, task)
+  }
+  return qqbotMeInfoPromises.get(selfId)
+}
+
+async function getQQBotMeName (selfId = '') {
+  return (await getQQBotMeInfo(selfId)).name
+}
+
+function formatQQBotGroupLogTarget (selfId = '', groupId = '', fallbackName = '') {
+  const identifier = String(groupId || '')
+  const groupOpenid = getQQBotGroupOpenid(selfId, identifier)
+  const groupName = getQQBotGroupDisplayName(selfId, groupOpenid) || String(fallbackName || '')
+  if (groupName) return `${groupName}(${identifier || groupOpenid})`
+  return identifier || groupOpenid || '未知群聊'
+}
+
+function escapeQQBotMarkdownText (value = '') {
+  return String(value ?? '').replace(/([\\`*_{}\[\]()#+\-.!|<>])/g, '\\$1')
+}
+
+function getQQBotRiskFields (value, path = '', result = {}) {
+  if (!value || typeof value !== 'object') return result
+  for (const [key, item] of Object.entries(value)) {
+    const itemPath = path ? `${path}.${key}` : key
+    if (/(risk|warn(?:ing)?|danger|security|fraud|abuse|blacklist)/i.test(key)) result[itemPath] = item
+    if (item && typeof item === 'object' && !Array.isArray(item)) getQQBotRiskFields(item, itemPath, result)
+  }
+  return result
+}
+
+function makeQQBotJsonCodeBlock (value) {
+  const json = JSON.stringify(value, null, 2)
+  const longestFence = Math.max(0, ...[...json.matchAll(/`+/g)].map(match => match[0].length))
+  const fence = '`'.repeat(Math.max(3, longestFence + 1))
+  return `${fence}json\n${json}\n${fence}`
+}
+
+function ensureGroupProactiveConfig (selfId = '') {
+  if (!config.groupProactive || typeof config.groupProactive !== 'object' || Array.isArray(config.groupProactive)) config.groupProactive = { bots: {} }
+  if (!config.groupProactive.bots || typeof config.groupProactive.bots !== 'object' || Array.isArray(config.groupProactive.bots)) config.groupProactive.bots = {}
+  const key = selfId || 'default'
+  if (!config.groupProactive.bots[key] || typeof config.groupProactive.bots[key] !== 'object') config.groupProactive.bots[key] = {}
+  const settings = config.groupProactive.bots[key]
+  if (typeof settings.markdown !== 'string') settings.markdown = ''
+  if (typeof settings.buttonEnabled !== 'boolean') settings.buttonEnabled = false
+  if (!settings.button || typeof settings.button !== 'object') settings.button = null
+  if (!Array.isArray(settings.results)) settings.results = []
+  settings.results = settings.results.slice(0, 100)
+  return settings
+}
+
+async function requestQQBotGroupApi (selfId, groupOpenid, endpoint, method = 'get', body) {
+  const group = getQQBotGroupOpenid(selfId, groupOpenid)
+  const bot = Bot[selfId]
+  if (!group || !bot?.sdk?.request) throw new Error('缺少有效群openid或机器人不可用')
+  const endpointName = String(endpoint).split('?')[0]
+  const family = endpointName.startsWith('approval_join_request/') ? 'approval_join_request' : endpointName
+  return groupInfoStore.requestEndpoint(selfId, group, family, () => {
+    const path = `/v2/groups/${group}/${endpoint}`
+    return method === 'post' ? bot.sdk.request.post(path, body) : bot.sdk.request.get(path)
+  })
+}
+
+async function getAllQQBotGroups (selfId) {
+  const stored = []
+  let page = 1
+  let pageCount = 1
+  do {
+    const result = await userManageStore.listGroups(selfId, page, 100)
+    stored.push(...result.list)
+    pageCount = result.pageCount
+    page++
+  } while (page <= pageCount && stored.length < 5000)
+  const groups = new Map(stored.map(item => [item.openid, item]))
+  for (const [key, value] of Bot[selfId]?.gl || []) {
+    const openid = getQQBotGroupOpenid(selfId, value?.group_openid || value?.group_id || key)
+    if (openid && !groups.has(openid)) groups.set(openid, { self_id: selfId, openid, last_seen_at: '' })
+  }
+  return [...groups.values()]
+}
+
+function normalizeQQBotApproval (value) {
+  if (value === true || value === 1) return 'approve'
+  if (value === false || value === 0) return 'decline'
+  return ['approve', 'yes', 'true', '1'].includes(String(value).toLowerCase()) ? 'approve' : 'decline'
+}
+
+function normalizeQQBotBlock (value) {
+  return value === true || value === 1 || ['yes', 'true', '1'].includes(String(value).toLowerCase())
+}
+
+function hasQQBotReplyContext (msg, event) {
+  if (event?.id || event?.event_id || event?.message_id) return true
+  const segments = Array.isArray(msg) ? msg : [msg]
+  return segments.some(item => item?.type === 'reply' || (item?.type === 'node' && item.data?.some?.(node => hasQQBotReplyContext(node?.message))))
+}
+
+function isQQBotNotGroupAdminError (err) {
+  const data = err?.response?.data || {}
+  const text = [data.message, data.msg, err?.message].filter(Boolean).join(' ')
+  return Number(data.code || data.err_code || err?.code || err?.err_code || 0) === 11703 || /code\(11703\)|not group admin|不是管理员/i.test(text)
+}
+
+function getQQBotApprovalErrorStatus (err) {
+  const data = err?.response?.data || {}
+  const text = [data.message, data.msg, err?.message].filter(Boolean).join(' ')
+  const code = Number(data.code || data.err_code || err?.code || err?.err_code || /code\((\d+)\)/i.exec(text)?.[1] || 0)
+  if (code === 120162002 || /already agree/i.test(text)) return { status: 'approved', message: '官方已通过该申请' }
+  if (code === 11293 || /机器人非群成员|not group member/i.test(text)) return { status: 'unprocessable', message: '无法处理：机器人非群成员' }
+  return null
+}
+
+async function getQQBotJoinRequests (selfId, groupOpenid, force = false) {
+  const group = getQQBotGroupOpenid(selfId, groupOpenid)
+  if (!group) return []
+  if (!force) {
+    const list = joinRequestStore.list(selfId, { group_openid: group, limit: 500 }).list.filter(item => item.passive_received === true || item.request_source !== 'active')
+    await joinRequestStore.markSeen(selfId, group)
+    return list
+  }
+  let state = groupInfoStore.getBotState(selfId, group)
+  if (!['admin', 'owner'].includes(state?.member_role)) {
+    const refreshed = await groupInfoStore.refreshBotState(selfId, group)
+    state = refreshed?.bot_state
+  }
+  if (!['admin', 'owner'].includes(state?.member_role)) return []
+  let cursor = ''
+  const fetched = []
+  const deadline = Date.now() + 5 * 60 * 1000
+  do {
+    const query = cursor ? `?cursor=${encodeURIComponent(cursor)}&limit=100` : '?limit=100'
+    const requestPage = () => groupInfoStore.requestEndpoint(
+      selfId,
+      group,
+      'join_request_list',
+      () => Bot[selfId].sdk.request.get(`/v2/groups/${group}/join_request_list${query}`),
+      { retries: 0 }
+    )
+    let result
+    try {
+      result = await requestPage()
+    } catch (err) {
+      if (!isQQBotNotGroupAdminError(err)) throw err
+      // A cached role can be stale. Revalidate once before one final list request.
+      const refreshed = await groupInfoStore.refreshBotState(selfId, group)
+      if (!['admin', 'owner'].includes(refreshed?.bot_state?.member_role)) return fetched
+      try { result = await requestPage() } catch { return fetched }
+    }
+    const { data = {} } = result
+    for (const item of data.list || []) fetched.push(await joinRequestStore.record({ ...item, official_payload: item, request_source: 'active', self_id: selfId, group_openid: group }))
+    cursor = data.next_cursor || ''
+  } while (cursor && Date.now() < deadline)
+  await joinRequestStore.markSeen(selfId, group)
+  return fetched.map(item => ({ ...item, unread: false }))
+}
+
+async function setQQBotGroupAddRequest (selfId, flag, approve = true, reason = '', block = false) {
+  const reference = String(flag || '')
+  const findRequest = () => /^\d+$/.test(reference)
+    ? joinRequestStore.findBySequence(selfId, reference)
+    : joinRequestStore.findByFlag(selfId, reference)
+  let item = findRequest()
+  if (!item) {
+    const since = Date.now() - 7 * 86400000
+    const groups = (await getAllQQBotGroups(selfId)).filter(group => {
+      const role = groupInfoStore.getBotState(selfId, group.openid)?.member_role
+      return Date.parse(group.last_seen_at || '') >= since && (role === 'admin' || role === 'owner')
+    })
+    for (const group of groups) {
+      await getQQBotJoinRequests(selfId, group.openid, true)
+      item = findRequest()
+      if (item) break
+    }
+  }
+  if (!item) throw new Error('未找到加群申请')
+  const op = normalizeQQBotApproval(approve)
+  try {
+    await requestQQBotGroupApi(selfId, item.group_openid, `approval_join_request/${item.member_openid || item.applicant_openid}`, 'post', {
+      op,
+      join_request_id: item.join_request_id,
+      ...(op === 'decline' && reason ? { reject_reason: String(reason) } : {}),
+      ...(op === 'decline' ? { add_to_member_blacklist: normalizeQQBotBlock(block) } : {})
+    })
+  } catch (err) {
+    const result = getQQBotApprovalErrorStatus(err)
+    if (!result) throw err
+    await joinRequestStore.resolve(selfId, item.group_openid, item.join_request_id, result.status, { reason: result.message, block: false })
+    return { status: result.status, message: result.message }
+  }
+  await joinRequestStore.resolve(selfId, item.group_openid, item.join_request_id, op, { reason, block })
+  return { status: op === 'approve' ? 'approved' : 'declined', message: '' }
+}
+
+async function getAllQQBotSystemMsg () {
+  const result = []
+  for (const selfId of Bot.uin || Object.keys(Bot)) {
+    if (typeof Bot[selfId]?.getSystemMsg !== 'function') continue
+    try { result.push(...await Bot[selfId].getSystemMsg()) } catch {}
+  }
+  return result
+}
+
+async function muteQQBotMember (selfId, groupOpenid, userOpenid, duration = 600) {
+  const seconds = Math.min(2592000, Math.max(0, Math.floor(Number(duration) || 0)))
+  const member = String(userOpenid || '').replace(`${selfId}${adapter.sep}`, '')
+  if (!member) throw new Error('缺少成员openid')
+  groupInfoStore.scheduleRefresh(selfId, getQQBotGroupOpenid(selfId, groupOpenid), 'mute', { info: false, botState: true })
+  if (seconds === 0) {
+    try {
+      await requestQQBotGroupApi(selfId, groupOpenid, 'restrict_chat_setting', 'post', { members: [{ op: 'del', member_openid: member, mute_expire_at: '' }] })
+    } catch {
+      await requestQQBotGroupApi(selfId, groupOpenid, 'restrict_chat_setting', 'post', { members: [{ op: 'update', member_openid: member, mute_expire_at: new Date().toISOString() }] })
+    }
+    return true
+  }
+  const expire = new Date(Date.now() + seconds * 1000).toISOString()
+  try {
+    await requestQQBotGroupApi(selfId, groupOpenid, 'restrict_chat_setting', 'post', { members: [{ op: 'add', member_openid: member, mute_expire_at: expire }] })
+  } catch {
+    await requestQQBotGroupApi(selfId, groupOpenid, 'restrict_chat_setting', 'post', { members: [{ op: 'update', member_openid: member, mute_expire_at: expire }] })
+  }
+  return true
+}
+
+async function getQQBotMuteMemberList (selfId, groupOpenid) {
+  const group = getQQBotGroupOpenid(selfId, groupOpenid)
+  groupInfoStore.scheduleRefresh(selfId, group, 'mute_list', { info: false, botState: true })
+  const result = await requestQQBotGroupApi(selfId, group, 'restrict_chat_setting')
+  return result.data?.members || []
+}
+
 function stripSelfIdPrefix (selfId = '', value = '') {
   return String(value || '').replace(new RegExp(`^${escapeRegExp(String(selfId))}[:：\uf03a]?`), '')
 }
@@ -654,6 +924,9 @@ const PER_BOT_CONFIG_KEYS = [
   'toImg',
   'callStats',
   'userStats',
+  'joinNotify',
+  'joinNotifyMode',
+  'joinNotifyUserOpenid',
   'userAgent',
   'offlineDetect'
 ]
@@ -682,6 +955,15 @@ function getBotConfigValue (selfId, key) {
 function setBotConfigValue (selfId, key, value) {
   const botConfig = ensureBotConfig(selfId)
   botConfig[key] = value
+}
+
+function getQQBotJoinNotifyMode (selfId = '') {
+  const mode = getBotConfigValue(selfId, 'joinNotifyMode')
+  return ['group', 'private', 'master'].includes(mode) ? mode : 'group'
+}
+
+function getQQBotJoinNotifyModeLabel (mode = '') {
+  return ({ group: '群内通知', private: '本人私信', master: '所有主人' })[mode] || '群内通知'
 }
 
 function ensureMessageSuffixConfig (selfId = '') {
@@ -1295,6 +1577,7 @@ function patchGroupMessageCreateEvent () {
           })
           wsRes.d._qqbotRawEvent = event
           if (typeof wsRes.d.content === 'string' && typeof wsRes.d._rawContent !== 'string') wsRes.d._rawContent = wsRes.d.content
+          if (!eventModule.QQEvent[event]) this.logger.warn(`unhandled(${event})`)
         }
         return originalDispatchEvent.call(this, event, wsRes)
       }
@@ -1319,6 +1602,10 @@ function patchGroupMessageCreateEvent () {
           text = text.replace(/^\/\s*/, '#')
         }
         payload.message = text ? [{ type: 'text', text }] : []
+        for (const attachment of payload.attachments || []) {
+          if (!String(attachment?.content_type || '').startsWith('image/') || !attachment.url) continue
+          payload.message.push({ type: 'image', url: attachment.url, content: attachment.content || '[图片]', width: attachment.width, height: attachment.height, size: attachment.size, name: attachment.filename || '' })
+        }
         payload.user_id = payload.author?.id
         payload.message_id = getQQBotActualMessageId(payload)
         payload.raw_message = text
@@ -1477,6 +1764,7 @@ function patchGroupMessageCreateEvent () {
         const selfId = this.config?.real_self_id || this.self_id || ''
         const rawGroupId = payload.group_openid || payload.group_id || ''
         const groupId = rawGroupId || '未知群聊'
+        const groupLogTarget = formatQQBotGroupLogTarget(selfId, rawGroupId, payload.group_name || payload.group?.name || '')
         const memberOpenid = payload.member_openid || payload.user_id || ''
         const memberName = getMemberNicknameFromStore(selfId, memberOpenid) || memberOpenid
         const timestamp = payload._rawTimestamp || payload.timestamp || payload.time || ''
@@ -1512,7 +1800,8 @@ function patchGroupMessageCreateEvent () {
           operator_id: payload.operator_id || payload.op_member_openid || '',
           time
         }
-        this.logger.info(`群(${groupId})成员(${memberName}(${memberOpenid}))${isIncrease ? '加入' : '退出'}`)
+        if (rawGroupId) groupInfoStore.scheduleRefresh(selfId, rawGroupId, 'member_change', { info: true, botState: true })
+        this.logger.info(`群(${groupLogTarget})成员(${memberName}(${memberOpenid}))${isIncrease ? '加入' : '退出'}`)
         return notice
       }
       eventModule.QQEvent.GROUP_MEMBER_ADD = 'notice.group.member.increase'
@@ -1526,8 +1815,41 @@ function patchGroupMessageCreateEvent () {
       const groupMemberIntent = 1 << 24
       constansModule.Intends.GROUP_MEMBER_ADD = groupMemberIntent
       constansModule.Intends.GROUP_MEMBER_REMOVE = groupMemberIntent
+      constansModule.Intends.GROUP_JOIN_REQUEST = groupMemberIntent
       constansModule.Intends[groupMemberIntent] = 'GROUP_MEMBER_ADD'
       constansModule.Intends._qqbotGroupMemberPatched = true
+    }
+
+    if (!eventModule.QQEvent.GROUP_JOIN_REQUEST) {
+      eventModule.QQEvent.GROUP_JOIN_REQUEST = 'request.group.add'
+      eventModule.EventParserMap.set(eventModule.QQEvent.GROUP_JOIN_REQUEST, function (event, payload) {
+        const verify = payload.verify_info || {}
+        return {
+          bot: this,
+          raw: payload,
+          post_type: 'request',
+          request_type: 'group',
+          sub_type: 'add',
+          event_id: payload.event_id || payload.id || '',
+          notice_id: payload.event_id || payload.id || payload.join_request_id || '',
+          flag: payload.join_request_id || '',
+          join_request_id: payload.join_request_id || '',
+          group_id: payload.group_openid || '',
+          group_openid: payload.group_openid || '',
+          user_id: payload.member_openid || '',
+          member_openid: payload.member_openid || '',
+          username: payload.username || '',
+          nickname: payload.username || '',
+          apply_at: payload.apply_at || '',
+          apply_source: payload.apply_source || '',
+          invited_by: payload.invited_by || '',
+          bot_account: payload.bot === true,
+          verify_info: verify,
+          risk_tips: payload.risk_tips || '',
+          sender: { user_id: payload.member_openid || '', nickname: payload.username || '' },
+          async reply () { return false }
+        }
+      })
     }
 
     eventModule.QQEvent.GROUP_MESSAGE_CREATE = 'message.group'
@@ -1559,6 +1881,7 @@ if (typeof segment?.button === 'function' && !segment.button._qqbotLimitPatched)
   segment.button = (...rows) => originalSegmentButton(...limitButtonRows(rows))
   segment.button._qqbotLimitPatched = true
 }
+if (typeof segment?.txt !== 'function') segment.txt = text => ({ type: 'text', text: String(text ?? ''), _qqbotPlainText: true })
 
 // ========== 账号掉线检测状态管理 ==========
 const offlineCheckState = {
@@ -1954,6 +2277,9 @@ const adapter = new class QQBotAdapter {
       const targetOpenid = contextTargetId
       record = await advancedWelcomeStore.getMessageIndex(messageId, { selfId: data.self_id, targetId: targetOpenid, type: 'group' })
       if (record) messageId = record.actual_message_id || record.message_id
+    }
+    if (contextType === 'group' && record && record.author_openid && String(record.author_openid) !== String(data.self_id)) {
+      groupInfoStore.scheduleRefresh(data.self_id, contextTargetId, 'recall_non_self', { info: false, botState: true })
     }
     if (!record && isReferenceIndex(messageId) && data.message_type === 'group' && contextTargetId) {
       const history = await userManageStore.findUniqueHistoryByMessageId(data.self_id, contextTargetId, messageId)
@@ -2534,7 +2860,8 @@ const adapter = new class QQBotAdapter {
         ...button.QQBot?.action
       }
     } else if (button.callback) {
-      if (getBotConfigValue(data.self_id, 'toCallback')) {
+      // qqbot-cmd-input/action data has a platform length limit. Keep long commands server-side.
+      if (getBotConfigValue(data.self_id, 'toCallback') || String(button.callback).length > 100) {
         msg.action = {
           type: 1,
           permission: { type: 2 },
@@ -2681,7 +3008,7 @@ const adapter = new class QQBotAdapter {
     const suffixState = getQQBotMessageSuffixInputState(msg)
     const officialChat = (data.group_id && !String(data.group_id).startsWith('qg_')) || (data.user_id && !String(data.user_id).startsWith('qg_') && !data.guild_id && !data.channel_id)
     const suffixMarkdown = !isQQBotInternalSend() && officialChat ? getQQBotActiveMessageSuffix(data.self_id) : ''
-    if (!skipHandle && Handler.has('QQBot.makeRawMarkdownMsg')) {
+    if (!skipHandle && !data._qqbotInternalPlainText && Handler.has('QQBot.makeRawMarkdownMsg')) {
       const res = await Handler.call('QQBot.makeRawMarkdownMsg', data, {
         adapter: this,
         data,
@@ -2696,8 +3023,15 @@ const adapter = new class QQBotAdapter {
     const files = []
     let content = ''
     let reply
+    const sourceSegments = Array.isArray(msg) ? msg : [msg]
+    const plainTextSegments = sourceSegments.filter(item => item?._qqbotPlainText === true)
+    const plainImageSegments = sourceSegments.filter(item => item?.type === 'image')
+    if (plainTextSegments.length && plainTextSegments.length + plainImageSegments.length === sourceSegments.length) {
+      return this.makeMsg(data, sourceSegments.map(item => item._qqbotPlainText ? { type: 'text', text: item.text } : item), true)
+    }
+    if (plainTextSegments.length) return []
 
-    for (let i of Array.isArray(msg) ? msg : [msg]) {
+    for (let i of sourceSegments) {
       if (typeof i == 'object') { i = { ...i } } else { i = { type: 'text', text: i } }
 
       switch (i.type) {
@@ -3040,7 +3374,7 @@ const adapter = new class QQBotAdapter {
   }
 
   async makeMsg (data, msg, skipHandle = false) {
-    if (!skipHandle && Handler.has('QQBot.makeMsg')) {
+    if (!skipHandle && !data._qqbotInternalPlainText && Handler.has('QQBot.makeMsg')) {
       const res = await Handler.call('QQBot.makeMsg', data, {
         adapter: this,
         data,
@@ -3366,7 +3700,13 @@ const adapter = new class QQBotAdapter {
       }], data.self_id)
       return { message_id: [], data: [], error: [err] }
     }
-    if (Handler.has('QQBot.group.sendMsg')) {
+    const botState = groupInfoStore.getBotState(data.self_id, groupId)
+    if (botState?.allow_proactive_msg === false && !hasQQBotReplyContext(msg, event)) {
+      const err = new Error('当前群不允许机器人主动发送消息')
+      Bot.makeLog('warn', ['已阻止无主动消息权限的群发送', { self_id: data.self_id, group_openid: groupId }], data.self_id)
+      return { message_id: [], data: [], error: [err] }
+    }
+    if (!data._qqbotInternalPlainText && Handler.has('QQBot.group.sendMsg')) {
       const res = await Handler.call(
         'QQBot.group.sendMsg',
         data,
@@ -3383,7 +3723,9 @@ const adapter = new class QQBotAdapter {
         return res
       }
     }
-    return this.sendMsg({ ...data, group_id: groupId, group_openid: groupId }, msg => data.bot.sdk.sendGroupMessage(groupId, msg, event), msg)
+    const result = await this.sendMsg({ ...data, group_id: groupId, group_openid: groupId }, msg => data.bot.sdk.sendGroupMessage(groupId, msg, event), msg)
+    if (!result?.error?.length) groupInfoStore.recordTrigger(data.self_id, groupId, 'bot')
+    return result
   }
 
   async makeGuildMsg (data, msg) {
@@ -3534,7 +3876,7 @@ const adapter = new class QQBotAdapter {
   }
 
   recallGroupMsg (data, message_id) {
-    Bot.makeLog('info', `撤回群消息：[${data.group_id}] ${message_id}`, data.self_id)
+    Bot.makeLog('info', `撤回群消息：[${formatQQBotGroupLogTarget(data.self_id, data.group_id || data.group_openid)}] ${message_id}`, data.self_id)
     const rawGroupId = data.raw?.group_id || String(data.group_id || '').replace(`${data.self_id}${this.sep}`, '')
     return this.simpleRecallMsg({ ...data, message_type: 'group', group_id: rawGroupId, group_openid: rawGroupId }, message_id, rawGroupId, 'group')
   }
@@ -3572,6 +3914,8 @@ const adapter = new class QQBotAdapter {
   }
 
   pickMember (id, group_id, user_id) {
+    group_id = String(group_id || '')
+    user_id = String(user_id || '')
     if (getBotConfigValue(id, 'toQQUin') && userIdCache.has(user_id)) {
       user_id = userIdCache.get(user_id)
     }
@@ -3584,13 +3928,21 @@ const adapter = new class QQBotAdapter {
       user_id: user_id.replace(`${id}${this.sep}`, ''),
       group_id: group_id.replace(`${id}${this.sep}`, '')
     }
+    const role = String(i.role || i.member_role || i.permission || '')
     return {
       ...this.pickFriend(id, user_id),
-      ...i
+      ...i,
+      role,
+      permission: role,
+      is_owner: role === 'owner',
+      is_admin: role === 'admin' || role === 'owner',
+      muteMember: duration => muteQQBotMember(id, i.group_id, i.user_id, duration),
+      getMuteMemberList: () => getQQBotMuteMemberList(id, i.group_id)
     }
   }
 
   pickGroup (id, group_id) {
+    group_id = String(group_id || '')
     if (group_id.startsWith?.('qg_')) { return this.pickGuild(id, group_id) }
     const i = {
       ...(Bot[id].gl?.get?.(group_id) || {}),
@@ -3603,7 +3955,16 @@ const adapter = new class QQBotAdapter {
       sendMsg: msg => this.sendGroupMsg(i, msg),
       pickMember: user_id => this.pickMember(id, group_id, user_id),
       recallMsg: (message_id, target_id, target_type) => this.simpleRecallMsg({ ...i, message_type: 'group', group_openid: i.group_id }, message_id, target_id || i.group_id, target_type || 'group'),
-      getMemberMap: () => i.bot.gml.get(group_id)
+      getMemberMap: () => i.bot.gml.get(group_id),
+      getjoinMsg: force => getQQBotJoinRequests(id, i.group_id, force === true || force === 1),
+      setGroupAddRequest: (flag, approve, reason, block) => setQQBotGroupAddRequest(id, flag, approve, reason, block),
+      getMuteMemberList: () => getQQBotMuteMemberList(id, i.group_id),
+      muteMember: (userOpenid, duration = 600) => muteQQBotMember(id, i.group_id, userOpenid, duration),
+      getGroupInfo: () => groupInfoStore.refreshInfo(id, i.group_id),
+      getBotState: () => groupInfoStore.refreshBotState(id, i.group_id),
+      refreshInfo: () => groupInfoStore.refreshGroup(id, i.group_id),
+      getinfo: () => groupInfoStore.getGroup(id, i.group_id),
+      refreshinfo: () => groupInfoStore.forceRefresh(id, i.group_id)
     }
   }
 
@@ -3707,7 +4068,7 @@ const adapter = new class QQBotAdapter {
     const _authorName = _author.username || '未知用户'
     const _authorTag = getQQBotMemberRoleTag(_author.member_role, _author.bot)
     const _msgType = event._qqbotFullMessageCreate ? '群全量消息' : '群@机器消息'
-    Bot.makeLog(logStat, `${_msgType}: [${_authorName}${_authorTag}]：[${data.group_id}, ${data.user_id}] ${data.raw_message}`, data.self_id)
+    Bot.makeLog(logStat, `${_msgType}: [${_authorName}${_authorTag}]：[${formatQQBotGroupLogTarget(data.self_id, data.group_openid || data.group_id, event.group_name || event.raw?.group_name)}, ${data.user_id}] ${data.raw_message}`, data.self_id)
 
     data.reply = msg => this.sendGroupMsg({
       ...data, group_id: event.group_id
@@ -3722,7 +4083,16 @@ const adapter = new class QQBotAdapter {
     if (rawUserOpenid && data.group_openid) {
       const historyAliases = getQQBotMessageAliases(event).filter(Boolean).filter(id => id !== data.message_id)
       await userManageStore.recordUser(data.self_id, rawUserOpenid, { nickname: event.author?.username || event.sender?.nickname || '', group_openid: data.group_openid })
-      await userManageStore.recordGroup(data.self_id, data.group_openid, { name: event.group_name || event.raw?.group_name || '' })
+      const cachedInfo = groupInfoStore.getInfo(data.self_id, data.group_openid)
+      await userManageStore.recordGroup(data.self_id, data.group_openid, {
+        name: cachedInfo?.group_name || event.group_name || event.raw?.group_name || '',
+        group_finger_memo: cachedInfo?.group_finger_memo || '',
+        group_class_text: cachedInfo?.group_class_text || '',
+        group_tags: cachedInfo?.group_tags || [],
+        group_member_num: cachedInfo?.group_member_num || 0
+      })
+      await groupInfoStore.recordGroup(data.self_id, data.group_openid)
+      groupInfoStore.recordTrigger(data.self_id, data.group_openid, event._qqbotFullMessageCreate === true ? 'full' : 'at')
       data.seq = await userManageStore.recordHistory(data.self_id, data.group_openid, { message_id: data.message_id || event.id || '', aliases: historyAliases, user_openid: rawUserOpenid, nickname: event.author?.username || event.sender?.nickname || '', bot: event.author?.bot === true, raw_message: data.raw_message, raw: event, time: event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '' })
       if (data.raw) data.raw.seq = data.seq
       if (ensureAdvancedWelcomeConfig(config, data.self_id).enabled) {
@@ -3806,7 +4176,7 @@ const adapter = new class QQBotAdapter {
       data.full_message = mentionState
       Bot.makeLog('debug', ['全量消息过滤状态', mentionState, { msg: data.raw_message, mentions: event._mentions || [] }], data.self_id)
       if (mentionState.shouldNotifyAll) {
-        Bot.makeLog('info', `[${data.self_id}] 全量消息@全体通知：[${data.group_id}, ${data.group_openid || '-'}, ${data.user_id}] ${data.raw_message}`, data.self_id)
+        Bot.makeLog('info', `[${data.self_id}] 全量消息@全体通知：[${formatQQBotGroupLogTarget(data.self_id, data.group_openid || data.group_id)}, ${data.user_id}] ${data.raw_message}`, data.self_id)
         try {
           await sendQQBotInternalMasterMsg(getFullMessageAllNotifyMsg(data))
         } catch (err) {
@@ -3884,9 +4254,14 @@ const adapter = new class QQBotAdapter {
   async setGroupMap (data) {
     if (!data.group_id) return
     if (!String(data.group_id).startsWith('qg_')) {
+      const rawGroupId = getRawQQBotGroupId(data, data.self_id, this.sep)
+      const cached = groupInfoStore.getGroup(data.self_id, rawGroupId)
       await data.bot.gl.set(data.group_id, {
         ...(data.bot.gl?.get?.(data.group_id) || {}),
-        group_id: data.group_id
+        group_id: data.group_id,
+        group_openid: rawGroupId,
+        ...(cached?.info || {}),
+        bot_state: cached?.bot_state || null
       })
     }
     let gml = data.bot.gml.get(data.group_id)
@@ -3899,6 +4274,21 @@ const adapter = new class QQBotAdapter {
       ...data.sender
     })
     data.group = data.bot.pickGroup(data.group_id)
+    const groupOpenid = getRawQQBotGroupId(data, data.self_id, this.sep)
+    const cache = groupInfoStore.getGroup(data.self_id, groupOpenid)
+    if (data.raw && cache) {
+      data.raw.qqbot_group_info = cache.info || null
+      data.raw.qqbot_bot_state = cache.bot_state || null
+      data.raw.group_name = cache.info?.group_name || ''
+      data.raw.group_member_num = cache.info?.group_member_num || 0
+      data.raw.member_openid = cache.bot_state?.member_openid || ''
+      data.raw.member_role = cache.bot_state?.member_role || ''
+      data.raw.allow_proactive_msg = cache.bot_state?.allow_proactive_msg
+      data.raw.qqbot_group_cache_status = {
+        info: cache.info?.error ? 'error' : cache.info?.fetched_at ? 'ok' : 'missing',
+        bot_state: cache.bot_state?.error ? (cache.bot_state.error.message.includes('管理员') ? '不是管理员' : 'error') : cache.bot_state?.fetched_at ? 'ok' : 'missing'
+      }
+    }
     this.wrapRecallResultReporter(data, data.group)
     if (data.user_id) data.member = data.bot.pickMember(data.group_id, data.user_id)
   }
@@ -4036,6 +4426,7 @@ const adapter = new class QQBotAdapter {
     const data = {
       raw: event,
       bot: Bot[id],
+      client: Object.assign(Object.create(Bot[id]), { getSystemMsg: getAllQQBotSystemMsg }),
       self_id: id,
       post_type: event.post_type,
       message_type: event.message_type,
@@ -4164,6 +4555,17 @@ const adapter = new class QQBotAdapter {
 
     const eventUserOpenid = normalizeQQBotOpenid(event.author?.id || event.author?.member_openid || event.sender?.user_id || event.operator_id || data.user_id || '')
     const eventGroupOpenid = data.group_openid || event.group_openid || event.raw?.group_openid || ''
+    if (data.raw && (data.message_type === 'group' || data.message_type === 'private') && !String(data.group_id || '').startsWith('qg_')) {
+      if (eventUserOpenid) data.raw.v_id = getVirtualAtIdFromEvent(data.self_id, event) || makeVirtualAtId(data.self_id, eventUserOpenid)
+      data.raw.is_has_new_join_request = joinRequestStore.hasUnread(data.self_id)
+      if (eventGroupOpenid) {
+        const cachedGroup = groupInfoStore.getGroup(data.self_id, eventGroupOpenid)
+        if (cachedGroup?.info) Object.assign(data.raw, { qqbot_group_info: cachedGroup.info, group_name: cachedGroup.info.group_name, group_member_num: cachedGroup.info.group_member_num })
+        if (cachedGroup?.bot_state) Object.assign(data.raw, { qqbot_bot_state: cachedGroup.bot_state, member_openid: cachedGroup.bot_state.member_openid, member_role: cachedGroup.bot_state.member_role, allow_proactive_msg: cachedGroup.bot_state.allow_proactive_msg })
+        groupInfoStore.scheduleRefresh(data.self_id, eventGroupOpenid, 'message', { info: true, botState: false })
+        if (!cachedGroup?.bot_state?.member_openid) groupInfoStore.scheduleRefresh(data.self_id, eventGroupOpenid, 'missing_member_openid', { info: false, botState: true })
+      }
+    }
     const cancelState = userManageStore.getCancel(data.self_id, eventUserOpenid)
     const activeCancelState = cancelState && Date.now() < Number(cancelState.block_until || Infinity)
     if (data.raw) data.raw.iscancelled = !!activeCancelState
@@ -4243,6 +4645,7 @@ const adapter = new class QQBotAdapter {
 
     const callback = data.bot.callback[event.data?.resolved?.button_id]
     const callbackGroupId = getRawQQBotGroupId(event, id, this.sep) || getRawQQBotGroupId(callback, id, this.sep)
+    if (callbackGroupId) groupInfoStore.scheduleRefresh(id, callbackGroupId, 'INTERACTION_CREATE', { info: true, botState: false })
     if (callback) {
       if (!event.group_id && callbackGroupId) event.group_id = callbackGroupId
       if (!event.group_openid && callbackGroupId) event.group_openid = callbackGroupId
@@ -4288,7 +4691,7 @@ const adapter = new class QQBotAdapter {
       case 'group':
         data.group_openid = callbackGroupId
         data.group_id = callbackGroupId ? `${id}${this.sep}${callbackGroupId}` : ''
-        Bot.makeLog('info', [`群按钮点击事件：[${data.group_id}, ${data.user_id}]`, data.raw_message], data.self_id)
+        Bot.makeLog('info', [`群按钮点击事件：[${formatQQBotGroupLogTarget(data.self_id, data.group_openid || data.group_id)}, ${data.user_id}]`, data.raw_message], data.self_id)
         data.reply = msg => this.sendGroupMsg(
           { ...data, group_id: callbackGroupId, group_openid: callbackGroupId },
           wrapWithEventId(msg)
@@ -4413,7 +4816,7 @@ const adapter = new class QQBotAdapter {
 
     // 群聊黑名单检查
     if (isGroup && Array.isArray(ib.disabledGroups) && ib.disabledGroups.includes(targetId)) {
-      Bot.makeLog('debug', [`[${selfId}] 群 ${targetId} 已在破冰黑名单中，跳过`], selfId)
+      Bot.makeLog('debug', [`[${selfId}] 群 ${formatQQBotGroupLogTarget(selfId, targetId)} 已在破冰黑名单中，跳过`], selfId)
       return
     }
 
@@ -4456,7 +4859,7 @@ const adapter = new class QQBotAdapter {
     try {
       const { data: result } = await bot.sdk.request.post(`${urlBase}/messages`, payload)
       await recordQQBotLocalMessageResponse({ self_id: selfId, target_id: targetId, type, author_openid: selfId, content_fingerprint: getQQBotMessageContentFingerprint(payload) }, result)
-      Bot.makeLog('info', [`[${selfId}] ${isGroup ? '群聊' : '私聊'}破冰发送成功`, { targetId, id: result?.id }], selfId)
+      Bot.makeLog('info', [`[${selfId}] ${isGroup ? '群聊' : '私聊'}破冰发送成功`, { targetId: isGroup ? formatQQBotGroupLogTarget(selfId, targetId) : targetId, id: result?.id }], selfId)
     } catch (err) {
       Bot.makeLog('warn', [`[${selfId}] ${isGroup ? '群聊' : '私聊'}破冰发送失败`, err.message, err.response?.data], selfId)
     }
@@ -4499,11 +4902,11 @@ const adapter = new class QQBotAdapter {
       const { data: result } = await bot.sdk.request.post(`/v2/groups/${groupOpenid}/messages`, payload)
       await advancedWelcomeStore.recordSendSuccess(selfId, groupOpenid, eventId)
       await recordQQBotLocalMessageResponse({ self_id: selfId, target_id: groupOpenid, type: 'group', author_openid: selfId, content_fingerprint: getQQBotMessageContentFingerprint(payload) }, result)
-      Bot.makeLog('info', [`[${selfId}] 高级群欢迎发送成功`, { groupOpenid, id: result?.id }], selfId)
+      Bot.makeLog('info', [`[${selfId}] 高级群欢迎发送成功`, { group: formatQQBotGroupLogTarget(selfId, groupOpenid), id: result?.id }], selfId)
     } catch (err) {
       const reason = err.response?.data?.message || err.message || '发送失败'
       await this._recordAdvancedWelcomeFailure(selfId, groupOpenid, reason)
-      Bot.makeLog('warn', [`[${selfId}] 高级群欢迎发送失败`, groupOpenid, reason, err.response?.data], selfId)
+      Bot.makeLog('warn', [`[${selfId}] 高级群欢迎发送失败`, formatQQBotGroupLogTarget(selfId, groupOpenid), reason, err.response?.data], selfId)
     }
   }
 
@@ -4642,6 +5045,7 @@ const adapter = new class QQBotAdapter {
           // GROUP_ADD_ROBOT: 记录 invite + 破冰
           const inviterOpenid = event.operator_id || ''
           const groupOpenid = getRawQQBotGroupId(event, data.self_id, this.sep)
+          if (groupOpenid) groupInfoStore.scheduleRefresh(data.self_id, groupOpenid, 'group_add', { info: true, botState: true })
           if (data.raw && groupOpenid) data.raw._qqbotFullMessageRecorded = isFullMessageGroupRecorded(data.self_id, groupOpenid)
           if (inviterOpenid) {
             inviteStore.recordGroupAdd(data.self_id, inviterOpenid, event.group_id, event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '')
@@ -4718,6 +5122,7 @@ const adapter = new class QQBotAdapter {
         break
       case 'member.increase':
         if (event.notice_type !== 'group') break
+        groupInfoStore.recordTrigger(data.self_id, event.group_openid || event.raw?.group_openid || data.group_openid || '', 'member')
         chatStore.setGroupMemberLeft(data.self_id, event.group_openid || event.raw?.group_openid || data.group_openid || data.group_id || '', event.member_openid || event.raw?.member_openid || data.member_openid || data.user_id || '', false).catch(err => {
           Bot.makeLog('debug', ['群排行入群状态更新失败', err.message], data.self_id)
         })
@@ -4744,6 +5149,7 @@ const adapter = new class QQBotAdapter {
         break
       case 'member.decrease':
         if (event.notice_type !== 'group') break
+        groupInfoStore.recordTrigger(data.self_id, event.group_openid || event.raw?.group_openid || data.group_openid || '', 'member')
         chatStore.setGroupMemberLeft(data.self_id, event.group_openid || event.raw?.group_openid || data.group_openid || data.group_id || '', event.member_openid || event.raw?.member_openid || data.member_openid || data.user_id || '', true).catch(err => {
           Bot.makeLog('debug', ['群排行退群状态更新失败', err.message], data.self_id)
         })
@@ -4764,7 +5170,6 @@ const adapter = new class QQBotAdapter {
             }
           }
         }
-        await Bot[data.self_id].dau.setDau('group_decrease', data)
         Bot.em(`${data.post_type}.${data.notice_type}.${data.sub_type}`, data)
         Bot.em(`${data.post_type}.${data.notice_type}.decrease`, { ...data, sub_type: 'decrease' })
         break
@@ -4773,11 +5178,123 @@ const adapter = new class QQBotAdapter {
         break
       case 'receive_open':
       case 'receive_close':
+        groupInfoStore.scheduleRefresh(id, data.group_openid || data.raw?.group_openid || '', 'receive_setting', { info: true, botState: true })
         Bot.em(`${data.post_type}.${data.notice_type}.${data.sub_type}`, data)
         break
       default:
         Bot.makeLog('warn', ['未知通知', event], id)
     }
+  }
+
+  async makeRequest (id, event) {
+    const groupOpenid = event.group_openid || event.raw?.group_openid || event.group_id || ''
+    const requestId = event.join_request_id || event.flag || event.raw?.join_request_id || ''
+    const memberOpenid = event.member_openid || event.user_id || event.raw?.member_openid || ''
+    if (event.request_type !== 'group' || event.sub_type !== 'add' || !groupOpenid || !requestId) return
+    const raw = event.raw || event
+    const officialPayload = { ...raw }
+    raw.is_has_new_join_request = true
+    raw.v_id = makeVirtualAtId(id, memberOpenid)
+    event.client = Object.assign(Object.create(Bot[id]), { getSystemMsg: getAllQQBotSystemMsg })
+    event.bot = Bot[id]
+    const request = await joinRequestStore.record({
+      ...raw,
+      official_payload: officialPayload,
+      self_id: id,
+      group_openid: groupOpenid,
+      join_request_id: requestId,
+      member_openid: memberOpenid,
+      user_openid: memberOpenid,
+      username: event.username || event.nickname || raw.username || '',
+      nickname: event.nickname || event.username || '',
+      application_time: event.apply_at || raw.apply_at || '',
+      source: event.apply_source || raw.apply_source || '',
+      request_source: 'event',
+      passive_received: true,
+      verification_info: event.verify_info || raw.verify_info || '',
+      risk: event.risk_tips || raw.risk_tips || ''
+    })
+    const refreshTask = groupInfoStore.scheduleRefresh(id, groupOpenid, 'join_request', { info: true, botState: true })
+    if (getBotConfigValue(id, 'joinNotify')) {
+      const verifyText = typeof raw.verify_info === 'object' ? JSON.stringify(raw.verify_info) : String(raw.verify_info || '-')
+      Promise.resolve(refreshTask).then(async cached => {
+        const state = cached?.bot_state || groupInfoStore.getBotState(id, groupOpenid)
+        const groupName = cached?.info?.group_name || getQQBotGroupDisplayName(id, groupOpenid) || groupOpenid
+        const botName = await getQQBotMeName(id)
+        const riskFields = getQQBotRiskFields(officialPayload)
+        const noticeMessage = [
+          `#[${id}]加群通知`,
+          '',
+          '',
+          `>群: ${escapeQQBotMarkdownText(groupName)}`,
+          '',
+          '',
+          `>用户: ${escapeQQBotMarkdownText(event.username || raw.username || memberOpenid)}`,
+          `>机器人: ${escapeQQBotMarkdownText(botName)}`,
+          `>openid: ${escapeQQBotMarkdownText(memberOpenid)}`,
+          `>验证: ${escapeQQBotMarkdownText(verifyText)}`,
+          `>风险: ${escapeQQBotMarkdownText(raw.risk_tips || '-')}`,
+          `>申请ID: ${escapeQQBotMarkdownText(requestId)}`,
+          ...(Object.keys(riskFields).length ? ['', '风险相关字段:', makeQQBotJsonCodeBlock(riskFields)] : []),
+          '',
+          '官方原始JSON:',
+          makeQQBotJsonCodeBlock(officialPayload),
+          '',
+          `><qqbot-cmd-input text="#QQBot查看加群申请详情 ${request.store_order}" show="查看申请详情"/>`,
+          '',
+          '><qqbot-cmd-input text="#QQBot查看加群申请 待处理 1" show="查看待处理"/>',
+          '',
+          `><qqbot-cmd-input text="#QQBot审批加群 ${request.store_order} 通过" show="同意申请"/>`,
+          '',
+          `><qqbot-cmd-input text="#QQBot审批加群 ${request.store_order} 拒绝" show="拒绝申请"/>`,
+          '',
+          `><qqbot-cmd-input text="#QQBot审批加群 ${request.store_order} 拒绝并拉黑" show="拒绝并拉黑"/>`
+        ].join('\n')
+        const noticeButtons = segment.button(
+          [{ text: '申请详情', callback: `#QQBot查看加群申请详情 ${request.store_order}` }, { text: '待处理', callback: '#QQBot查看加群申请 待处理 1' }],
+          [{ text: '同意申请', callback: `#QQBot审批加群 ${request.store_order} 通过` }, { text: '拒绝申请', callback: `#QQBot审批加群 ${request.store_order} 拒绝` }],
+          [{ text: '拒绝并拉黑', callback: `#QQBot审批加群 ${request.store_order} 拒绝并拉黑` }]
+        )
+        const notifyMode = getQQBotJoinNotifyMode(id)
+        if (notifyMode === 'master') return sendQQBotInternalMasterMsg(noticeMessage)
+        if (notifyMode === 'private') {
+          const userOpenid = String(getBotConfigValue(id, 'joinNotifyUserOpenid') || '')
+          if (!userOpenid) return sendQQBotInternalMasterMsg(noticeMessage)
+          try {
+            const result = await withQQBotInternalSend(() => this.sendFriendMsg(
+              { self_id: id, bot: Bot[id], user_id: userOpenid },
+              [noticeMessage, noticeButtons]
+            ))
+            if (result === false || result?.error?.length) throw new Error('主动私信通知发送失败')
+            return result
+          } catch {
+            return sendQQBotInternalMasterMsg(noticeMessage)
+          }
+        }
+        if (state?.allow_proactive_msg !== true) return sendQQBotInternalMasterMsg(noticeMessage)
+        try {
+          const result = await withQQBotInternalSend(() => this.sendGroupMsg(
+            { self_id: id, bot: Bot[id], group_id: groupOpenid, group_openid: groupOpenid },
+            [noticeMessage, noticeButtons]
+          ))
+          if (result === false || result?.error?.length) throw new Error('主动群通知发送失败')
+        } catch {
+          await sendQQBotInternalMasterMsg(noticeMessage)
+        }
+      }).catch(() => sendQQBotInternalMasterMsg(noticeMessage).catch(() => {}))
+    }
+    Bot.em('request.group.add', {
+      ...event,
+      raw,
+      self_id: id,
+      group_openid: groupOpenid,
+      group_id: groupOpenid,
+      user_id: memberOpenid,
+      member_openid: memberOpenid,
+      flag: requestId,
+      e: undefined,
+      reply: async () => false
+    })
   }
 
   getFriendMap (id) {
@@ -5268,7 +5785,7 @@ async connect (token) {
     mode: 'websocket'
   }
 
-  opts.intents.push('GROUP_AT_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE', 'GROUP_MEMBER_ADD', 'GROUP_MEMBER_REMOVE')
+  opts.intents.push('GROUP_AT_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE', 'GROUP_MEMBER_ADD', 'GROUP_MEMBER_REMOVE', 'GROUP_JOIN_REQUEST')
   if (Number(account.guildPrivate)) opts.intents.push('GUILD_MESSAGES')
   else opts.intents.push('PUBLIC_GUILD_MESSAGES')
 
@@ -5744,6 +6261,18 @@ async connect (token) {
 
     pickMember: (group_id, user_id) => this.pickMember(id, group_id, user_id),
     pickGroup: group_id => this.pickGroup(id, group_id),
+    getSystemMsg: async () => {
+      const groups = (await getAllQQBotGroups(id)).filter(group => {
+        const role = groupInfoStore.getBotState(id, group.openid)?.member_role
+        return role === 'admin' || role === 'owner'
+      })
+      const result = []
+      for (const group of groups) result.push(...await getQQBotJoinRequests(id, group.openid, true))
+      return result
+    },
+    setGroupAddRequest: (flag, approve, reason, block) => setQQBotGroupAddRequest(id, flag, approve, reason, block),
+    setGroupBan: (groupId, userId, duration) => muteQQBotMember(id, groupId, userId, duration),
+    getMuteMemberList: groupId => getQQBotMuteMemberList(id, groupId),
     getGroupMap () { return this.gl },
     gl: await this.getGroupMap(id),
     gml: await this.getMemberMap(id),
@@ -5767,6 +6296,10 @@ async connect (token) {
   sdk.pickFriend = userId => this.pickFriend(id, String(userId || ''))
   sdk.pickGroup = groupId => this.pickGroup(id, String(groupId || ''))
   sdk.pickMember = (groupId, userId) => this.pickMember(id, String(groupId || ''), String(userId || ''))
+  sdk.getSystemMsg = Bot[id].getSystemMsg
+  sdk.setGroupAddRequest = Bot[id].setGroupAddRequest
+  sdk.setGroupBan = Bot[id].setGroupBan
+  sdk.getMuteMemberList = Bot[id].getMuteMemberList
   sdk.recallPrivateMessage = (userId, messageId) => this.simpleRecallMsg({ self_id: id, bot: Bot[id], message_type: 'private', user_id: String(userId || '') }, messageId, String(userId || ''), 'user')
   sdk.recallGroupMessage = (groupId, messageId) => this.simpleRecallMsg({ self_id: id, bot: Bot[id], message_type: 'group', group_id: String(groupId || ''), group_openid: String(groupId || '') }, messageId, String(groupId || ''), 'group')
 
@@ -5964,6 +6497,8 @@ async connect (token) {
 
   Bot[id].sdk.on('message', event => enqueueQQBotMessage(this, id, event))
   Bot[id].sdk.on('notice', event => this.makeNotice(id, event).catch(err => Bot.makeLog('error', [`[${id}] 通知处理失败`, err.message], id)))
+  Bot[id].sdk.on('request', event => this.makeRequest(id, event).catch(err => Bot.makeLog('error', [`[${id}] 加群申请处理失败`, err.message], id)))
+  groupInfoStore.resumePending(id).catch(err => Bot.makeLog('warn', [`[${id}] 恢复群资料刷新任务失败`, err.message], id))
 
   // ===== 心跳超时检测 =====
   const heartbeatTimeoutMs = Number(getOfflineDetectConfig(id).heartbeatTimeout) || 60000  // 默认60秒
@@ -6158,7 +6693,9 @@ qqbotStoresReady = Promise.allSettled([
   timedStoreInit('invite', () => initInviteStore(config)),
   timedStoreInit('chat', () => chatStore.init()),
   timedStoreInit('advancedWelcome', () => advancedWelcomeStore.init()),
-  timedStoreInit('userManage', () => userManageStore.init())
+  timedStoreInit('userManage', () => userManageStore.init()),
+  timedStoreInit('joinRequest', () => joinRequestStore.init()),
+  timedStoreInit('groupInfo', () => groupInfoStore.init())
 ]).then(results => {
   const failures = results.filter(result => result.status === 'rejected').map(result => result.reason?.message || String(result.reason))
   if (!failures.length) return
@@ -6188,6 +6725,11 @@ export class QQBotAdapter extends plugin {
         {
           reg: /^#q+bot(帮助|help)$/i,
           fnc: 'help',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot恢复md$/i,
+          fnc: 'restoreHelpMarkdown',
           permission: config.permission
         },
         {
@@ -6266,8 +6808,13 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
-          reg: /^#q+bot普通设置(?:\s*(强制silk\s*(?:开启|关闭)|群事件\s*(?:开启|关闭)|查看(?:踢出|拉入)排行(?:\s+\d+)?))?$/i,
+          reg: /^#q+bot普通设置(?:\s*(强制silk\s*(?:开启|关闭)|群事件\s*(?:开启|关闭)|群聊主动菜单|查看(?:踢出|拉入)排行(?:\s+\d+)?))?$/i,
           fnc: 'normalSetting',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot群聊主动(?:菜单|配置(?:\s+[\s\S]+)?|预览|发送(?:\s+\d+)?|结果(?:\s+\d+)?|查看可主动群(?:\s+\d+)?)$/i,
+          fnc: 'groupProactiveCommand',
           permission: config.permission
         },
         {
@@ -6316,6 +6863,11 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
+          reg: /^#q+bot查看官方接口记录(?:\s+(\d+))?$/i,
+          fnc: 'fullMessageOfficialRecords',
+          permission: config.permission
+        },
+        {
           reg: /^#q+bot全量清空(确认)?$/i,
           fnc: 'fullMessageClear',
           permission: config.permission
@@ -6331,8 +6883,18 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
-          reg: /^#q+bot用户管理菜单(?:\s*(注销菜单|拉黑菜单|查询菜单|使用范围|删除群聊缓存发言(?:\s+确认)?|时间加\s*-?\d+(?:\.\d+)?))?$/i,
+          reg: /^#q+bot用户管理菜单(?:\s*(注销菜单|拉黑菜单|查询菜单|群管菜单|使用范围|删除群聊缓存发言(?:\s+确认)?|时间加\s*-?\d+(?:\.\d+)?))?$/i,
           fnc: 'userManageMenu',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot(?:刷新已保存群聊昵称|刷新群名\s+\S+|刷新所有群|刷新所有群身份|刷新全量群|查看机器管理(?:\s+\d+)?|群人数排行(?:\s+\d+)?|查看加群申请(?:\s+(?:全部|待处理|已通过|已拒绝|无法处理|已失效|已过期)(?:\s+\d+)?)?|查看加群申请详情\s+\S+|清空加群申请(?:确认)?|加群通知\s+(?:开启|关闭)|加群通知方式(?:\s+(?:群内|本人私信|所有主人))?)$/i,
+          fnc: 'groupManageCommand',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot审批加群\s+\S+\s+(?:通过|拒绝并拉黑|拒绝)(?:\s+[\s\S]+)?$/i,
+          fnc: 'groupManageCommand',
           permission: config.permission
         },
         {
@@ -6346,7 +6908,7 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
-          reg: /^#q+bot(?:查看最近发言|查看所有用户|查看所有好友|查看所有用户最近发言|搜索用户(?:\s+.+)?|查看用户所在群\s+\S+|查看所有群|查看所有群最近发言|查看群成员(?:\s+\S+)?|查看群最近发言(?:\s+\S+(?:\s+(?:\d+|#\d+))?)?|查看私聊最近发言(?:\s+\S+(?:\s+(?:\d+|#\d+))?)?|备注群名称\s+\S+\s+.+|备注真实群号\s+\S+\s+.+)(?:\s+\d+)?$/i,
+           reg: /^#q+bot(?:查看最近发言|查看所有用户|查看所有好友|查看所有用户最近发言|高级搜索(?:\s+.+)?|查看用户所在群\s+\S+|查看所有群|查看所有群最近发言|查看群成员(?:\s+\S+)?|查看群最近发言(?:\s+\S+(?:\s+(?:\d+|#\d+))?)?|查看私聊最近发言(?:\s+\S+(?:\s+(?:\d+|#\d+))?)?|备注群名称\s+\S+\s+.+|备注真实群号\s+\S+\s+.+)(?:\s+\d+)?$/i,
           fnc: 'userQueryCommand',
           permission: config.permission
         },
@@ -6568,11 +7130,26 @@ export class QQBotAdapter extends plugin {
     return false
   }
 
-  help () {
+  async help () {
   if (!this.guardOfficialBot()) return true
   const botConfig = ensureBotConfig(this.e.self_id)
   const od = getOfflineDetectConfig(this.e.self_id)
-  const isRawMarkdown = config.markdown?.[this.e.self_id] === 'raw'
+  let isRawMarkdown = config.markdown?.[this.e.self_id] === 'raw'
+  if (!isRawMarkdown && !qqbotHelpMarkdownTried.has(this.e.self_id)) {
+    qqbotHelpMarkdownTried.add(this.e.self_id)
+    const previous = config.markdown?.[this.e.self_id]
+    config.markdown[this.e.self_id] = 'raw'
+    const result = await this.reply({ type: 'markdown', data: '# QQBot 帮助' }, true)
+    const errors = result?.error || []
+    const failed = errors.length || /超过|限制|频率|失败/i.test(errors.map(item => item?.message || item).join(' '))
+    if (failed) config.markdown[this.e.self_id] = previous
+    else {
+      qqbotHelpMarkdownRestore.set(this.e.self_id, previous)
+      await configSave()
+      isRawMarkdown = true
+      await this.reply(['已自动开启当前机器人的原生Markdown\n\n><qqbot-cmd-input text="#QQBot恢复MD" show="恢复"/>', segment.button([{ text: '恢复', callback: '#QQBot恢复MD' }])], true)
+    }
+  }
   
   if (isRawMarkdown) {
     // Markdown 模式（带参数指令和按钮）
@@ -6688,6 +7265,17 @@ export class QQBotAdapter extends plugin {
     )
   }
 }
+
+  async restoreHelpMarkdown () {
+    if (!this.guardOfficialBot()) return true
+    if (!qqbotHelpMarkdownRestore.has(this.e.self_id)) return this.reply('没有可恢复的Markdown配置', true)
+    const previous = qqbotHelpMarkdownRestore.get(this.e.self_id)
+    if (typeof previous === 'undefined') delete config.markdown[this.e.self_id]
+    else config.markdown[this.e.self_id] = previous
+    qqbotHelpMarkdownRestore.delete(this.e.self_id)
+    await configSave()
+    return this.reply('已恢复原Markdown配置', true)
+  }
 
   refConfig () {
     if (!this.guardOfficialBot()) return true
@@ -6825,16 +7413,33 @@ export class QQBotAdapter extends plugin {
   async DAUStat () {
     if (!this.guardOfficialBot()) return true
     const pro = this.e.msg.includes('pro')
-    const uin = this.e.msg.replace(/^#q+botdau(pro)?/i, '') || this.e.self_id
-    const dau = Bot[uin]?.dau
-    if (!dau || !dau.dauDB) return false
-    const msg = await dau.getDauStatsMsg(this.e, pro)
-    if (msg.length) this.reply(msg, true)
+    const rest = this.e.msg.replace(/^#q+botdau(pro)?/i, '').trim()
+    const dau = Bot[this.e.self_id]?.dau
+    if (!dau || !dau.dauDB) return this.reply('DAU统计未开启', true)
+    let date = ''
+    if (rest) {
+      const match = /^(\d{2})[-/.]?(\d{2})$/.exec(rest)
+      if (!match) return this.reply('日期格式错误，请使用MM-DD、MMDD、MM/MM或MM.MM', true)
+      const year = new Date().getFullYear()
+      const month = Number(match[1])
+      const day = Number(match[2])
+      const parsed = new Date(year, month - 1, day)
+      if (parsed.getFullYear() !== year || parsed.getMonth() !== month - 1 || parsed.getDate() !== day) return this.reply('日期格式错误', true)
+      date = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+      const today = dau.today || new Date().toISOString().slice(0, 10)
+      if (date > today) return this.reply('不能查询未来日期', true)
+      const oldest = new Date(`${today}T00:00:00+08:00`)
+      oldest.setFullYear(oldest.getFullYear() - 1)
+      if (new Date(`${date}T00:00:00+08:00`) < oldest) return this.reply('只能查询最近一年内的数据', true)
+    }
+    const msg = await dau.getDauStatsMsg(this.e, pro, date)
+    if (msg) this.reply(msg, true)
+    else if (date) this.reply('该日期暂无DAU记录', true)
   }
 
   async callStat () {
     if (!this.guardOfficialBot()) return true
-    if (!getBotConfigValue(this.e.self_id, 'callStats')) return false
+    if (!getBotConfigValue(this.e.self_id, 'callStats')) return this.reply('调用统计未开启', true)
     const dau = this.e.bot.dau
     if (!dau || !dau.dauDB) return false
     const msg = dau.getCallStatsMsg(this.e)
@@ -6843,7 +7448,7 @@ export class QQBotAdapter extends plugin {
 
   async userStat () {
     if (!this.guardOfficialBot()) return true
-    if (!getBotConfigValue(this.e.self_id, 'userStats')) return false
+    if (!getBotConfigValue(this.e.self_id, 'userStats')) return this.reply('用户统计未开启', true)
     const dau = this.e.bot.dau
     if (!dau || !dau.dauDB) return false
     if (dau.dauDB === 'redis') {
@@ -7016,9 +7621,13 @@ export class QQBotAdapter extends plugin {
 
   async normalSetting () {
     if (!this.guardOfficialBot()) return true
-    const match = /^#q+bot普通设置(?:\s*(强制silk\s*(?:开启|关闭)|群事件\s*(?:开启|关闭)|查看(?:踢出|拉入)排行(?:\s+\d+)?))?$/i.exec(this.e.msg)
+     const match = /^#q+bot普通设置(?:\s*(强制silk\s*(?:开启|关闭)|群事件\s*(?:开启|关闭)|群聊主动菜单|查看(?:踢出|拉入)排行(?:\s+\d+)?))?$/i.exec(this.e.msg)
     const botConfig = ensureBotConfig(this.e.self_id)
     const action = match?.[1] || ''
+
+    if (action === '群聊主动菜单') {
+      return this.groupProactiveCommand()
+    }
 
     if (/^查看(?:踢出|拉入)排行/i.test(action)) {
       const isKick = action.includes('踢出')
@@ -7051,6 +7660,10 @@ export class QQBotAdapter extends plugin {
         '',
         '><qqbot-cmd-input text="#QQBot召回菜单" show="打开召回菜单"/>',
         '',
+        '>群聊主动消息',
+        '',
+        '><qqbot-cmd-input text="#QQBot普通设置 群聊主动菜单" show="打开群聊主动菜单"/>',
+        '',
         '>群记录排行',
         '',
         '><qqbot-cmd-input text="#QQBot普通设置 查看拉入排行" show="拉入排行"/>',
@@ -7074,10 +7687,13 @@ export class QQBotAdapter extends plugin {
           ],
           [
             { text: '召回菜单', callback: '#QQBot召回菜单' },
-            { text: '拉入排行', callback: '#QQBot普通设置 查看拉入排行' }
+            { text: '主动菜单', callback: '#QQBot普通设置 群聊主动菜单' }
           ],
           [
-            { text: '踢出排行', callback: '#QQBot普通设置 查看踢出排行' },
+            { text: '拉入排行', callback: '#QQBot普通设置 查看拉入排行' },
+            { text: '踢出排行', callback: '#QQBot普通设置 查看踢出排行' }
+          ],
+          [
             { text: '返回', callback: '#QQBot帮助' }
           ]
         )
@@ -7505,7 +8121,7 @@ export class QQBotAdapter extends plugin {
         [
           `#[${this.e.self_id}] 查询菜单`, '',
           '><qqbot-cmd-input text="#QQBot查看所有用户 1" show="所有用户"/>', '',
-          '><qqbot-cmd-input text="#QQBot搜索用户 用户名" show="搜索用户"/>', '',
+          '><qqbot-cmd-input text="#QQBot高级搜索 内容" show="高级搜索"/>', '',
           '><qqbot-cmd-input text="#QQBot查看用户所在群 openid" show="用户群"/>', '',
           '><qqbot-cmd-input text="#QQBot查看所有群 1" show="所有群"/>', '',
           '><qqbot-cmd-input text="#QQBot查看群成员 群openid 1" show="群成员"/>', '',
@@ -7516,13 +8132,36 @@ export class QQBotAdapter extends plugin {
         ].join('\n'),
         segment.button(
           [{ text: '所有用户', callback: '#QQBot查看所有用户 1' }, { text: '所有群', callback: '#QQBot查看所有群 1' }],
-          [{ text: '搜索用户', input: '#QQBot搜索用户 ' }, { text: '用户群', input: '#QQBot查看用户所在群 ' }],
+          [{ text: '高级搜索', input: '#QQBot高级搜索 ' }, { text: '用户群', input: '#QQBot查看用户所在群 ' }],
           [{ text: '群成员', input: '#QQBot查看群成员 ' }, { text: '最近发言', callback: '#QQBot查看最近发言' }],
           [{ text: '备注群名', input: '#QQBot备注群名称 ' }, { text: '备注群号', input: '#QQBot备注真实群号 ' }],
           [{ text: '查绑定全量', callback: '#QQBot查看用户绑定全量 1' }, { text: '返回', callback: '#QQBot用户管理菜单' }]
         )
       ], true)
       return
+    }
+    if (/群管菜单/i.test(msg)) {
+      return this.reply([
+        [
+          `#[${this.e.self_id}] 群管菜单`,
+          '',
+           '><qqbot-cmd-input text="#QQBot刷新已保存群聊昵称" show="刷新所有昵称"/>',
+           '><qqbot-cmd-input text="#QQBot刷新所有群身份" show="刷新所有群身份"/>',
+           '><qqbot-cmd-input text="#QQBot查看机器管理" show="查看机器管理"/>',
+           '><qqbot-cmd-input text="#QQBot群人数排行 1" show="群人数排行"/>',
+            '><qqbot-cmd-input text="#QQBot查看加群申请" show="加群申请菜单"/>',
+            '><qqbot-cmd-input text="#QQBot清空加群申请" show="清空加群申请"/>',
+            '><qqbot-cmd-input text="#QQBot加群通知方式" show="加群通知方式"/>',
+           `><qqbot-cmd-input text="#QQBot加群通知 ${getBotConfigValue(this.e.self_id, 'joinNotify') ? '关闭' : '开启'}" show="${getBotConfigValue(this.e.self_id, 'joinNotify') ? '关闭' : '开启'}加群通知"/>`
+        ].join('\n'),
+        segment.button(
+        [{ text: '刷新昵称', callback: '#QQBot刷新已保存群聊昵称' }, { text: '刷新身份', callback: '#QQBot刷新所有群身份' }],
+        [{ text: '查看机器管理', callback: '#QQBot查看机器管理' }, { text: '群人数排行', callback: '#QQBot群人数排行 1' }],
+        [{ text: '加群申请', callback: '#QQBot查看加群申请' }, { text: '通知方式', callback: '#QQBot加群通知方式' }],
+        [{ text: '清空申请', callback: '#QQBot清空加群申请' }, { text: `${getBotConfigValue(this.e.self_id, 'joinNotify') ? '关' : '开'}加群通知`, callback: `#QQBot加群通知 ${getBotConfigValue(this.e.self_id, 'joinNotify') ? '关闭' : '开启'}` }],
+        [{ text: '返回', callback: '#QQBot用户管理菜单 查询菜单' }]
+        )
+      ], true)
     }
     if (/删除群聊缓存发言/i.test(msg)) {
       if (/确认/i.test(msg)) {
@@ -7567,6 +8206,7 @@ export class QQBotAdapter extends plugin {
         '><qqbot-cmd-input text="#QQBot用户管理菜单 注销菜单" show="注销菜单"/>', '',
         '><qqbot-cmd-input text="#QQBot用户管理菜单 拉黑菜单" show="拉黑菜单"/>', '',
         '><qqbot-cmd-input text="#QQBot用户管理菜单 查询菜单" show="查询菜单"/>', '',
+        '><qqbot-cmd-input text="#QQBot用户管理菜单 群管菜单" show="群管菜单"/>', '',
         '><qqbot-cmd-input text="#QQBot用户管理菜单 使用范围" show="使用范围"/>', '',
         '><qqbot-cmd-input text="#QQBot用户管理菜单 删除群聊缓存发言" show="删发言缓存"/>', '',
         '><qqbot-cmd-input text="#QQBot用户管理菜单 时间加 0" show="时间加0"/>', '',
@@ -7579,7 +8219,7 @@ export class QQBotAdapter extends plugin {
         [{ text: '查询菜单', callback: '#QQBot用户管理菜单 查询菜单' }, { text: '使用范围', callback: '#QQBot用户管理菜单 使用范围' }],
         [{ text: '删缓存', callback: '#QQBot用户管理菜单 删除群聊缓存发言' }, { text: '时间+0', callback: '#QQBot用户管理菜单 时间加 0' }],
         [{ text: '时间+8', callback: '#QQBot用户管理菜单 时间加 8' }, { text: `${um.uaEnabled ? '关' : '开'}UA`, callback: `#QQBot用户管理 ua${um.uaEnabled ? '关闭' : '开启'}` }],
-        [{ text: '设置UA', input: '#QQBot用户管理 设置ua ' }]
+        [{ text: '设置UA', input: '#QQBot用户管理 设置ua ' }, { text: '群管菜单', callback: '#QQBot用户管理菜单 群管菜单' }]
       )
     ], true)
   }
@@ -7700,6 +8340,414 @@ export class QQBotAdapter extends plugin {
     this.reply(`已${enabled ? '拉黑' : '删除拉黑'}${m[2]} ${target}${enabled && reason ? `\n\n>理由: ${reason}` : ''}`, true)
   }
 
+  async groupManageCommand () {
+    if (!this.guardOfficialBot()) return true
+    const msg = String(this.e.msg || '')
+    const queueBatch = (groups, reason, options, label) => {
+      const refreshTypes = [
+        options.info !== false && 'info',
+        options.botState !== false && 'bot_state'
+      ].filter(Boolean)
+      const batchKeys = refreshTypes.map(type => `${this.e.self_id}:${type}`)
+      const busyType = refreshTypes.find((type, index) => qqbotGroupRefreshBatches.has(batchKeys[index]))
+      if (busyType) return { started: false, busyType }
+      const startedAt = Date.now() - 1000
+      const tasks = groups.map(group => groupInfoStore.scheduleRefresh(this.e.self_id, group.openid, reason, options).then(async cached => {
+        const errors = [options.info !== false && cached?.info?.error, options.botState !== false && cached?.bot_state?.error].filter(Boolean)
+        const refreshError = errors.find(error => error.message !== '不是管理员' && Date.parse(error.at || '') >= startedAt)
+        if (refreshError) throw new Error(refreshError.message || '群资料刷新失败')
+        if (options.info !== false && cached?.info?.group_name) await userManageStore.setGroupRemark(this.e.self_id, group.openid, 'remark_name', cached.info.group_name)
+        const runtimeGroup = Bot[this.e.self_id]?.gl?.get?.(group.openid) || {}
+        await Bot[this.e.self_id]?.gl?.set?.(group.openid, {
+          ...runtimeGroup,
+          group_id: runtimeGroup.group_id || group.openid,
+          group_openid: group.openid,
+          ...(cached?.info || {}),
+          bot_state: cached?.bot_state || runtimeGroup.bot_state || null
+        })
+        return cached
+      }))
+      const completion = Promise.allSettled(tasks).then(async results => {
+        const failed = results.filter(item => item.status === 'rejected').length
+        const text = `${label}完成，共${results.length}个群，失败${failed}个`
+        try {
+          const result = await this.reply(text, true)
+          if (result?.error?.length) throw new Error('当前环境发送失败')
+        } catch { await sendQQBotInternalMasterMsg(text) }
+      })
+      for (const key of batchKeys) qqbotGroupRefreshBatches.set(key, completion)
+      completion.finally(() => {
+        for (const key of batchKeys) {
+          if (qqbotGroupRefreshBatches.get(key) === completion) qqbotGroupRefreshBatches.delete(key)
+        }
+      }).catch(() => {})
+      return { started: true }
+    }
+    if (/刷新已保存群聊昵称/i.test(msg)) {
+      const groups = await getAllQQBotGroups(this.e.self_id)
+      const result = queueBatch(groups, 'manual_info', { info: true, botState: false }, '群昵称刷新')
+      if (!result.started) return this.reply('已有群昵称刷新队列正在执行，请等待完成后再试', true)
+      return this.reply(`已加入刷新队列，共${groups.length}个群`, true)
+    }
+    let match = /^#q+bot刷新群名\s+(\S+)$/i.exec(msg)
+    if (match) {
+      const group = await groupInfoStore.refreshInfo(this.e.self_id, match[1])
+      if (group?.info?.error) return this.reply(`群名刷新失败: ${group.info.error.message || '官方接口请求失败'}，保持原数据`, true)
+      if (group?.info?.group_name) await userManageStore.setGroupRemark(this.e.self_id, match[1], 'remark_name', group.info.group_name)
+      return this.reply(group?.info?.group_name ? `群名已刷新：${group.info.group_name}` : '群名刷新失败，保持原数据', true)
+    }
+    if (/刷新所有群身份/i.test(msg)) {
+      const groups = await getAllQQBotGroups(this.e.self_id)
+      const result = queueBatch(groups, 'manual_bot_state', { info: false, botState: true }, '群身份刷新')
+      if (!result.started) return this.reply('已有群身份刷新队列正在执行，请等待完成后再试', true)
+      return this.reply(`已加入群身份刷新队列，共${groups.length}个群`, true)
+    }
+    if (/刷新所有群/i.test(msg)) {
+      const groups = await getAllQQBotGroups(this.e.self_id)
+      const result = queueBatch(groups, 'manual_all', { info: true, botState: true }, '群资料刷新')
+      if (!result.started) return this.reply(`已有${result.busyType === 'info' ? '群昵称' : '群身份'}刷新队列正在执行，请等待完成后再试`, true)
+      return this.reply(`已加入群资料刷新队列，共${groups.length}个群`, true)
+    }
+    if (/刷新全量群/i.test(msg)) {
+      const groups = (await getAllQQBotGroups(this.e.self_id)).filter(group => isFullMessageGroupRecorded(this.e.self_id, group.openid) || userManageStore.isFullGroupEventSeen(this.e.self_id, group.openid))
+      const result = queueBatch(groups, 'full_groups', { info: false, botState: true }, '全量群状态刷新')
+      if (!result.started) return this.reply('已有全量群身份刷新队列正在执行，请等待完成后再试', true)
+      return this.reply(`已加入全量群状态刷新队列，共${groups.length}个群`, true)
+    }
+    match = /^#q+bot查看机器管理(?:\s+(\d+))?$/i.exec(msg)
+    if (match) {
+      const groups = await getAllQQBotGroups(this.e.self_id)
+      const managed = groups.filter(group => groupInfoStore.getBotState(this.e.self_id, group.openid)?.member_role === 'admin' || groupInfoStore.getBotState(this.e.self_id, group.openid)?.member_role === 'owner')
+      const pageSize = 20
+      const pageCount = Math.max(1, Math.ceil(managed.length / pageSize))
+      const page = Math.min(pageCount, Math.max(1, Number(match[1]) || 1))
+      const body = managed.slice((page - 1) * pageSize, page * pageSize).map((item, index) => `${(page - 1) * pageSize + index + 1}. ${groupInfoStore.getInfo(this.e.self_id, item.openid)?.group_name || item.openid}\n${item.openid} ${groupInfoStore.getBotState(this.e.self_id, item.openid)?.member_role || '-'}`).join('\n\n') || '暂无缓存的管理群'
+      const rows = [
+        ...this._pageButtonRows('#QQBot查看机器管理', { page, pageCount }),
+        [{ text: '群管菜单', callback: '#QQBot用户管理菜单 群管菜单' }]
+      ].slice(0, 5)
+      return this.reply([`#[${this.e.self_id}] 机器管理群 ${page}/${pageCount}\n\n\`\`\`text\n${body}\n\`\`\`\n\n><qqbot-cmd-input text="#QQBot用户管理菜单 群管菜单" show="返回群管菜单"/>`, segment.button(...rows)], true)
+    }
+    match = /^#q+bot群人数排行(?:\s+(\d+))?$/i.exec(msg)
+    if (match) {
+      const list = await groupInfoStore.listMemberCountRank(this.e.self_id)
+      const page = Math.max(1, Number(match[1]) || 1)
+      const rows = list.slice((page - 1) * 20, page * 20)
+      const body = rows.map((item, index) => `${(page - 1) * 20 + index + 1}. ${item.info?.group_name || item.group_openid} ${Number.isFinite(Number(item.info?.group_member_num)) ? Number(item.info.group_member_num) : '未知'}人`).join('\n') || '暂无群资料缓存'
+      return this.reply([`#[${this.e.self_id}] 群人数排行 ${page}/${Math.max(1, Math.ceil(list.length / 20))}\n\n\`\`\`text\n${body}\n\`\`\``, segment.button(...this._pageButtonRows('#QQBot群人数排行', { page, pageCount: Math.max(1, Math.ceil(list.length / 20)) }), [{ text: '群管菜单', callback: '#QQBot用户管理菜单 群管菜单' }])], true)
+    }
+    match = /^#q+bot审批加群\s+(\S+)\s+(通过|拒绝并拉黑|拒绝)(?:\s+([\s\S]+))?$/i.exec(msg)
+    if (match) {
+      const request = /^\d+$/.test(match[1])
+        ? joinRequestStore.findBySequence(this.e.self_id, match[1])
+        : joinRequestStore.findByFlag(this.e.self_id, match[1])
+      if (!request) {
+        const ownerRequest = /^\d+$/.test(match[1])
+          ? joinRequestStore.findAnyBySequence(match[1])
+          : joinRequestStore.findAnyByFlag(match[1])
+        if (ownerRequest && ownerRequest.self_id !== String(this.e.self_id)) {
+          const targetBot = ownerRequest.self_id
+          const me = await getQQBotMeInfo(targetBot)
+          return this.reply(`该加群申请属于机器人${targetBot}(${me.name})，请前往机器人${targetBot}处理\n\n[点击前往](${me.link})`, true)
+        }
+      }
+      if (request && request.status !== 'pending') return this.reply(`该申请已处理，当前状态: ${request.status}`, true)
+      try {
+        const result = await setQQBotGroupAddRequest(this.e.self_id, match[1], match[2] === '通过', (match[3] || '').trim(), match[2] === '拒绝并拉黑')
+        if (result.status === 'unprocessable') return this.reply(result.message, true)
+        if (result.status === 'approved' && match[2] !== '通过') return this.reply(`已通过加群申请 ${match[1]}（${result.message}）`, true)
+        return this.reply(`已${match[2]}加群申请 ${match[1]}`, true)
+      } catch (err) {
+        return this.reply(`审批失败: ${err.message}`, true)
+      }
+    }
+    if (/^#q+bot清空加群申请确认$/i.test(msg)) {
+      const count = await joinRequestStore.clear(this.e.self_id)
+      return this.reply(`已清空 ${count} 条加群申请记录`, true)
+    }
+    if (/^#q+bot清空加群申请$/i.test(msg)) {
+      const count = joinRequestStore.list(this.e.self_id, { limit: 1, mark_seen: false }).total
+      return this.reply([`将清空当前机器人保存的 ${count} 条加群申请记录。\n\n此操作不会删除群、用户、发言或其他功能数据。`, segment.button([{ text: '确认清空', callback: '#QQBot清空加群申请确认' }, { text: '申请菜单', callback: '#QQBot查看加群申请' }])], true)
+    }
+    if (/^#q+bot查看加群申请$/i.test(msg)) {
+      const count = status => joinRequestStore.list(this.e.self_id, { status, limit: 1, mark_seen: false }).total
+      return this.reply([
+        [
+          `#[${this.e.self_id}] 加群申请菜单`, '',
+          `>待处理: ${count('pending')}`,
+          `>已通过: ${count('approved')}`,
+          `>已拒绝: ${count('declined')}`,
+          `>无法处理: ${count('unprocessable')}`,
+          `>已失效: ${count('invalidated')}`,
+          `>已过期: ${count('expired')}`,
+          `>全部: ${joinRequestStore.list(this.e.self_id, { limit: 1, mark_seen: false }).total}`,
+          '',
+          '>审批格式: #QQBot审批加群 序号/flag 通过、拒绝或拒绝并拉黑 [理由]',
+          '>详情格式: #QQBot查看加群申请详情 序号/flag'
+        ].join('\n'),
+        segment.button(
+          [{ text: '待处理', callback: '#QQBot查看加群申请 待处理 1' }, { text: '已通过', callback: '#QQBot查看加群申请 已通过 1' }],
+          [{ text: '已拒绝', callback: '#QQBot查看加群申请 已拒绝 1' }, { text: '无法处理', callback: '#QQBot查看加群申请 无法处理 1' }],
+          [{ text: '已失效', callback: '#QQBot查看加群申请 已失效 1' }, { text: '已过期', callback: '#QQBot查看加群申请 已过期 1' }],
+          [{ text: '全部', callback: '#QQBot查看加群申请 全部 1' }, { text: '清空申请', callback: '#QQBot清空加群申请' }]
+        )
+      ], true)
+    }
+    match = /^#q+bot查看加群申请\s+(全部|待处理|已通过|已拒绝|无法处理|已失效|已过期)(?:\s+(\d+))?$/i.exec(msg)
+    if (match) {
+      const statusMap = { 待处理: 'pending', 已通过: 'approved', 已拒绝: 'declined', 无法处理: 'unprocessable', 已失效: 'invalidated', 已过期: 'expired' }
+      const statusLabel = match[1]
+      const page = joinRequestStore.list(this.e.self_id, { status: statusMap[statusLabel], limit: 20, page: match[2] || 1, mark_seen: true })
+      if (!page.list.length) return this.reply('暂无加群申请', true)
+      const body = page.list.map(item => `${item.store_order}. ${item.nickname || item.member_openid || item.applicant_openid || '-'}\n群: ${formatQQBotGroupLogTarget(this.e.self_id, item.group_openid)}\n状态: ${item.status}\n申请ID: ${item.join_request_id}\n验证: ${typeof item.verification_info === 'object' ? JSON.stringify(item.verification_info) : item.verification_info || '-'}\n详情: #QQBot查看加群申请详情 ${item.store_order}`).join('\n\n')
+      const rows = [
+        ...this._pageButtonRows(`#QQBot查看加群申请 ${statusLabel}`, page),
+        ...(statusLabel === '待处理' && page.list[0]
+          ? [[
+              { text: '同意首条', callback: `#QQBot审批加群 ${page.list[0].store_order} 通过` },
+              { text: '拒绝首条', callback: `#QQBot审批加群 ${page.list[0].store_order} 拒绝` }
+            ]]
+          : []),
+        [{ text: '状态菜单', callback: '#QQBot查看加群申请' }, { text: '清空申请', callback: '#QQBot清空加群申请' }],
+        [{ text: '群管菜单', callback: '#QQBot用户管理菜单 群管菜单' }]
+      ].slice(0, 5)
+      return this.reply([`#[${this.e.self_id}] 加群申请 ${statusLabel} ${page.page}/${page.pageCount}\n\n\`\`\`text\n${body}\n\`\`\``, segment.button(...rows)], true)
+    }
+    match = /^#q+bot查看加群申请详情\s+(\S+)$/i.exec(msg)
+    if (match) {
+      const item = /^\d+$/.test(match[1])
+        ? joinRequestStore.findBySequence(this.e.self_id, match[1])
+        : joinRequestStore.findByFlag(this.e.self_id, match[1])
+      if (!item) return this.reply('未找到加群申请', true)
+      const officialPayload = item.official_payload && typeof item.official_payload === 'object' ? item.official_payload : item
+      const record = {
+        序号: item.store_order,
+        状态: item.status,
+        群: formatQQBotGroupLogTarget(this.e.self_id, item.group_openid),
+        申请ID: item.join_request_id,
+        申请人openid: item.applicant_openid || item.member_openid || item.user_openid || '',
+        申请时间: item.application_time || '',
+        本地接收来源: item.request_source || '',
+        接收时间: item.created_at || '',
+        最后更新: item.updated_at || '',
+        审批时间: item.resolved_at || '',
+        拒绝理由: item.reason || '',
+        加入黑名单: item.block === true
+      }
+      return this.reply([`#[${this.e.self_id}] 加群申请详情\n\n\`\`\`text\n${JSON.stringify(record, null, 2)}\n\`\`\`\n\n官方原始JSON\n\`\`\`json\n${JSON.stringify(officialPayload, null, 2)}\n\`\`\``, segment.button([{ text: '申请菜单', callback: '#QQBot查看加群申请' }, { text: '群管菜单', callback: '#QQBot用户管理菜单 群管菜单' }])], true)
+    }
+    match = /^#q+bot加群通知\s+(开启|关闭)$/i.exec(msg)
+    if (match) {
+      setBotConfigValue(this.e.self_id, 'joinNotify', match[1] === '开启')
+      await configSave()
+      return this.reply(`加群通知已${match[1]}`, true)
+    }
+    match = /^#q+bot加群通知方式(?:\s+(群内|本人私信|所有主人))?$/i.exec(msg)
+    if (match) {
+      const modeMap = { 群内: 'group', 本人私信: 'private', 所有主人: 'master' }
+      const targetMode = modeMap[match[1]]
+      if (targetMode) {
+        setBotConfigValue(this.e.self_id, 'joinNotifyMode', targetMode)
+        if (targetMode === 'private') {
+          const userOpenid = this._userOpenidFromEvent()
+          if (!userOpenid) return this.reply('未识别当前管理者openid，无法设置本人私信', true)
+          setBotConfigValue(this.e.self_id, 'joinNotifyUserOpenid', userOpenid)
+        }
+        await configSave()
+        return this.reply(`加群通知方式已设为${getQQBotJoinNotifyModeLabel(targetMode)}${targetMode === 'private' ? `，接收人: ${getBotConfigValue(this.e.self_id, 'joinNotifyUserOpenid')}` : ''}`, true)
+      }
+      const mode = getQQBotJoinNotifyMode(this.e.self_id)
+      const recipient = getBotConfigValue(this.e.self_id, 'joinNotifyUserOpenid')
+      return this.reply([
+        [
+          `#[${this.e.self_id}] 加群通知方式`,
+          '',
+          `>当前: ${getQQBotJoinNotifyModeLabel(mode)}`,
+          mode === 'private' ? `>本人openid: ${recipient || '未设置'}` : '',
+          '',
+          '>群内通知: 优先发申请所在群，失败后通知所有主人。',
+          '>本人私信: 发给当前设置者，失败后通知所有主人。',
+          '>所有主人: 直接通知所有主人。'
+        ].filter(Boolean).join('\n'),
+        segment.button(
+          [{ text: '群内通知', callback: '#QQBot加群通知方式 群内' }, { text: '本人私信', callback: '#QQBot加群通知方式 本人私信' }],
+          [{ text: '所有主人', callback: '#QQBot加群通知方式 所有主人' }, { text: '群管菜单', callback: '#QQBot用户管理菜单 群管菜单' }]
+        )
+      ], true)
+    }
+  }
+
+  async groupProactiveCommand () {
+    if (!this.guardOfficialBot()) return true
+    const selfId = this.e.self_id
+    const msg = String(this.e.msg || '')
+    const settings = ensureGroupProactiveConfig(selfId)
+    const groups = await getAllQQBotGroups(selfId)
+    const allowedGroups = groups.filter(group => groupInfoStore.getBotState(selfId, group.openid)?.allow_proactive_msg === true)
+    const menu = () => this.reply([
+      [
+        `#[${selfId}] 群聊主动菜单`, '',
+        `>允许主动消息群: ${allowedGroups.length}/${groups.length}`,
+        '',
+        `>消息内容: ${settings.markdown ? '已设置' : '未设置'}`,
+        '',
+        `>按钮: ${settings.buttonEnabled ? '开启' : '关闭'}${settings.button ? '' : '(未配置)'}`,
+        '',
+        '>发送仅面向缓存中 allow_proactive_msg=true 的群。',
+        '',
+        '><qqbot-cmd-input text="#QQBot群聊主动配置" show="打开主动配置"/>',
+        '',
+        '><qqbot-cmd-input text="#QQBot群聊主动预览" show="预览主动消息"/>',
+        '',
+        '><qqbot-cmd-input text="#QQBot群聊主动查看可主动群 1" show="查看可主动群"/>',
+        '',
+        `><qqbot-cmd-input text="#QQBot群聊主动发送 ${allowedGroups.length}" show="发送全部可用群"/>`
+      ].join('\n'),
+      segment.button(
+        [{ text: '主动配置', callback: '#QQBot群聊主动配置' }, { text: '主动预览', callback: '#QQBot群聊主动预览' }],
+        [{ text: '可主动群', callback: '#QQBot群聊主动查看可主动群 1' }, { text: '发送群聊', callback: `#QQBot群聊主动发送 ${allowedGroups.length}` }],
+        [{ text: '发送结果', callback: '#QQBot群聊主动结果 1' }, { text: '刷新状态', callback: '#QQBot刷新所有群' }],
+        [{ text: '返回', callback: '#QQBot普通设置' }]
+      )
+    ], true)
+
+    if (/^#q+bot(?:普通设置\s+)?群聊主动菜单$/i.test(msg)) return menu()
+    const groupsMatch = /^#q+bot群聊主动查看可主动群(?:\s+(\d+))?$/i.exec(msg)
+    if (groupsMatch) {
+      const pageSize = 20
+      const pageCount = Math.max(1, Math.ceil(allowedGroups.length / pageSize))
+      const page = Math.min(pageCount, Math.max(1, Number(groupsMatch[1]) || 1))
+      const list = allowedGroups.slice((page - 1) * pageSize, page * pageSize)
+      const body = list.length
+        ? list.map((group, index) => {
+            const info = groupInfoStore.getInfo(selfId, group.openid)
+            const state = groupInfoStore.getBotState(selfId, group.openid)
+            return `${(page - 1) * pageSize + index + 1}. ${info?.group_name || group.openid}\n${group.openid} 角色:${state?.member_role || '-'}`
+          }).join('\n\n')
+        : '暂无允许主动消息的群，请先刷新群状态'
+      const rows = [
+        ...this._pageButtonRows('#QQBot群聊主动查看可主动群', { page, pageCount }),
+        [{ text: '主动菜单', callback: '#QQBot群聊主动菜单' }, { text: '刷新状态', callback: '#QQBot刷新所有群' }]
+      ].slice(0, 5)
+      return this.reply([`#[${selfId}] 可主动群 ${page}/${pageCount}\n\n\`\`\`text\n${body}\n\`\`\`\n\n><qqbot-cmd-input text="#QQBot群聊主动菜单" show="返回主动菜单"/>`, segment.button(...rows)], true)
+    }
+    if (/^#q+bot群聊主动配置$/i.test(msg)) {
+      return this.reply([
+        [
+          `#[${selfId}] 群聊主动配置`, '',
+          `>消息内容: ${settings.markdown ? '已设置' : '未设置'}`,
+          '',
+          `>按钮: ${settings.buttonEnabled ? '开启' : '关闭'}${settings.button ? '' : '(未配置)'}`
+        ].join('\n'),
+        segment.button(
+          [{ text: '设置内容', input: '#QQBot群聊主动配置 Markdown ' }, { text: '清空内容', callback: '#QQBot群聊主动配置 Markdown 清空' }],
+          [{ text: '设置按钮', input: '#QQBot群聊主动配置 button ' }, { text: `${settings.buttonEnabled ? '关' : '开'}按钮`, callback: `#QQBot群聊主动配置 button ${settings.buttonEnabled ? '关闭' : '开启'}` }],
+          [{ text: '删按钮', callback: '#QQBot群聊主动配置 button 删除' }, { text: '主动预览', callback: '#QQBot群聊主动预览' }],
+          [{ text: '返回', callback: '#QQBot群聊主动菜单' }]
+        )
+      ], true)
+    }
+
+    const configMatch = /^#q+bot群聊主动配置\s+([\s\S]+)$/i.exec(msg)
+    if (configMatch) {
+      const args = configMatch[1].trim()
+      let match = /^markdown\s+([\s\S]+)$/i.exec(args)
+      if (match) {
+        const content = match[1].trim()
+        if (content === '清空') {
+          settings.markdown = ''
+          settings.button = null
+          settings.buttonEnabled = false
+          await configSave()
+          return this.reply('群聊主动消息内容和按钮已清空', true)
+        }
+        settings.markdown = content
+        await configSave()
+        return this.reply('群聊主动消息内容已设置', true)
+      }
+      match = /^button\s*(删除|清空)$/i.exec(args)
+      if (match) {
+        settings.button = null
+        settings.buttonEnabled = false
+        await configSave()
+        return this.reply('群聊主动按钮已删除', true)
+      }
+      match = /^button\s*(开启|关闭)$/i.exec(args)
+      if (match) {
+        const enabled = match[1] === '开启'
+        if (enabled && !settings.markdown) return this.reply('请先设置群聊主动消息内容，平台禁止单发按钮', true)
+        if (enabled && !settings.button) return this.reply('请先配置群聊主动按钮数据', true)
+        settings.buttonEnabled = enabled
+        await configSave()
+        return this.reply(`群聊主动按钮已${match[1]}`, true)
+      }
+      match = /^button\s*(\{[\s\S]+\})$/i.exec(args)
+      if (match) {
+        if (!settings.markdown) return this.reply('请先设置群聊主动消息内容，平台禁止单发按钮', true)
+        try {
+          settings.button = JSON.parse(match[1].replace(/[\r\n]/g, ''))
+          settings.buttonEnabled = true
+          await configSave()
+          return this.reply('群聊主动按钮已设置并开启', true)
+        } catch (err) {
+          return this.reply(`JSON解析失败: ${err.message}`, true)
+        }
+      }
+      return this.reply('未知群聊主动配置参数', true)
+    }
+
+    if (/^#q+bot群聊主动预览$/i.test(msg)) {
+      if (!settings.markdown) return this.reply('未设置群聊主动消息内容，无法预览', true)
+      const buttons = settings.buttonEnabled && settings.button ? [{ type: 'raw', data: { type: 'keyboard', content: settings.button } }] : []
+      return this.reply([settings.markdown, ...buttons, segment.button([{ text: '返回', callback: '#QQBot群聊主动菜单' }])], true)
+    }
+
+    const sendMatch = /^#q+bot群聊主动发送(?:\s+(\d+))?$/i.exec(msg)
+    if (sendMatch) {
+      if (!settings.markdown) return this.reply('未设置群聊主动消息内容，无法发送', true)
+      const requested = Math.max(1, Number(sendMatch[1]) || allowedGroups.length)
+      const targets = allowedGroups.slice(0, requested)
+      if (!targets.length) return this.reply('暂无允许主动消息的群，请先刷新群状态', true)
+      const startedAt = new Date().toISOString()
+      const results = []
+      for (const [index, group] of targets.entries()) {
+        const payload = { msg_type: 0, content: settings.markdown, msg_seq: Math.floor(Math.random() * 1000000) + 1 }
+        if (config.markdown?.[selfId] === 'raw') {
+          payload.msg_type = 2
+          payload.markdown = { content: settings.markdown }
+          delete payload.content
+          if (settings.buttonEnabled && settings.button) payload.keyboard = { content: settings.button, bot_appid: Number(Bot[selfId]?.info?.appid || 0) }
+        }
+        try {
+          const { data: result } = await Bot[selfId].sdk.request.post(`/v2/groups/${group.openid}/messages`, payload)
+          await recordQQBotLocalMessageResponse({ self_id: selfId, target_id: group.openid, type: 'group', author_openid: selfId, content_fingerprint: getQQBotMessageContentFingerprint(payload) }, result)
+          results.push({ group_openid: group.openid, group_name: getQQBotGroupDisplayName(selfId, group.openid), ok: true, message_id: result?.id || '' })
+        } catch (err) {
+          results.push({ group_openid: group.openid, group_name: getQQBotGroupDisplayName(selfId, group.openid), ok: false, error: err.response?.data?.message || err.message || '发送失败' })
+        }
+        if (index + 1 < targets.length) await sleep(2000)
+      }
+      const run = { started_at: startedAt, finished_at: new Date().toISOString(), total: targets.length, success_count: results.filter(item => item.ok).length, failed_count: results.filter(item => !item.ok).length, results }
+      settings.results.unshift(run)
+      settings.results = settings.results.slice(0, 100)
+      await configSave()
+      const text = `群聊主动发送完成，共${run.total}个群，成功${run.success_count}个，失败${run.failed_count}个`
+      try { return await this.reply([text, segment.button([{ text: '发送结果', callback: '#QQBot群聊主动结果 1' }, { text: '主动菜单', callback: '#QQBot群聊主动菜单' }])], true) } catch { return sendQQBotInternalMasterMsg(text) }
+    }
+
+    const resultMatch = /^#q+bot群聊主动结果(?:\s+(\d+))?$/i.exec(msg)
+    if (resultMatch) {
+      const pageSize = 10
+      const pageCount = Math.max(1, Math.ceil(settings.results.length / pageSize))
+      const page = Math.min(pageCount, Math.max(1, Number(resultMatch[1]) || 1))
+      const list = settings.results.slice((page - 1) * pageSize, page * pageSize)
+      const body = list.length ? list.map((run, index) => `${(page - 1) * pageSize + index + 1}. ${run.finished_at || '-'}\n成功/失败: ${run.success_count || 0}/${run.failed_count || 0}`).join('\n\n') : '暂无发送结果'
+      return this.reply([`#[${selfId}] 群聊主动结果 ${page}/${pageCount}\n\n${body}`, segment.button(...this._pageButtonRows('#QQBot群聊主动结果', { page, pageCount }), [{ text: '主动菜单', callback: '#QQBot群聊主动菜单' }])], true)
+    }
+
+    return menu()
+  }
+
   async userQueryCommand () {
     if (!this.guardOfficialBot()) return true
     const msg = String(this.e.msg || '')
@@ -7724,8 +8772,8 @@ export class QQBotAdapter extends plugin {
     }
     m = /^#q+bot查看所有群(?:\s+(\d+))?$/i.exec(msg)
     if (m) return this._replyGroupPage(await userManageStore.listGroups(this.e.self_id, m[1] || 1, 10), '所有群')
-    if (/^#q+bot搜索用户\s*$/i.test(msg)) return this.reply('缺少参数: 用户名/openid/群openid', true)
-    m = /^#q+bot搜索用户\s+(.+)$/i.exec(msg)
+    if (/^#q+bot高级搜索\s*$/i.test(msg)) return this.reply('缺少参数: 用户名/openid/群名/群openid', true)
+    m = /^#q+bot高级搜索\s+(.+)$/i.exec(msg)
     if (m) {
       let keyword = m[1].trim()
       let pageNo = 1
@@ -7734,35 +8782,51 @@ export class QQBotAdapter extends plugin {
         keyword = pageMatch[1].trim()
         pageNo = Number(pageMatch[2]) || 1
       }
-      const page = /^\d+$/.test(keyword)
+      const userPage = /^\d+$/.test(keyword)
         ? await userManageStore.searchUsersByNicknamePage(this.e.self_id, keyword, pageNo, 50)
         : await userManageStore.searchUsersPage(this.e.self_id, keyword, pageNo, 50)
-      if (/^\d+$/.test(keyword) && !page.total) return this.reply('数字关键词未匹配到昵称，请输入更具体的昵称或openid片段', true)
-      const body = page.list.map((i, idx) => [
+      const groupPage = await userManageStore.searchGroupsPage(this.e.self_id, keyword, pageNo, 50)
+      const page = { ...userPage, list: [...userPage.list, ...groupPage.list.map(item => ({ ...item, _groupResult: true }))], total: userPage.total + groupPage.total }
+      if (userPage.list.length === 0 && groupPage.list.length === 0) return this.reply('未匹配到用户或群', true)
+      const body = page.list.map((i, idx) => i._groupResult ? (() => {
+        const info = groupInfoStore.getInfo(this.e.self_id, i.openid)
+        const groupName = info?.group_name || i.name || i.remark_name || i.openid
+        return [
+        `${idx + 1}. ${groupName}`,
+        `群openid: ${i.openid}`,
+        `成员数: ${Number.isFinite(Number(info?.group_member_num)) && Number(info.group_member_num) > 0 ? Number(info.group_member_num) : (i.group_member_num || '-')}`,
+        `群简介: ${info?.group_finger_memo || i.group_finger_memo || '-'}`
+      ].join('\n')
+      })() : [
         `${(page.page - 1) * 50 + idx + 1}. ${i.nickname || i.openid}`,
         `openid: ${i.openid}`,
         '群:',
-        ...(Object.keys(i.groups || {}).length ? Object.keys(i.groups || {}).map(groupOpenid => `- ${groupOpenid}`) : ['- -'])
+        ...(Object.keys(i.groups || {}).length ? Object.keys(i.groups || {}).map(groupOpenid => `- ${getQQBotGroupDisplayName(this.e.self_id, groupOpenid) ? `${getQQBotGroupDisplayName(this.e.self_id, groupOpenid)} ` : ''}${groupOpenid}`) : ['- -'])
       ].join('\n')).join('\n\n') || '无匹配用户'
       const rows = [
-        ...this._pageButtonRows(`#QQBot搜索用户 ${keyword}`, page),
+        ...this._pageButtonRows(`#QQBot高级搜索 ${keyword}`, page),
         ...(page.list[0]
           ? [[
-              { text: '查询发言', callback: `#QQBot查看私聊最近发言 ${page.list[0].openid} 1` },
-              { text: '快速拉黑', callback: `#QQBot拉黑用户 ${page.list[0].openid}` }
+              page.list[0]._groupResult
+                ? { text: '群聊发言', callback: `#QQBot查看群最近发言 ${page.list[0].openid} 1` }
+                : { text: '私聊发言', callback: `#QQBot查看私聊最近发言 ${page.list[0].openid} 1` },
+              page.list[0]._groupResult
+                ? { text: '拉黑群', callback: `#QQBot拉黑群 ${page.list[0].openid}` }
+                : { text: '拉黑用户', callback: `#QQBot拉黑用户 ${page.list[0].openid}` }
             ]]
           : []),
         [{ text: '查询菜单', callback: '#QQBot用户管理菜单 查询菜单' }]
       ].slice(0, 5)
-      return this.reply([`#[${this.e.self_id}] 搜索用户: ${keyword} ${page.page}/${page.pageCount}\n\n\`\`\`text\n${body}\n\`\`\``, segment.button(...rows)], true)
+      return this.reply([`#[${this.e.self_id}] 高级搜索: ${keyword} ${page.page}/${page.pageCount}\n\n\`\`\`text\n${body}\n\`\`\``, segment.button(...rows)], true)
     }
     m = /^#q+bot查看用户所在群\s+(\S+)$/i.exec(msg)
     if (m) { const u = await userManageStore.getUser(this.e.self_id, m[1]); return this.reply((u ? Object.keys(u.groups || {}).join('\n') : '') || '暂无记录', true) }
     m = /^#q+bot查看所有群最近发言(?:\s+(\d+))?$/i.exec(msg)
     if (m) {
       const pageNo = Number(m[1]) || 1
-      if (pageNo > 500) return this.reply('所有群最近发言最多查看 500 页', true)
-      return this._replyAllGroupRecentHistory(await userManageStore.listRecentGroupHistories(this.e.self_id, pageNo, 20))
+      const page = await userManageStore.listRecentGroupHistories(this.e.self_id, pageNo, 20)
+      if (page.historyLimit) return this.reply('所有群最近发言最多查看 5000 页', true)
+      return this._replyAllGroupRecentHistory(page)
     }
     if (/^#q+bot查看群成员\s*$/i.test(msg)) return this.reply('缺少参数: 群openid', true)
     m = /^#q+bot查看群成员\s+(\S+)(?:\s+(\d+))?$/i.exec(msg)
@@ -7794,7 +8858,7 @@ export class QQBotAdapter extends plugin {
         : '>暂无记录'
       const pageRows = this._pageButtonRows(`#QQBot查看群最近发言 ${groupOpenid}`, page)
       return this.reply([
-        `#[${this.e.self_id}] 群最近发言 ${page.page}/${page.pageCount}\n\n>${groupOpenid}\n\n${body}`,
+        `#[${this.e.self_id}] 群最近发言 ${page.page}/${page.pageCount}\n\n>${getQQBotGroupDisplayName(this.e.self_id, groupOpenid) ? `${getQQBotGroupDisplayName(this.e.self_id, groupOpenid)} ` : ''}${groupOpenid}\n\n${body}`,
         segment.button(
           ...pageRows,
           [{ text: '返回群列', callback: '#QQBot查看所有群 1' }, { text: '群成员', input: `#QQBot查看群成员 ${groupOpenid} 1` }],
@@ -7919,13 +8983,14 @@ export class QQBotAdapter extends plugin {
   _replyGroupPage (page, title) {
     const groupLines = page.list.map(i => {
       const blacked = userManageStore.isBlackGroup(this.e.self_id, i.openid)
+      const officialName = groupInfoStore.getInfo(this.e.self_id, i.openid)?.group_name || i.name || i.remark_name || ''
       return [
-        `>${(i.remark_name || i.name) ? `${i.remark_name || i.name} ` : ''}${i.openid}${i.real_group_id ? ` (${i.real_group_id})` : ''}(${userManageStore.isFullGroupEventSeen(this.e.self_id, i.openid) || isFullMessageGroupRecorded(this.e.self_id, i.openid) ? '全量群' : '非全量群'})`,
+        `>${officialName ? `${officialName} ` : ''}${i.openid}${i.real_group_id ? ` (${i.real_group_id})` : ''}(${userManageStore.isFullGroupEventSeen(this.e.self_id, i.openid) || isFullMessageGroupRecorded(this.e.self_id, i.openid) ? '全量群' : '非全量群'})`,
         `>最近记录: ${this._formatUserManageTime(i.last_seen_at)}`,
         '',
         `><qqbot-cmd-input text="#QQBot查看群最近发言 ${i.openid} 1" show="最近发言"/>`,
         '',
-        `><qqbot-cmd-input text="#QQBot备注群名称 ${i.openid} " show="备注群名"/>`,
+        `><qqbot-cmd-input text="#QQBot刷新群名 ${i.openid}" show="刷新群名"/>`,
         '',
         `><qqbot-cmd-input text="#QQBot备注真实群号 ${i.openid} " show="备注群号"/>`,
         '',
@@ -7949,7 +9014,7 @@ export class QQBotAdapter extends plugin {
   _replyAllGroupRecentHistory (page) {
     const body = page.list.map(i => [
       '```text',
-      `${i.group_openid} #${i.seq} [${this._formatUserManageTime(i.time)}] ${i.bot ? '[BOT] ' : ''}${i.nickname || i.user_openid}: ${String(i.raw_message || '').replace(/```/g, '`\u200b``')}`,
+       `${getQQBotGroupDisplayName(this.e.self_id, i.group_openid) ? `${getQQBotGroupDisplayName(this.e.self_id, i.group_openid)} ` : ''}${i.group_openid} #${i.seq} [${this._formatUserManageTime(i.time)}] ${i.bot ? '[BOT] ' : ''}${i.nickname || i.user_openid}: ${String(i.raw_message || '').replace(/```/g, '`\u200b``')}`,
       '```',
       `><qqbot-cmd-input text="#QQBot查看群最近发言 ${i.group_openid} #${i.seq}" show="查看raw"/>`
     ].join('\n')).join('\n\n') || '>暂无记录'
@@ -8223,24 +9288,56 @@ export class QQBotAdapter extends plugin {
     if (!this.guardOfficialBot()) return true
     this.reply([
       [
-        `#[${this.e.self_id}] 清/查记录`,
-        '',
-        '>请选择要执行的记录操作',
-        '',
-        '><qqbot-cmd-input text="#QQBot全量查看" show="查看记录"/>',
-        '',
-        '><qqbot-cmd-input text="#QQBot全量清空" show="清空记录"/>'
-      ].join('\n'),
-      segment.button(
-        [
-          { text: '查看记录', callback: '#QQBot全量查看' },
-          { text: '清空记录', callback: '#QQBot全量清空' }
-        ],
-        [
-          { text: '返回', callback: '#QQBot全量消息设置' }
-        ]
-      )
-    ], true)
+          `#[${this.e.self_id}] 清/查记录`,
+          '',
+          '>请选择要执行的记录操作',
+          '',
+          '><qqbot-cmd-input text="#QQBot全量查看" show="查看记录(记录的)"/>',
+          '',
+          '><qqbot-cmd-input text="#QQBot全量清空" show="清空记录(记录的)"/>',
+          '',
+          '><qqbot-cmd-input text="#QQBot查看官方接口记录 1" show="查看官方接口记录(准确)"/>',
+          '',
+          '>官方接口记录是群身份刷新保存的数据（#QQBot刷新所有群身份），仅输出全量记录群。'
+        ].join('\n'),
+        segment.button(
+          [
+            { text: '查看记录', callback: '#QQBot全量查看' },
+            { text: '清空记录', callback: '#QQBot全量清空' }
+          ],
+          [
+            { text: '官方记录', callback: '#QQBot查看官方接口记录 1' },
+            { text: '刷新全量', callback: '#QQBot刷新全量群' }
+          ],
+          [
+            { text: '返回', callback: '#QQBot全量消息设置' }
+          ]
+        )
+      ], true)
+    }
+
+  fullMessageOfficialRecords () {
+    if (!this.guardOfficialBot()) return true
+    const match = /^#q+bot查看官方接口记录(?:\s+(\d+))?$/i.exec(this.e.msg)
+    const pageSize = 10
+    const records = Object.values(fullMessageStore.getRecords())
+      .filter(item => item.self_id === this.e.self_id)
+      .sort((a, b) => String(b.last_time || '').localeCompare(String(a.last_time || '')))
+    const pageCount = Math.max(1, Math.ceil(records.length / pageSize))
+    const page = Math.min(pageCount, Math.max(1, Number(match?.[1]) || 1))
+    const list = records.slice((page - 1) * pageSize, page * pageSize)
+    const body = list.length
+      ? list.map((item, index) => {
+          const info = groupInfoStore.getInfo(item.self_id, item.group_openid)
+          const state = groupInfoStore.getBotState(item.self_id, item.group_openid)
+          return `${(page - 1) * pageSize + index + 1}. ${info?.group_name || item.group_openid}\n群openid: ${item.group_openid}\n${JSON.stringify(state || { error: '暂无群身份接口缓存，请先刷新所有群身份' }, null, 2)}`
+        }).join('\n\n')
+      : '暂无全量记录群'
+    const rows = [
+      ...this._pageButtonRows('#QQBot查看官方接口记录', { page, pageCount }),
+      [{ text: '刷新身份', callback: '#QQBot刷新全量群' }, { text: '清查记录', callback: '#QQBot全量清/查记录' }]
+    ].slice(0, 5)
+    return this.reply([`#[${this.e.self_id}] 官方接口记录 ${page}/${pageCount}\n\n>群身份刷新保存的数据，仅展示全量记录群。\n\n\`\`\`text\n${body}\n\`\`\``, segment.button(...rows)], true)
   }
 
   async fullMessageClear () {

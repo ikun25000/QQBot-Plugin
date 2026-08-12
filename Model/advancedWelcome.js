@@ -1,4 +1,5 @@
 import advancedWelcomeStore from './advancedWelcomeStore.js'
+import groupInfoStore from './groupInfoStore.js'
 
 function limitButtonRows (rows) {
   return rows
@@ -312,7 +313,8 @@ function getAdvancedWelcomeListMsg (config, selfId = '', type = 'all', page = 1,
     const withdrawn = Object.keys(item.withdrawn_complaints || {}).length
     const counts = advancedWelcomeStore.getSentWindowCounts(item.self_id, item.group_openid)
     lines.push('```text')
-    lines.push(`${(page - 1) * pageSize + index + 1}. ${item.group_openid}`)
+    const groupName = groupInfoStore.getInfo(item.self_id, item.group_openid)?.group_name || ''
+    lines.push(`${(page - 1) * pageSize + index + 1}. ${groupName ? `${groupName} ` : ''}${item.group_openid}`)
     lines.push(`状态: ${getAdvancedWelcomeStatusText(item)}`)
     lines.push(`额度: 总${counts.total}/${formatLimit(aw.totalLimit)} 天${counts.day}/${formatLimit(aw.dayLimit)} 周${counts.week}/${formatLimit(aw.weekLimit)}`)
     lines.push(`短期: 5时: ${counts.hour5}/${formatLimitValue(aw.hour5Limit)} 1时: ${counts.hour1}/${formatLimitValue(aw.hour1Limit)} 5分: ${counts.min5}/${formatLimitValue(aw.min5Limit)} 1分: ${counts.min1}/${formatLimitValue(aw.min1Limit)}`)

@@ -9,6 +9,8 @@ import { ensureIcebreakerConfig, ensureRecallConfig, getIcebreakerMenuMsg, getIc
 import inviteStore from './inviteStore.js'
 import chatStore from './chatStore.js'
 import userManageStore from './userManageStore.js'
+import joinRequestStore from './joinRequestStore.js'
+import groupInfoStore from './groupInfoStore.js'
 import { advancedWelcomeStore, buttonTextWarnings, checkAdvancedWelcomeSend, ensureAdvancedWelcomeConfig, getAdvancedWelcomeAutoCloseMenuButtons, getAdvancedWelcomeAutoCloseMenuMsg, getAdvancedWelcomeListButtons, getAdvancedWelcomeListMsg, getAdvancedWelcomeLimitMenuButtons, getAdvancedWelcomeLimitMenuMsg, getAdvancedWelcomeMenuButtons, getAdvancedWelcomeMenuMsg, getAdvancedWelcomeRecommendButtonJson, getAdvancedWelcomeStatusText, getFullMessageStatusText, replaceWelcomeVariables } from './advancedWelcome.js'
 
 export {
@@ -70,6 +72,8 @@ export {
   inviteStore,
   chatStore,
   userManageStore,
+  joinRequestStore,
+  groupInfoStore,
   advancedWelcomeStore,
   buttonTextWarnings,
   checkAdvancedWelcomeSend,

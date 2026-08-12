@@ -7,6 +7,9 @@ const JSON_DATA_DIR = join(process.cwd(), 'data', 'QQBotUserManage')
 const HISTORY_LIMIT = 500
 const HISTORY_CACHE_LIMIT = 20
 const RECENT_GROUP_LIMIT = 10000
+const RECENT_GROUP_WINDOW_PAGES = 500
+const RECENT_GROUP_MAX_PAGES = 5000
+const RECENT_GROUP_SNAPSHOT_TTL = 2 * 60 * 1000
 const RAW_TEXT_LIMIT = 4000
 const RAW_SNAPSHOT_LIMIT = 12000
 const USER_CACHE_LIMIT = 10000
@@ -82,6 +85,7 @@ class UserManageStore {
     this._entityWriteQueues = new Map()
     this._jsonWriteQueue = Promise.resolve()
     this._writeSeq = 0
+    this._recentSnapshots = new Map()
   }
 
   _empty () {
@@ -108,6 +112,7 @@ class UserManageStore {
     this._historyCache.clear()
     this._recentGroupIndexes.clear()
     this._recentUserIndexes.clear()
+    this._recentSnapshots.clear()
     this._jsonHistories = {}
     this._historyKeys.clear()
     this._historyWriteQueues.clear()
@@ -594,6 +599,9 @@ class UserManageStore {
     const old = await this._getEntity('group', key) || {}
     const item = { ...old, self_id: selfId, openid: groupOpenid, first_seen_at: old.first_seen_at || nowIso(), last_seen_at: nowIso() }
     if (info.name) item.name = safeText(info.name, 120)
+    for (const field of ['group_finger_memo', 'group_class_text']) if (info[field]) item[field] = safeText(info[field], 500)
+    if (Array.isArray(info.group_tags)) item.group_tags = info.group_tags.map(item => safeText(item, 80))
+    if (Number(info.group_member_num) > 0) item.group_member_num = Number(info.group_member_num)
     if (this.type === 'level') this._cacheEntity('group', key, item)
     else this._data.groups[key] = item
     await this._save('group', key, item)
@@ -677,14 +685,56 @@ class UserManageStore {
   }
 
   async listRecentGroupHistories (selfId = '', page = 1, size = 20) {
-    const indexes = [...(this._recentGroupIndexes.get(String(selfId)) || [])].reverse()
-    const indexPage = pageSlice(indexes, Math.min(500, Math.max(1, Number(page) || 1)), size)
+    const requested = Math.max(1, Number(page) || 1)
+    const windowNo = Math.floor((requested - 1) / RECENT_GROUP_WINDOW_PAGES)
+    if (requested > RECENT_GROUP_MAX_PAGES) return { list: [], page: requested, pageCount: requested, total: 0, historyLimit: true }
+    const cacheKey = `${String(selfId)}:${windowNo}`
+    let snapshot = this._recentSnapshots.get(cacheKey)
+    if (!snapshot || snapshot.expires_at <= Date.now()) {
+      snapshot = { list: await this._loadRecentGroupWindow(selfId, windowNo, size), created_at: Date.now(), expires_at: Date.now() + RECENT_GROUP_SNAPSHOT_TTL }
+      this._recentSnapshots.set(cacheKey, snapshot)
+    }
+    const localPage = requested - windowNo * RECENT_GROUP_WINDOW_PAGES
+    const list = snapshot.list.slice((localPage - 1) * size, localPage * size)
+    const knownPages = windowNo * RECENT_GROUP_WINDOW_PAGES + Math.ceil(snapshot.list.length / size)
+    const hasMore = snapshot.list.length === RECENT_GROUP_WINDOW_PAGES * size
+    return { list, page: requested, pageCount: Math.max(requested, knownPages, hasMore && requested % RECENT_GROUP_WINDOW_PAGES === 0 ? requested + 1 : 0), total: windowNo * RECENT_GROUP_WINDOW_PAGES * size + snapshot.list.length, hasMore, snapshot_at: snapshot.created_at }
+  }
+
+  async _loadRecentGroupWindow (selfId, windowNo, size) {
+    const source = new Map()
+    for (const index of this._recentGroupIndexes.get(String(selfId)) || []) source.set(`${index.group_openid}:${index.seq}`, index)
+    if (windowNo > 0 && this.type === 'level' && this._db) {
+      for await (const [key, item] of this._db.db.iterator({ gte: `historyItem:${selfId}:`, lt: `historyItem:${selfId}:\uffff` })) {
+        const suffix = String(key).slice(12)
+        const split = suffix.lastIndexOf(':')
+        if (split <= 0) continue
+        const historyKey = suffix.slice(0, split)
+        const groupOpenid = historyKey.slice(String(selfId).length + 1)
+        const seq = Number(item?.seq) || Number(suffix.slice(split + 1)) || 0
+        if (groupOpenid && seq) source.set(`${groupOpenid}:${seq}`, { self_id: String(selfId), group_openid: groupOpenid, seq, time_ms: this._historyTimeMs(item?.time), item })
+        if (source.size >= RECENT_GROUP_MAX_PAGES * size) break
+      }
+    } else if (windowNo > 0) {
+      for (const [historyKey, list] of Object.entries(this._jsonHistories)) {
+        if (!historyKey.startsWith(`${String(selfId)}:`) || !Array.isArray(list)) continue
+        const groupOpenid = historyKey.slice(String(selfId).length + 1)
+        for (const item of list) source.set(`${groupOpenid}:${item.seq}`, { self_id: String(selfId), group_openid: groupOpenid, seq: Number(item.seq) || 0, time_ms: this._historyTimeMs(item.time), item })
+      }
+    }
+    const start = windowNo * RECENT_GROUP_WINDOW_PAGES * size
+    const ordered = [...source.values()].sort((a, b) => (b.time_ms || 0) - (a.time_ms || 0) || (b.seq || 0) - (a.seq || 0)).slice(start, start + RECENT_GROUP_WINDOW_PAGES * size)
     const rows = []
-    for (const index of indexPage.list) {
-      const item = await this.findHistoryBySeq(selfId, index.group_openid, index.seq)
+    for (const index of ordered) {
+      const item = index.item || await this.findHistoryBySeq(selfId, index.group_openid, index.seq)
       if (item) rows.push({ ...item, group_openid: index.group_openid })
     }
-    return { ...indexPage, list: rows, pageCount: Math.min(500, indexPage.pageCount), total: Math.min(RECENT_GROUP_LIMIT, indexPage.total) }
+    return rows
+  }
+
+  _invalidateRecentSnapshots (selfId = '') {
+    const prefix = `${String(selfId)}:`
+    for (const key of this._recentSnapshots.keys()) if (key.startsWith(prefix)) this._recentSnapshots.delete(key)
   }
 
   async listRecentUserHistories (selfId = '', page = 1, size = 20) {
@@ -704,6 +754,7 @@ class UserManageStore {
   }
 
   async _deleteRecentHistory (selfId, targetOpenid, count, type, key) {
+    this._invalidateRecentSnapshots(selfId)
     const list = await this._loadHistory(key)
     if (!list.length) return 0
     const n = String(count) === '全部' ? list.length : Math.max(0, Number(count) || 0)
@@ -721,6 +772,7 @@ class UserManageStore {
   }
 
   async clearGroupHistories (selfId = '') {
+    this._invalidateRecentSnapshots(selfId)
     let messageCount = 0
     let groupCount = 0
     if (this.type === 'level' && this._db) {
@@ -835,6 +887,14 @@ class UserManageStore {
       })
     }
     return pageSlice(await this.searchUsers(selfId, keyword), page, size)
+  }
+
+  async searchGroupsPage (selfId = '', keyword = '', page = 1, size = 50) {
+    const kw = String(keyword || '').trim().toLowerCase()
+    if (!kw) return pageSlice([], page, size)
+    const match = item => [item.openid, item.name, item.remark_name, item.real_group_id, item.group_finger_memo, item.group_class_text, ...(item.group_tags || [])].filter(Boolean).join('\n').toLowerCase().includes(kw)
+    if (this.type === 'level' && this._db) return this._pageLevelPrefix(`group:${selfId}:`, page, size, match)
+    return pageSlice(Object.values(this._data.groups).filter(item => item.self_id === selfId && match(item)), page, size)
   }
 
   async searchUsersByNicknamePage (selfId = '', keyword = '', page = 1, size = 50) {

@@ -4,7 +4,6 @@ import moment from 'moment'
 import Level from './level.js'
 import { join } from 'node:path'
 import schedule from 'node-schedule'
-import { getTime } from './common.js'
 import puppeteer from '../../../lib/puppeteer/puppeteer.js'
 
 //! 需顺序
@@ -32,10 +31,13 @@ const numToChinese = {
   11: '十一', 12: '十二', 13: '十三', 14: '十四', 15: '十五',
   16: '十六', 17: '十七', 18: '十八', 19: '十九', 20: '二十',
   21: '二十一', 22: '二十二', 23: '二十三', 24: '二十四', 25: '二十五',
-  26: '二十六', 27: '二十七', 28: '二十八', 29: '二十九', 30: '三十'
+  26: '二十六', 27: '二十七', 28: '二十八', 29: '二十九', 30: '三十',
+  31: '三十一'
 }
 
 const _path = process.cwd()
+// DAU follows node-schedule's local business day. Production runs in Asia/Shanghai.
+const getDauDate = (offset = 0) => moment().add(offset, 'day').format('YYYY-MM-DD')
 
 export default class Dau {
   constructor (self_id, sep, dauDB) {
@@ -49,8 +51,8 @@ export default class Dau {
    */
   async init () {
     // 时间
-    this.today = getTime()
-    this.yesterday = getTime(-1)
+    this.today = getDauDate()
+    this.yesterday = getDauDate(-1)
     switch (this.dauDB) {
       case 'redis': {
         const prefix = `QQBot:${this.self_id}:`
@@ -124,7 +126,42 @@ export default class Dau {
     this.job = this.setScheduleJob()
   }
 
+  _emptyStats () {
+    return _.reduce(_.keys(dauAttr), (acc, key) => {
+      acc[key] = 0
+      return acc
+    }, {})
+  }
+
+  async ensureCurrentDay () {
+    const currentDay = getDauDate()
+    if (currentDay === this.today) return
+    if (this._dayRollover) return this._dayRollover
+    this._dayRollover = (async () => {
+      const previousDay = this.today
+      const snapshot = this.dauDB === 'level' ? { ...(this.stats || this._emptyStats()), time: previousDay } : await this.getStats(previousDay)
+      const path = join(_path, 'data', 'QQBotDAU', this.self_id)
+      try {
+        fs.mkdirSync(path, { recursive: true })
+        const filePath = join(path, `${moment(previousDay).format('YYYY-MM')}.json`)
+        const history = fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, 'utf8')) : []
+        const index = history.findIndex(item => String(item?.time || '').slice(0, 10) === previousDay)
+        if (index >= 0) history[index] = snapshot
+        else history.push(snapshot)
+        fs.writeFileSync(filePath, JSON.stringify(history, null, '\t'), 'utf8')
+      } catch (err) {
+        logger.error('归档DAU数据出错,self_id: ' + this.self_id, err)
+      }
+
+      this.today = currentDay
+      this.yesterday = moment(currentDay).subtract(1, 'day').format('YYYY-MM-DD')
+      await this.initData()
+    })().finally(() => { this._dayRollover = null })
+    return this._dayRollover
+  }
+
   async getStats (time = this.today) {
+    if (String(time) !== String(this.today)) return this.getArchivedStats(time)
     if (this.dauDB === 'level') {
       return this.stats
     } else {
@@ -147,6 +184,15 @@ export default class Dau {
     }
   }
 
+  getArchivedStats (date) {
+    const text = String(date || '')
+    const file = join(_path, 'data', 'QQBotDAU', this.self_id, `${text.slice(0, 7)}.json`)
+    try {
+      const rows = JSON.parse(fs.readFileSync(file, 'utf8'))
+      return rows.find(row => String(row?.time || '').slice(0, 10) === text.slice(0, 10)) || null
+    } catch { return null }
+  }
+
   async scan (MATCH) {
     let cursor = 0
     const arr = []
@@ -163,13 +209,17 @@ export default class Dau {
  * @param {*} pro
  * @returns
  */
-  async getDauStatsMsg (e, pro) {
+  async getDauStatsMsg (e, pro, queryDate = '') {
   const normalizeDauRow = (row = {}) => _.reduce(_.keys(dauAttr), (acc, key) => {
     acc[key] = Number(row?.[key]) || 0
     return acc
   }, {})
 
-  let msg = [this.today, ...this.toDauMsg(normalizeDauRow(await this.getStats())), '']
+   const selectedDate = queryDate || this.today
+   const selected = await this.getStats(selectedDate)
+   if (!selected) return false
+   let msg = [selectedDate, ...this.toDauMsg(normalizeDauRow(selected)), '']
+   if (queryDate) return [msg.join('\n'), this.getButton(e.user_id, e.message_type === 'group', queryDate)]
 
   const path = join(_path, 'data', 'QQBotDAU', this.self_id)
   const yearMonth = moment(this.today).format('YYYY-MM')
@@ -246,7 +296,7 @@ export default class Dau {
     msg = img
   }
 
-  return [msg, this.getButton(e.user_id)]
+   return [msg, this.getButton(e.user_id, e.message_type === 'group')]
 }
 
   getCallStatsMsg (e) {
@@ -257,7 +307,7 @@ export default class Dau {
       const s = arr[i]
       msg.push(`${i + 1}: ${s[0]}\t\t${s[1]}次`)
     }
-    return [msg.join('\n'), this.getButton(e.user_id)]
+     return [msg.join('\n'), this.getButton(e.user_id, e.message_type === 'group')]
   }
 
   async callStat (arr, isall = false) {
@@ -367,37 +417,25 @@ export default class Dau {
       `相同用户: ${user_same_count}`,
       `减少用户: ${yesterday_user_count - user_same_count}`
     ]
-    return [msg.join('\r'), this.getButton(e.user_id)]
+     return [msg.join('\r'), this.getButton(e.user_id, e.message_type === 'group')]
   }
 
-  getButton (user_id) {
+  getButton (user_id, restricted = true, date = '') {
+    const permission = restricted ? { permission: user_id } : {}
+    const suffix = date ? ` ${String(date).slice(5)}` : ''
     return segment.button([
-      { text: 'dau', callback: '#QQBotdau', permission: user_id },
-      { text: 'daupro', callback: '#QQBotdaupro', permission: user_id }
+      { text: 'dau', callback: `#QQBotdau${suffix}`, ...permission },
+      { text: 'daupro', callback: `#QQBotdaupro${suffix}`, ...permission }
     ], [
-      { text: '调用统计', callback: '#QQBot调用统计', permission: user_id },
-      { text: '用户统计', callback: '#QQBot用户统计', permission: user_id }
+      { text: '调用统计', callback: '#QQBot调用统计', ...permission },
+      { text: '用户统计', callback: '#QQBot用户统计', ...permission }
     ])
   }
 
   setScheduleJob () {
     return schedule.scheduleJob('0 0 0 * * ?', async () => {
-      const yesMonth = moment().subtract(1, 'd').format('YYYY-MM')
-      this.today = getTime()
-      this.yesterday = getTime(-1)
-      const path = join(process.cwd(), 'data', 'QQBotDAU')
-      if (!fs.existsSync(path)) fs.mkdirSync(path)
       try {
-        const data = await this.getStats(this.yesterday)
-        data.time = this.yesterday
-
-        await this.initData()
-
-        if (!fs.existsSync(join(path, this.self_id))) fs.mkdirSync(join(path, this.self_id))
-        const filePath = join(path, this.self_id, `${yesMonth}.json`)
-        const file = fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, 'utf8')) : []
-        file.push(data)
-        fs.writeFile(filePath, JSON.stringify(file, '', '\t'), 'utf-8', () => { })
+        await this.ensureCurrentDay()
       } catch (error) {
         logger.error('清除DAU数据出错,self_id: ' + this.self_id, error)
       }
@@ -499,6 +537,7 @@ export default class Dau {
    */
   async setDau (type, data) {
     if (!this.dauDB) return
+    await this.ensureCurrentDay()
     const user_id = data.user_id?.replace?.(this.self_id + this.sep, '')
     const group_id = data.group_id?.replace?.(this.self_id + this.sep, '')
     const key = `${type}_count`
@@ -523,10 +562,14 @@ export default class Dau {
         }
         break
       case 'group_decrease':
+        if (!group_id) break
         if (this.dauDB === 'level') {
-          if (this.all_group[group_id]) {
-            this.deleteNotExistGroup([group_id])
+          if (!this.group_decrease[group_id]) {
+            this.group_decrease[group_id] = 1
+            this.stats[key]++
+            await this.setDB('group_decrease', this.group_decrease, 2)
           }
+          if (this.all_group[group_id]) await this.deleteNotExistGroup([group_id])
         } else {
           if (!this.group_decrease[group_id]) {
             this.group_decrease[group_id] = 0

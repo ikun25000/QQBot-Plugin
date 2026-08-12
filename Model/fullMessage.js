@@ -1,4 +1,5 @@
 import fullMessageStore from './fullMessageStore.js'
+import groupInfoStore from './groupInfoStore.js'
 
 const FULL_MESSAGE_OPTIONS = {
   '仅回复@机器人': {
@@ -232,6 +233,7 @@ function getFullMessageStatusMsg (config, selfId = '', receiveEnabled = true) {
   lines.push('', `>WebSocket全量解析: ${receiveEnabled ? '已接入' : '未接入'}`)
   lines.push('', `>已记录群数: ${total}`)
   lines.push('', `>已拉黑群数: ${blackTotal}`)
+  lines.push('', `>机器人member_openid: ${Object.values(fullMessageStore.getRecords()).filter(item => !selfId || item.self_id === selfId).map(item => groupInfoStore.getBotState(item.self_id, item.group_openid)?.member_openid).find(Boolean) || '-'}`)
   lines.push('', `>存储方式: ${config.fullMessageDB || 'json'}`)
   lines.push('', `><qqbot-cmd-input text="#QQBot全量存储 json" show="切换JSON存储"/>`)
   lines.push('', `><qqbot-cmd-input text="#QQBot全量存储 level" show="切换LevelDB存储"/>`)
@@ -398,11 +400,13 @@ function getFullMessageMentionState (config, event, selfId = '') {
 }
 
 function getFullMessageAllNotifyMsg (data) {
+  const groupOpenid = data.group_openid || ''
+  const groupName = groupInfoStore.getInfo(data.self_id, groupOpenid)?.group_name || ''
   return [
     `[${data.self_id}] QQBot 全量消息 @全体通知`,
     `账号: ${data.self_id}`,
-    `群: ${data.group_id}`,
-    `群openid: ${data.group_openid || '-'}`,
+    `群: ${groupName || data.group_id}`,
+    `群openid: ${groupOpenid || '-'}`,
     `用户: ${data.user_id}`,
     `内容: ${data.raw_message || '(空消息)'}`
   ].join('\n')
@@ -419,13 +423,17 @@ function getFullMessageRecordsMsg (config, page = 1, pageSize = 20, selfId = '')
   const start = (page - 1) * pageSize
   const list = records.slice(start, start + pageSize)
   const prefix = selfId ? `[${selfId}] ` : ''
-  const lines = [`#${prefix.trimEnd()}`, '', `>全量消息记录: 共 ${total} 个,当前第 ${page}/${maxPage} 页\n`, '```QbotAllMsgNum']
+  const memberOpenid = records.map(item => groupInfoStore.getBotState(item.self_id, item.group_openid)?.member_openid).find(Boolean) || '-'
+  const lines = [`#${prefix.trimEnd()}`, '', `>全量消息记录: 共 ${total} 个,当前第 ${page}/${maxPage} 页`, '', `>机器人member_openid: ${memberOpenid}\n`, '```QbotAllMsgNum']
 
   if (!list.length) {
     lines.push('暂无记录。开启“记录群”后收到 GROUP_MESSAGE_CREATE 才会记录。')
   } else {
     list.forEach((item, index) => {
-      lines.push(`${start + index + 1}. ${item.group_openid}`)
+      lines.push(`${start + index + 1}. ${groupInfoStore.getInfo(item.self_id, item.group_openid)?.group_name ? `${groupInfoStore.getInfo(item.self_id, item.group_openid).group_name} ` : ''}${item.group_openid}`)
+      const botState = groupInfoStore.getBotState(item.self_id, item.group_openid)
+      lines.push(`机器人角色: ${botState?.member_role || '-'}`)
+      lines.push(`允许主动消息: ${botState ? (botState.allow_proactive_msg ? '是' : '否') : '-'}`)
       lines.push(`账号: ${item.self_id}`)
       lines.push(`原群ID: ${item.raw_group_id || '-'}`)
       lines.push(`状态: ${blackGroups.has(item.group_openid) ? '已拉黑' : '正常'}`)
