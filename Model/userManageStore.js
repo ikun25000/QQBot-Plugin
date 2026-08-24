@@ -737,8 +737,10 @@ class UserManageStore {
     for (const key of this._recentSnapshots.keys()) if (key.startsWith(prefix)) this._recentSnapshots.delete(key)
   }
 
-  async listRecentUserHistories (selfId = '', page = 1, size = 20) {
+  async listRecentUserHistories (selfId = '', page = 1, size = 20, allowedOpenids = null) {
+    const allowed = allowedOpenids instanceof Set ? allowedOpenids : null
     const indexes = [...(this._recentUserIndexes.get(String(selfId)) || [])].reverse()
+      .filter(item => !allowed || allowed.has(item.user_openid))
     const indexPage = pageSlice(indexes, Math.min(500, Math.max(1, Number(page) || 1)), size)
     const rows = []
     for (const index of indexPage.list) {
