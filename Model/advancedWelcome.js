@@ -60,7 +60,7 @@ function getAdvancedWelcomeRecommendButtonJson (selfId = '') {
     rows: [
       {
         buttons: [
-          { render_data: { label: '关闭通知' }, action: { type: 2, permission: { type: 2 }, data: `#我要关闭通知 ${selfId}`, enter: true } },
+          { render_data: { label: '关闭通知' }, action: { type: 2, permission: { type: 1 }, data: `#我要关闭通知 ${selfId}`, enter: true } },
           { render_data: { label: '投诉通知' }, action: { type: 2, permission: { type: 2 }, data: `#我要投诉通知 ${selfId}`, enter: true } }
         ]
       }
