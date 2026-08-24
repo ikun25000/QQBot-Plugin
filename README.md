@@ -38,6 +38,10 @@ TRSS-Yunzai QQBot 插件
 | 拉黑联动 | 全量查看列表标注「已拉黑/正常」，拉黑群仅 @机器人 触发 |
 | 群消息角色图标 | 群主👑 管理⭐ 成员👥，机器人额外🤖 |
 | 发言记录 | `this.e.raw.chat` 按用户区分群/私聊，含今日/昨日/7天/30天 |
+| 群活跃用户 | `this.e.raw.active` 累计去重统计群内 @、非 @ 和总用户数 |
+| 配置保护 | `QQBot.yaml` 原子写入、有效版本备份；部分凭据丢失提醒，全部丢失时恢复 |
+| 音频兜底 | 语音失败后依次尝试文件和黑色空白画面 MP4，可按机器人关闭 |
+| 投诉拉黑 | 独立禁止指定群发起/确认投诉，不影响其他命令和群管理关闭通知 |
 | DAU 好友统计 | 新增好友数、删除好友数，兼容旧数据缺字段按 0 显示 |
 | 高级群欢迎 | 入群事件欢迎通知、单群额度、投诉关闭、详情查看，详见 `advanced_welcome.md` |
 
@@ -45,6 +49,8 @@ TRSS-Yunzai QQBot 插件
 ### 存储
 
 - 新增独立用户管理存储，路径为 `QQBot-Plugin/db/userManage`，不混用全量消息、高级欢迎等已有数据。
+- 群活跃累计集合默认存入 `QQBot-Plugin/db/active`；LevelDB 不可用时回退 `data/QQBotActive/active.json`。
+- QQBot 配置有效版本保存在 `data/QQBotConfigBackup/`，包括最近有效版本、最近含账号版本和最多 30 个去重历史版本。
 - 按机器人 `self_id` 分离配置与数据，多个 Bot 之间互不影响。
 - 记录用户、群、群成员关系、拉黑、注销、最近发言、绑定全量缓存、全量事件检测状态。
 - 频道数据不参与用户管理拉黑、查询和群/好友缓存污染写入。
@@ -56,12 +62,21 @@ TRSS-Yunzai QQBot 插件
 - 建议按实际需要配置或定期清理发言缓存、绑定记录和管理记录，不要将导出的数据、原始事件或日志公开传播。
 - 机器人管理员应向群成员说明启用的记录、欢迎或管理功能，并提供可用的关闭、投诉或删除入口。
 
+### 配置保护
+
+- 插件加载 `config/QQBot.yaml` 前安装定向安全 Hook，不修改 `框架lib`，其他配置和数据文件仍走框架原逻辑。
+- 保存时先校验非空 YAML 对象，再写同目录临时文件、同步文件、原子重命名并同步目录，降低断电留下空文件或半截 YAML 的风险。
+- 有效版本按 SHA-256 去重，保留 `latest-good.yaml`、`latest-credential.yaml` 和最多 30 个历史版本；每 6 小时重新校验一次。
+- 空文件、损坏 YAML 或全部机器人凭据丢失时，会保存 `broken-*.yaml` 并恢复最近含账号的有效版本。仅部分凭据丢失时不修改用户配置文件，而是通过仍可用的机器人向主人发送一次仅含缺失 AppID 的提醒，绝不发送 AppSecret；使用账号删除命令明确删除账号时不会触发恢复或提醒。
+- 本地原子写入和备份不能替代持久卷、磁盘快照或异机备份；整盘损坏、多进程并发覆盖仍需部署侧解决。
+
 ### 菜单入口
 
 ```text
 #QQBot用户管理菜单
 #QQBot用户管理菜单 注销菜单
 #QQBot用户管理菜单 拉黑菜单
+#QQBot用户管理菜单 投诉拉黑菜单
 #QQBot用户管理菜单 查询菜单
 #QQBot用户管理菜单 使用范围
 ```
@@ -80,6 +95,7 @@ TRSS-Yunzai QQBot 插件
 #QQBot注销管理 撤回 openid
 #QQBot注销管理 设置注销时间 7天
 #QQBot注销管理 设置注销拉黑时间 3650天
+#QQBot注销管理 强制注销 openid 理由
 #QQBot注销管理 管理注销 openid 理由
 ```
 
@@ -117,7 +133,11 @@ TRSS-Yunzai QQBot 插件
 #QQBot查看所有用户 1
 #QQBot查看所有好友 1
 #QQBot查看所有用户最近发言 1
-#QQBot搜索用户 用户名 1
+#QQBot查看所有好友最近发言 1
+#QQBot高级搜索 用户名/openid/群名/群openid 1
+#QQBot高级搜索选择 私聊 序号或openid
+#QQBot高级搜索选择 群 序号或openid
+#QQBot高级搜索禁言 30分钟
 #QQBot查看用户所在群 openid
 #QQBot查看所有群 1
 #QQBot查看群成员 群openid 1
@@ -130,19 +150,21 @@ TRSS-Yunzai QQBot 插件
 #QQBot删除群最近发言 群openid 20
 #QQBot删除群最近发言 群openid 全部
 #QQBot备注群名称 群openid 群名
-#QQBot备注群标识 群openid 群号
+#QQBot备注真实群号 群openid 群号
 ```
 
 - 用户、群、群成员列表均支持分页，每页 10 条。
 - `#QQBot查看所有用户 1` 同时包含群成员和有好友关系的用户，并提供“所有好友”和“所有用户发言”入口。
 - `#QQBot查看所有好友 1` 只展示当前仍有好友关系的用户，排除已删除好友，按最近活跃时间倒序。
 - `#QQBot查看所有用户最近发言 1` 聚合展示机器人好友私聊记录，每页 20 条，最多 500 页。
-- `#QQBot搜索用户` 的按钮会针对第一条搜索结果提供“查询发言”和“快速拉黑”；后续搜索结果不增加快捷按钮。
-- `#QQBot搜索用户` 支持按昵称、openid、所在群 openid 模糊搜索，每页 50 条，结果使用代码块输出；同一用户所在多个群会全部列出，未输入关键词会提示缺少参数。纯数字关键词会先只按昵称搜索，昵称无匹配时再提示输入更具体关键词，避免命中过多 openid。
-- 群列表支持备注群名、备注群标识、全量群/非全量群标识、查看最近发言、拉黑/删黑快捷入口。
+- `#QQBot查看所有好友最近发言 1` 只聚合当前仍有好友关系的私聊记录；删除好友后历史保留，但不进入该列表。
+- `#QQBot高级搜索` 支持昵称、用户 openid、所在群 openid、群名和群 openid 模糊搜索。搜索结果生成 10 分钟内存快照，按机器人和操作人隔离，最多保存 1000 个会话。
+- 搜索序号绑定当前快照。可以先选私聊用户再选群，也可以反向选择；任意 openid 可直接输入，纯数字 openid 使用 `openid:内容` 避免被解释为序号。
+- 选择完成后可禁言 `30秒`、`30分钟`、`2小时`、`30天`，输入 `0` 解禁；超过 30 天会拒绝，不会静默截断。
+- 群列表支持备注群名、备注真实群号、全量群/非全量群标识、查看最近发言、拉黑/删黑快捷入口。
 - 单群和单个好友私聊的最近发言支持分页查看，每页 20 条，也支持 `#seq` 查看对应记录的精简 `raw` JSON。
 - `#QQBot查看最近发言` 提供群聊发言、私聊发言和返回按钮；查询菜单中的“最近发言”入口不会增加按钮总数。
-- 所有群最近发言支持分页查看，每页 20 条，最多缓存和展示最近 500 页；历史按会话从 LevelDB 懒加载，不会一次载入全部历史。
+- 所有群最近发言支持分页查看，每页 20 条，最多 5000 页；每 500 页使用一个 2 分钟快照窗口，历史按需懒加载。
 - 最近发言索引使用版本标记；完成一次兼容迁移后，后续启动只读取索引与管理状态，不再重复扫描全部历史消息。
 - 群成员、最近发言、备注等命令缺少或传入无效群 openid 时会直接提示缺少有效参数。
 - 群聊缓存发言可按单群删除，也可在用户管理菜单中清空全部群聊缓存。
@@ -256,6 +278,31 @@ TRSS-Yunzai QQBot 插件
 - `userOpenid` 必填，传用户 openid。
 - `groupOpenid` 可选，传群 openid 时返回该用户在指定群的统计。
 - 返回结构与 `this.e.raw.chat` 一致，包含 `today / yesterday / week / month`。
+
+### `this.e.raw.active`
+
+群消息和群按钮回调会注入当前群的累计活跃用户统计：
+
+```js
+{
+  user: 123,
+  activeat: 80,
+  activenoat: 70
+}
+```
+
+- `activeat` 是累计至少一次 @ 机器人或点击群按钮的去重用户数。
+- `activenoat` 是累计至少一次未 @ 机器人的全量群消息去重用户数。
+- `user` 是两个用户集合的并集去重数，不能将前两项直接相加。
+- 同一用户可因不同消息同时属于 `activeat` 和 `activenoat`；同一消息的全量与 @ 双事件会按消息别名合并，不会误计入两类。
+- 机器人自身消息只读取统计，不计入活跃用户。关闭全量消息后保留已累计的 `activenoat`，只停止新增。
+
+### `this.e.raw.invite.otherkick`
+
+- `otherkick` 表示由当前用户邀请机器人进入、后来由其他用户移除机器人的累计去重群数。
+- `otherkicktime` 是最近一次对应移除时间；原邀请者自己移除机器人时不增加 `otherkick`。
+- 统计按群邀请生命周期关联，重复退出和乱序旧事件不会重复或错误归属；旧数据无法确认邀请者时不会补造统计。
+
 # QQBot 高级群欢迎
 
 高级群欢迎用于在用户入群事件触发时发送官方 Markdown 服务通知。功能按机器人 QQ 分开配置，数据独立存储在 LevelDB，不依赖普通群事件开关。
@@ -317,6 +364,7 @@ qbotcmd：`高级群欢迎菜单`
 
 - `关闭通知`：`#我要关闭通知 当前机器人QQ`
 - `投诉通知`：`#我要投诉通知 当前机器人QQ`
+- `关闭通知` 按钮使用官方群管理员权限，投诉按钮允许普通群成员使用。
 
 ## 次数限制
 
@@ -371,6 +419,10 @@ qbotcmd：`高级群欢迎菜单`
 #QQBot高级群欢迎查看详情 群openid
 #QQBot高级群欢迎关闭 群openid
 #QQBot高级群欢迎开启 群openid
+#QQBot用户管理菜单 投诉拉黑菜单
+#QQBot投诉拉黑 群openid
+#QQBot投诉删黑 群openid
+#QQBot查看投诉拉黑 1
 ```
 
 说明：
@@ -380,6 +432,7 @@ qbotcmd：`高级群欢迎菜单`
 - qbotcmd 不放在代码块内，避免客户端无法识别。
 - 如果群 openid 还没有记录，关闭/开启命令会提前创建状态并提示“群记录不存在，已提前关闭/开启”。
 - 新操作会标记来源：开发者命令显示“开发者”，群主/管理员命令显示“群内管理”，投诉或连续错误自动关闭显示“系统”；旧记录不补来源标签。
+- 投诉拉黑是独立列表，只禁止该群发起和确认新投诉；撤回投诉、关闭/开启通知、普通群拉黑及外部插件命令互不影响。
 
 ## 群员命令
 
@@ -516,8 +569,16 @@ qbotcmd：`高级群欢迎菜单`
 #QQBot召回配置 每批数量 2
 #QQBot召回结果
 #QQBot召回失败 1
-#QQBot普通设置 查看拉入排行
-#QQBot普通设置 查看踢出排行
+#QQBot普通设置 查看排行
+#QQBot普通设置 查看排行 拉入 1
+#QQBot普通设置 查看排行 踢出 1
+#QQBot普通设置 音频错误配置菜单
+#QQBot普通设置 音频错误配置 开启
+#QQBot普通设置 音频错误配置 优先文件
+#QQBot普通设置 音频错误配置 正确文件名开启
+#QQBot高级设置
+#QQBot高级设置 Markdown回复 开启
+#QQBot高级设置 龙虾菜单
 #QQBot高级群欢迎菜单
 ```
 
@@ -530,6 +591,15 @@ qbotcmd：`高级群欢迎菜单`
    - 优化了ws超时的报错重连
    - `toCallback` 默认改为 `false`
    - 新增 `forceSilk` 配置
+   - 新增 `audioErrorFallback` 配置，默认开启；新增 `audioErrorFallbackPriority`，默认 `file`，可配置文件或黑色空白画面视频优先
+   - 新增 `audioCorrectFileName`，默认开启；网络音频转文件时通过 URL `a=https://正确文件名` 机制绕过官方 URL 直传忽略 `file_name` 的问题
+   - 空白封面视频最长 20 分钟且不得超过 20 MiB，使用 H.264/AAC `yuv420p`
+   - 官方返回 `40093013`（上传音频时长超过限制）时，跳过其他音频上传和 Silk 重试，直接进入文件/视频兜底顺序
+   - 旧 `#QQBot普通设置 音频错误转文件/视频 开启/关闭` 命令继续兼容，新配置统一进入 `#QQBot普通设置 音频错误配置菜单`
+   - 频控、鉴权、权限、机器人不在群和禁言等业务错误不会触发 Silk/文件/视频连续重试
+   - Silk 视频兜底先通过 `silk-wasm` 解码，再交给系统 `ffmpeg`；转换临时文件会在成功或失败后清理
+   - 新增 `markdownReference`，默认关闭；关闭时外部插件 Markdown 不发送 `message_reference`，但保留被动回复所需 `msg_id`
+   - 所有内部 `#QQBot` 命令始终不发送 `message_reference`，不受 `markdownReference` 开关影响
    - 新增 `icebreaker` 和 `recall` 配置对象
    - `fullMessageDB` 改为 `level` 存储
    
@@ -586,6 +656,9 @@ segment.file("https://example.com/file.pdf")
 // 2. 网络文件，自定义文件名；文件内容应与扩展名保持一致
 segment.file("https://example.com/document.pdf", "文档.pdf")
 segment.file("https://example.com/audio.mp3", "音频.mp3", 1)
+
+// URL 查询参数不会进入文件名，以下语音文件名为 C600000VlmgY2Xlput.m4a
+segment.record("https://example.com/C600000VlmgY2Xlput.m4a?guid=1&vkey=xxx")
 
 // 3. 本地文件，绝对路径
 segment.file("/root/yunzai/data/file.pdf", "文件.pdf")
@@ -1015,6 +1088,7 @@ const currentDay = getDauDate()
 | 字段 | 说明 |
 | --- | --- |
 | `this.e.group.getChatHistory(seq?, count?)` | 读取该群的本地发言记录 |
+| `this.e.group.active` | 当前群累计去重活跃统计 `{ user, activeat, activenoat }`；`Bot[xxx].pickGroup(groupId).active` 同样可用，并兼容小写 `pickgroup` |
 
 ### 6. this.e.raw 的插件追加字段
 
@@ -1030,6 +1104,7 @@ const currentDay = getDauDate()
 | `this.e.raw.is_has_new_join_request` | 该机器人是否有未读加群申请 |
 | `this.e.raw.iscancelled` | 用户是否处于注销/封禁 |
 | `this.e.raw.invite` | 邀请/好友/召回本地状态（群聊、私聊、通知事件） |
+| `this.e.raw.active` | 当前群累计去重活跃用户 `{ user, activeat, activenoat }`（群消息、群按钮回调） |
 | `this.e.raw.chat` | 用户/群发言统计（全量群消息、好友私聊） |
 | `this.e.raw.qqbot_group_info` | 群 info 官方缓存 |
 | `this.e.raw.qqbot_bot_state` | bot_state 官方缓存 |
@@ -1610,11 +1685,18 @@ this.e.bot.sdk.getSystemMsg() / setGroupAddRequest(...)       // sdk 同样挂�
 ```text
 #QQBot高级搜索 内容
 #QQBot高级搜索 内容 页码
+#QQBot高级搜索选择 私聊 序号或openid
+#QQBot高级搜索选择 群 序号或openid
+#QQBot高级搜索禁言 30分钟
+#QQBot高级搜索禁言 0
 ```
 
 - 原 `#QQBot搜索用户` / `#QQBot全局搜索` 入口统一改为 `#QQBot高级搜索`。
 - 群结果优先使用 `groupInfoStore` 官方缓存显示官方群名、成员数、群简介；用户结果保留昵称、openid、所在群列表（带群名）。
 - 首条为群时快捷按钮为“群聊发言 + 拉黑群”，首条为用户时为“私聊发言 + 拉黑用户”。
+- 搜索页生成按机器人和操作人隔离的 10 分钟内存快照，序号不会重新查询数据库；最多保留 1000 个会话。
+- 支持任意顺序选择用户和群。输入 `openid:内容` 可强制把纯数字解释为 openid；按钮不附加平台 `permission`，命令本身仍由 `config.permission` 校验。
+- 禁言支持秒、分钟、小时、天和 `0` 解禁，最大 30 天。群 openid 进入官方接口路径前会进行 URL 编码，接口错误返回中文摘要。
 
 ## A7. 所有群最近发言快照
 
@@ -1663,3 +1745,142 @@ this.e.bot.sdk.setGroupBan(...) / getMuteMemberList(...)
 - `#QQBot全量消息设置` 显示机器人 member_openid。
 - `#QQBot全量清/查记录` 菜单增加“刷新全量群”（刷新全量已记录群的 bot_state）。
 - 按钮回调（INTERACTION_CREATE）触发群 info 刷新。
+
+---
+
+## 本地扩展同步（相对 GitCode 最新提交）
+
+本节记录本地工作副本在 GitCode `ikun25000/QQBot-Plugin` 最新提交 `81ff653c18f9d038f08cf5a2a0c19cc35543a47b` 基础上的功能扩展。原有文档内容保留。
+
+### 注销管理菜单
+
+无参数命令现在会直接列出全部管理功能：
+
+```text
+#QQBot注销管理
+#QQBot注销管理 查看 1
+#QQBot注销管理 撤回 openid
+#QQBot注销管理 设置注销时间 7天
+#QQBot注销管理 设置注销拉黑时间 3650天
+#QQBot注销管理 强制注销 openid 理由
+```
+
+- `#QQBot注销管理` 会显示查看注销记录、强制撤回、设置注销时间、设置注销拉黑时间和强制注销按钮。
+- `#QQBot注销管理 强制注销 openid 理由` 会立即使目标进入不可用状态；只有开发者可以撤回。
+- 历史文档中的“管理注销”旧写法仍保留在文档中作对照，实际命令使用“强制注销”。
+
+### 群活跃兼容
+
+```js
+this.e.raw.active
+this.e.group.active
+Bot[xxx].pickGroup(group_openid).active
+Bot[xxx].pickgroup(group_openid).active
+```
+
+统计结构为：
+
+```js
+{
+  user: 123,
+  activeat: 80,
+  activenoat: 70
+}
+```
+
+- `user` 是 @ 和非 @ 用户集合的并集去重数。
+- `activeat` 和 `activenoat` 都是累计去重用户数，不是消息数。
+- 同一消息的全量事件和 @ 事件会按消息别名去重，不会因为事件重复把同一用户错误归类。
+- 同一用户因不同消息同时出现在两个集合中是合法情况。
+- 关闭全量消息后保留已有 `activenoat` 累计值，只停止新增。
+
+### 邀请移除统计
+
+```js
+this.e.raw.invite.otherkick
+this.e.raw.invite.otherkicktime
+```
+
+- `otherkick` 表示由该用户邀请机器人入群、后来被其他成员移除的累计去重群数。
+- 原邀请者自己移除机器人时不增加 `otherkick`。
+- 群邀请生命周期、重复退群事件和乱序事件会进行去重及时间校验。
+
+### 好友最近发言
+
+```text
+#QQBot查看所有好友最近发言 1
+```
+
+- 只聚合当前仍为好友的用户。
+- 删除好友后历史记录保留，但不会进入好友聚合列表。
+- 入口位于 `#QQBot查看最近发言`、`#QQBot用户管理菜单 查询菜单`、所有用户页和所有好友页。
+
+### 配置保护和凭据丢失
+
+- `config/QQBot.yaml` 保存使用临时文件、文件同步、原子重命名和目录同步。
+- 有效配置备份在 `data/QQBotConfigBackup/`，保存 `latest-good.yaml`、`latest-credential.yaml` 和历史版本。
+- 部分凭据丢失时不自动恢复用户配置，只通过仍然存在的机器人向主人通知缺失 `AppID`；通知不会包含 `AppSecret` 或完整 token，且同一状态只通知一次。
+- 全部凭据丢失、配置为空或 YAML 损坏时才恢复最近完整凭据备份。
+- 通过账号删除命令明确删除账号时不会触发误报恢复。
+
+### 音频错误配置
+
+```text
+#QQBot普通设置 音频错误配置菜单
+#QQBot普通设置 音频错误配置 开启
+#QQBot普通设置 音频错误配置 关闭
+#QQBot普通设置 音频错误配置 优先文件
+#QQBot普通设置 音频错误配置 优先视频
+#QQBot普通设置 音频错误配置 正确文件名开启
+#QQBot普通设置 音频错误配置 正确文件名关闭
+```
+
+配置项：
+
+```yaml
+audioErrorFallback: true
+audioErrorFallbackPriority: file
+audioCorrectFileName: true
+```
+
+- 默认启用兜底，默认文件优先；视频优先时顺序为视频再文件。
+- 网络音频转文件时，正确文件名机制会在实际 URL 追加 `a=https://文件名`，解决官方 URL 直传忽略 `file_name` 的问题。
+- 空白封面视频最长 20 分钟，最大 20 MiB，使用 H.264/AAC、`yuv420p`。
+- 官方错误码 `40093013`（上传音频时长超过限制）会跳过其他音频上传和 Silk 重试，直接进入文件/视频兜底。
+- 频控、鉴权、权限、禁言和机器人不在群等业务错误不会触发不必要的连续重试。
+
+### Markdown 引用策略
+
+```text
+#QQBot高级设置
+#QQBot高级设置 Markdown回复 开启
+#QQBot高级设置 Markdown回复 关闭
+#QQBot高级设置 Markdown引用回复 开启
+#QQBot高级设置 Markdown引用回复 关闭
+#QQBot高级设置 龙虾菜单
+```
+
+配置项：
+
+```yaml
+markdownReference: false
+```
+
+- 默认关闭外部 Markdown 的 `message_reference`，但保留被动回复所需的 `msg_id`。
+- 开启后，外部插件可以显式发送 Markdown 引用回复。
+- 所有内部 `#QQBot` 命令始终不发送 `message_reference`，不受开关影响。
+- 高级设置根菜单已压缩，龙虾相关按钮移动到 `#QQBot高级设置 龙虾菜单`。
+
+### 高级搜索选择
+
+```text
+#QQBot高级搜索 内容
+#QQBot高级搜索选择 私聊 序号或openid
+#QQBot高级搜索选择 群 序号或openid
+#QQBot高级搜索禁言 30分钟
+```
+
+- 搜索结果页始终显示“选私聊”和“选群聊”；无对应结果时按钮改为直接输入 openid。
+- 选择流程按钮不附加按钮级 `permission`，命令规则仍使用 `config.permission` 校验。
+- 支持先选私聊再选群，也支持先选群再选私聊；纯数字 openid 可使用 `openid:内容`。
+- 搜索快照有效期 10 分钟，禁言最长 30 天，`0` 表示解除禁言。
