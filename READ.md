@@ -608,6 +608,10 @@ segment.file("https://example.com/file.pdf")
 segment.file("https://bbs.hycdn.cn/image/2026/01/24/500031/b3fcde82eed9639923cf532d84d6412e.jpg?a=https://嘿壳.jpg","无效参数.jpg")
 segment.file("http://game.gtimg.cn/images/up/act/a20170301pre/media/bg.mp3","嘿壳.mp3",1)
 
+// 音频错误转文件时可在 #QQBot普通设置 音频错误配置菜单 开关“正确文件名”。
+// 默认开启，网络 URL 会追加 a=https://正确文件名，绕过官方直传忽略 file_name 的问题。
+// 空白封面视频最长 20 分钟，最大 20 MiB。
+
 // 3. 本地文件，绝对路径
 segment.file("/root/yunzai/data/file.pdf", "文件.pdf")
 
@@ -1685,3 +1689,121 @@ this.e.bot.sdk.setGroupBan(...) / getMuteMemberList(...)
 - `#QQBot全量消息设置` 显示机器人 member_openid。
 - `#QQBot全量清/查记录` 菜单增加“刷新全量群”（刷新全量已记录群的 bot_state）。
 - 按钮回调（INTERACTION_CREATE）触发群 info 刷新。
+
+---
+
+## 本地扩展同步（GitCode 最新提交之后）
+
+本节为本地工作副本追加内容，对照 GitCode `ikun25000/QQBot-Plugin` 最新提交 `81ff653c18f9d038f08cf5a2a0c19cc35543a47b` 整理。前文原始内容不删除。
+
+### 注销管理无参数菜单
+
+```text
+#QQBot注销管理
+#QQBot注销管理 查看 1
+#QQBot注销管理 撤回 openid
+#QQBot注销管理 设置注销时间 7天
+#QQBot注销管理 设置注销拉黑时间 3650天
+#QQBot注销管理 强制注销 openid 理由
+```
+
+`#QQBot注销管理` 不带参数时会列出查看注销记录、强制撤回、注销时间、注销拉黑时间和强制注销功能。历史文档中的“管理注销”是旧称，实际使用“强制注销”。
+
+### 群活跃兼容
+
+```js
+this.e.raw.active
+this.e.group.active
+Bot[xxx].pickGroup(group_openid).active
+Bot[xxx].pickgroup(group_openid).active
+```
+
+```js
+{
+  user: 123,
+  activeat: 80,
+  activenoat: 70
+}
+```
+
+- `user` 是 @ 用户集合和非 @ 用户集合的并集去重数。
+- `activeat`、`activenoat` 是累计去重人数，不是消息数量。
+- 同一消息的全量/@ 双事件会进行消息别名去重；不同消息允许同一用户同时出现在两个集合。
+- 关闭全量后不清空既有 `activenoat`。
+
+### 邀请移除与好友发言
+
+```js
+this.e.raw.invite.otherkick
+this.e.raw.invite.otherkicktime
+```
+
+- `otherkick` 只统计其他成员移除原邀请者拉入的群，原邀请者自己移除不计入。
+- 群邀请生命周期和乱序事件会校验，重复事件不会重复计数。
+
+```text
+#QQBot查看所有好友最近发言 1
+```
+
+- 只聚合当前好友；删除好友后保留历史但排除出好友聚合。
+- 命令入口同时存在于最近发言菜单、用户管理查询菜单、所有用户页和所有好友页。
+
+### 配置保护与凭据丢失
+
+- `config/QQBot.yaml` 使用临时文件、同步文件、原子重命名和目录同步，备份目录为 `data/QQBotConfigBackup/`。
+- `latest-good.yaml` 保存最近有效配置，`latest-credential.yaml` 保存最近完整凭据配置，另保留最多 30 个历史版本。
+- 只有部分凭据丢失时不自动恢复文件；剩余机器人通过 `sendMasterMsg` 向主人发送一次缺失 `AppID` 通知，不发送 `AppSecret` 或完整 token。
+- 全部凭据丢失、空配置或损坏 YAML 才会恢复最近完整凭据备份。
+- 账号删除命令的明确删除不会被安全恢复逻辑误判。
+
+### 音频错误配置与文件名
+
+```text
+#QQBot普通设置 音频错误配置菜单
+#QQBot普通设置 音频错误配置 开启
+#QQBot普通设置 音频错误配置 关闭
+#QQBot普通设置 音频错误配置 优先文件
+#QQBot普通设置 音频错误配置 优先视频
+#QQBot普通设置 音频错误配置 正确文件名开启
+#QQBot普通设置 音频错误配置 正确文件名关闭
+```
+
+```yaml
+audioErrorFallback: true
+audioErrorFallbackPriority: file
+audioCorrectFileName: true
+```
+
+- 文件优先为文件后视频，视频优先为视频后文件，默认文件优先。
+- 网络音频转文件会追加 `a=https://正确文件名` 到实际 URL，解决官方 URL 直传忽略 `file_name` 的问题。
+- 空白封面视频最长 20 分钟、最大 20 MiB，使用 H.264/AAC 和 `yuv420p`。
+- `40093013` 上传音频时长超过限制时跳过音频上传方式和 Silk 重试，直接进入文件/视频兜底。
+
+### Markdown 引用回复
+
+```text
+#QQBot高级设置
+#QQBot高级设置 Markdown回复 开启
+#QQBot高级设置 Markdown回复 关闭
+#QQBot高级设置 龙虾菜单
+```
+
+```yaml
+markdownReference: false
+```
+
+- 默认关闭外部 Markdown 的 `message_reference`，但保留 `msg_id`。
+- 内部 `#QQBot` 命令始终不添加 `message_reference`。
+- 高级设置根菜单已压缩，龙虾配置移动到独立子菜单。
+
+### 高级搜索选择补充
+
+```text
+#QQBot高级搜索选择 私聊 序号或openid
+#QQBot高级搜索选择 群 序号或openid
+#QQBot高级搜索禁言 30分钟
+```
+
+- 搜索结果始终显示“选私聊”和“选群聊”；无匹配类型时显示 openid 输入按钮。
+- 选择按钮不附加按钮级 `permission`，命令本身仍使用 `config.permission`。
+- 支持任意顺序选择用户和群，`openid:内容` 可强制按 openid 解析，禁言最长 30 天，`0` 解禁。
