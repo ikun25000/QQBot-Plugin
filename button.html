@@ -1141,6 +1141,20 @@
         setStatus(importMsg, 'error', '没有可导入的按钮');
         return;
       }
+      // 检测平台加密的回调数据: 以 BOT1.0 开头的 data 是平台加密密文(无密钥无法解密)，拒绝导入
+      let encryptedCount = 0;
+      for (const r of newRows) {
+        for (const b of r.buttons) {
+          if ((b.data || '').startsWith('BOT1.0')) encryptedCount++;
+        }
+      }
+      if (encryptedCount > 0) {
+        importMsg.className = 'import-result';
+        importMsg.innerHTML =
+          `<span class="status-msg is-error">${icon('ic-x')}<span>已拒绝导入：${encryptedCount} 个按钮的回调数据以 <code>BOT1.0</code> 开头</span></span>` +
+          `<span class="import-warn">${icon('ic-warn')}<span><strong>BOT1.0 开头是平台加密后的密文，没有密钥、无法解密！</strong><br>这类数据不能作为按钮数据再次生成，请改用自己编写的明文指令/回调数据。</span></span>`;
+        return;
+      }
       rows = newRows;
       const smallFontSelect = document.getElementById('globalSmallFont');
       if (smallFontSelect) smallFontSelect.value = extractSmallFont(parsed) ? 'small' : 'no';
@@ -1357,6 +1371,10 @@
         for (let btn of r.buttons) {
           if (!btn.label || btn.label.trim() === '') {
             setError('存在按钮文字为空');
+            return false;
+          }
+          if ((btn.data || '').startsWith('BOT1.0')) {
+            setError(`按钮「${escapeHtml(btn.label)}」的数据以 BOT1.0 开头：这是平台加密密文(无密钥无法解密)，已拒绝生成`);
             return false;
           }
           if (btn.actionType === '4' && (!btn.templateId || btn.templateId.trim() === '')) {
