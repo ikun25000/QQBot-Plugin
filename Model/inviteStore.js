@@ -12,15 +12,18 @@ class InviteStore {
     this._c2c = {}
     this._atId = {}
     this._recallRuns = {}
+    this._groupInviters = {}
     this._db = null
     this._saveTimer = null
     this._c2cSaveTimer = null
     this._atIdSaveTimer = null
     this._recallRunsSaveTimer = null
+    this._groupInvitersSaveTimer = null
     this._writeQueue = Promise.resolve()
     this._c2cWriteQueue = Promise.resolve()
     this._atIdWriteQueue = Promise.resolve()
     this._recallRunsWriteQueue = Promise.resolve()
+    this._groupInvitersWriteQueue = Promise.resolve()
     this._writeSeq = 0
     this._ready = false
   }
@@ -29,6 +32,7 @@ class InviteStore {
   _c2cJsonPath () { return join(JSON_DATA_DIR, 'c2c_openids.json') }
   _atIdJsonPath () { return join(JSON_DATA_DIR, 'at_id.json') }
   _recallRunsJsonPath () { return join(JSON_DATA_DIR, 'recall_runs.json') }
+  _groupInvitersJsonPath () { return join(JSON_DATA_DIR, 'group_inviters.json') }
 
   async init (type = 'json') {
     if (this._ready && this.type === type) return
@@ -39,6 +43,7 @@ class InviteStore {
     this._c2c = {}
     this._atId = {}
     this._recallRuns = {}
+    this._groupInviters = {}
 
     if (type === 'level') {
       try {
@@ -56,6 +61,9 @@ class InviteStore {
           } else if (String(key).startsWith('__recall_runs__')) {
             const selfId = String(key).replace('__recall_runs__', '')
             this._recallRuns[selfId] = Array.isArray(value) ? value : []
+          } else if (String(key).startsWith('__group_inviters__')) {
+            const selfId = String(key).replace('__group_inviters__', '')
+            this._groupInviters[selfId] = value && typeof value === 'object' ? value : {}
           } else {
             this._data[key] = value
           }
@@ -73,6 +81,7 @@ class InviteStore {
       this._loadJson(this._c2cJsonPath(), '_c2c')
       this._loadJson(this._atIdJsonPath(), '_atId')
       this._loadJson(this._recallRunsJsonPath(), '_recallRuns')
+      this._loadJson(this._groupInvitersJsonPath(), '_groupInviters')
     }
 
     this._ready = true
@@ -123,6 +132,15 @@ class InviteStore {
     }, 1000)
   }
 
+  _scheduleGroupInvitersSave () {
+    if (this.type === 'level' && this._db) return
+    if (this._groupInvitersSaveTimer) clearTimeout(this._groupInvitersSaveTimer)
+    this._groupInvitersSaveTimer = setTimeout(() => {
+      this._writeJsonAtomic(this._groupInvitersJsonPath(), this._groupInviters, '_groupInvitersWriteQueue')
+      this._groupInvitersSaveTimer = null
+    }, 1000)
+  }
+
   _writeJsonAtomic (file, data, queueKey) {
     this[queueKey] = this[queueKey]
       .catch(() => {})
@@ -170,45 +188,121 @@ class InviteStore {
     }
   }
 
+  async _saveGroupInviters (selfId) {
+    if (this.type === 'level' && this._db) {
+      await this._db.set(`__group_inviters__${selfId}`, this._groupInviters[selfId] || {}, 0)
+    } else {
+      this._scheduleGroupInvitersSave()
+    }
+  }
+
   // ========== invite 数据 ==========
   _ensureInvite (selfId, userOpenid) {
     const key = `${selfId}:${userOpenid}`
     if (!this._data[key]) {
-      this._data[key] = { number: 0, kick: 0, time: '', kicktime: '', groups: {}, kickGroups: {} }
+      this._data[key] = { number: 0, kick: 0, otherkick: 0, time: '', kicktime: '', otherkicktime: '', groups: {}, kickGroups: {}, otherkickGroups: {} }
     }
     if (!this._data[key].groups || typeof this._data[key].groups !== 'object') this._data[key].groups = {}
     if (!this._data[key].kickGroups || typeof this._data[key].kickGroups !== 'object') this._data[key].kickGroups = {}
+    if (!this._data[key].otherkickGroups || typeof this._data[key].otherkickGroups !== 'object') this._data[key].otherkickGroups = {}
     return this._data[key]
   }
 
   recordGroupAdd (selfId, userOpenid, groupOpenid, timestamp = '') {
+    if (!this._groupInviters[selfId]) this._groupInviters[selfId] = {}
+    const lifecycle = groupOpenid ? this._groupInviters[selfId][groupOpenid] : null
+    const eventMs = this._timestampMs(timestamp)
+    if (lifecycle) {
+      const boundaryMs = this._timestampMs(lifecycle.active === false ? lifecycle.removed_at : lifecycle.added_at)
+      if (eventMs === null || (boundaryMs !== null && eventMs <= boundaryMs)) return this.getInvite(selfId, userOpenid)
+    }
     const key = `${selfId}:${userOpenid}`
     const inv = this._ensureInvite(selfId, userOpenid)
-    if (groupOpenid && inv.groups[groupOpenid]) return inv
-    inv.time = this._resolveTime(timestamp)
+    const time = this._resolveTime(timestamp)
     if (groupOpenid) {
-      inv.groups[groupOpenid] = inv.time
+      inv.time = time
+      inv.groups[groupOpenid] = time
       inv.number = Object.keys(inv.groups).length
+      this._saveInviteData(key)
     } else {
+      inv.time = time
       inv.number = (inv.number || 0) + 1
+      this._saveInviteData(key)
     }
-    this._saveInviteData(key)
+    if (groupOpenid) {
+      this._groupInviters[selfId][groupOpenid] = {
+        inviter_openid: userOpenid,
+        active: true,
+        added_at: time,
+        removed_at: '',
+        removed_by: ''
+      }
+      this._saveGroupInviters(selfId)
+    }
     return inv
   }
 
   recordGroupDel (selfId, userOpenid, groupOpenid, timestamp = '') {
+    if (!this._groupInviters[selfId]) this._groupInviters[selfId] = {}
+    const time = this._resolveTime(timestamp)
+    const eventMs = this._timestampMs(timestamp)
+    let lifecycle = groupOpenid ? this._groupInviters[selfId][groupOpenid] : null
+    let lifecycleCreated = false
+    if (!lifecycle && groupOpenid) {
+      const inviter = this._findLatestInviter(selfId, groupOpenid)
+      lifecycle = this._groupInviters[selfId][groupOpenid] = { inviter_openid: inviter?.openid || '', active: true, added_at: inviter?.time || '', removed_at: '', removed_by: '' }
+      lifecycleCreated = true
+    }
+    if (lifecycle?.active === false) return this.getInvite(selfId, userOpenid)
+    const addedMs = this._timestampMs(lifecycle?.added_at)
+    if (addedMs !== null && (eventMs === null || eventMs < addedMs)) {
+      if (lifecycleCreated) this._saveGroupInviters(selfId)
+      return this.getInvite(selfId, userOpenid)
+    }
     const key = `${selfId}:${userOpenid}`
     const inv = this._ensureInvite(selfId, userOpenid)
-    if (groupOpenid && inv.kickGroups[groupOpenid]) return inv
-    inv.kicktime = this._resolveTime(timestamp)
+    inv.kicktime = time
     if (groupOpenid) {
-      inv.kickGroups[groupOpenid] = inv.kicktime
-      inv.kick = Object.keys(inv.kickGroups).length
+      if (!inv.kickGroups[groupOpenid]) {
+        inv.kickGroups[groupOpenid] = inv.kicktime
+        inv.kick = Object.keys(inv.kickGroups).length
+      }
     } else {
       inv.kick = (inv.kick || 0) + 1
     }
     this._saveInviteData(key)
+    const inviterOpenid = lifecycle?.inviter_openid || ''
+    if (groupOpenid && inviterOpenid && inviterOpenid !== userOpenid) {
+      const inviterKey = `${selfId}:${inviterOpenid}`
+      const inviter = this._ensureInvite(selfId, inviterOpenid)
+      if (!inviter.otherkickGroups[groupOpenid]) {
+        inviter.otherkicktime = inv.kicktime
+        inviter.otherkickGroups[groupOpenid] = inviter.otherkicktime
+        inviter.otherkick = Object.keys(inviter.otherkickGroups).length
+        this._saveInviteData(inviterKey)
+      }
+    }
+    if (groupOpenid && lifecycle) {
+      lifecycle.active = false
+      lifecycle.removed_at = inv.kicktime
+      lifecycle.removed_by = userOpenid
+      this._saveGroupInviters(selfId)
+    }
     return inv
+  }
+
+  _findLatestInviter (selfId, groupOpenid) {
+    let result = null
+    let latest = 0
+    for (const [key, value] of Object.entries(this._data)) {
+      if (!key.startsWith(`${selfId}:`) || !value?.groups?.[groupOpenid]) continue
+      const time = Date.parse(value.groups[groupOpenid]) || 0
+      if (!result || time > latest) {
+        result = { openid: key.slice(String(selfId).length + 1), time: value.groups[groupOpenid] }
+        latest = time
+      }
+    }
+    return result
   }
 
   getInvite (selfId, userOpenid) {
@@ -217,7 +311,8 @@ class InviteStore {
     return {
       ...inv,
       number: Object.keys(inv.groups || {}).length || Number(inv.number) || 0,
-      kick: Object.keys(inv.kickGroups || {}).length || Number(inv.kick) || 0
+      kick: Object.keys(inv.kickGroups || {}).length || Number(inv.kick) || 0,
+      otherkick: Object.keys(inv.otherkickGroups || {}).length || Number(inv.otherkick) || 0
     }
   }
 
@@ -275,9 +370,14 @@ class InviteStore {
     if (!this._c2c[selfId]) this._c2c[selfId] = {}
     const existing = this._c2c[selfId][userOpenid]
     const now = this._resolveTime(timestamp)
+    const eventMs = this._timestampMs(timestamp)
     if (!existing) {
       this._c2c[selfId][userOpenid] = { firstTime: now, lastActive: now, eventId, friendDeleted: false }
     } else {
+      const lastActiveMs = this._timestampMs(existing.lastActive)
+      const deletedMs = this._timestampMs(existing.friendDeletedTime)
+      if (existing.friendDeleted === true && (eventMs === null || deletedMs === null || eventMs <= deletedMs)) return
+      if (eventMs !== null && lastActiveMs !== null && eventMs < lastActiveMs) return
       existing.lastActive = now
       if (eventId) existing.eventId = eventId
       existing.friendDeleted = false
@@ -290,11 +390,17 @@ class InviteStore {
     if (!selfId || !userOpenid) return
     if (!this._c2c[selfId]) this._c2c[selfId] = {}
     const now = this._resolveTime(timestamp)
+    const eventMs = this._timestampMs(timestamp)
     if (!this._c2c[selfId][userOpenid]) {
       this._c2c[selfId][userOpenid] = { firstTime: now, lastActive: now, eventId: '', friendDeleted: true, friendDeletedTime: now }
     } else {
-      this._c2c[selfId][userOpenid].friendDeleted = true
-      this._c2c[selfId][userOpenid].friendDeletedTime = now
+      const existing = this._c2c[selfId][userOpenid]
+      const deletedMs = this._timestampMs(existing.friendDeletedTime)
+      const lastActiveMs = this._timestampMs(existing.lastActive)
+      if (eventMs !== null && lastActiveMs !== null && eventMs < lastActiveMs) return
+      if (existing.friendDeleted === true && eventMs !== null && deletedMs !== null && eventMs <= deletedMs) return
+      existing.friendDeleted = true
+      existing.friendDeletedTime = now
     }
     this._saveC2cData(selfId)
   }
@@ -308,6 +414,17 @@ class InviteStore {
     const d = new Date(timestamp)
     if (!Number.isNaN(d.getTime())) return d.toISOString()
     return new Date().toISOString()
+  }
+
+  _timestampMs (timestamp) {
+    if (timestamp === '' || timestamp === null || typeof timestamp === 'undefined') return null
+    if (typeof timestamp === 'number' || /^\d+$/.test(String(timestamp))) {
+      const num = Number(timestamp)
+      if (!Number.isFinite(num) || num <= 0) return null
+      return num < 10000000000 ? num * 1000 : num
+    }
+    const parsed = Date.parse(String(timestamp))
+    return Number.isFinite(parsed) ? parsed : null
   }
 
   getC2cUsers (selfId) {
@@ -565,7 +682,7 @@ class InviteStore {
 
   // ========== 存储切换/迁移 ==========
   getAllData () {
-    return { data: { ...this._data }, c2c: JSON.parse(JSON.stringify(this._c2c)), atId: JSON.parse(JSON.stringify(this._atId)), recallRuns: JSON.parse(JSON.stringify(this._recallRuns)) }
+    return { data: { ...this._data }, c2c: JSON.parse(JSON.stringify(this._c2c)), atId: JSON.parse(JSON.stringify(this._atId)), recallRuns: JSON.parse(JSON.stringify(this._recallRuns)), groupInviters: JSON.parse(JSON.stringify(this._groupInviters)) }
   }
 
   async migrateFrom (oldData) {
@@ -599,11 +716,18 @@ class InviteStore {
         if (this.type === 'level' && this._db) await this._db.set(`__recall_runs__${selfId}`, this._recallRuns[selfId], 0)
       }
     }
+    if (oldData.groupInviters && typeof oldData.groupInviters === 'object') {
+      for (const [selfId, groups] of Object.entries(oldData.groupInviters)) {
+        this._groupInviters[selfId] = groups && typeof groups === 'object' ? groups : {}
+        if (this.type === 'level' && this._db) await this._db.set(`__group_inviters__${selfId}`, this._groupInviters[selfId], 0)
+      }
+    }
     if (this.type === 'json') {
       this._scheduleDataSave()
       this._scheduleC2cSave()
       this._scheduleAtIdSave()
       this._scheduleRecallRunsSave()
+      this._scheduleGroupInvitersSave()
     }
     const inviteCount = Object.keys(oldData.data || {}).length
     const c2cCount = Object.values(oldData.c2c || {}).reduce((sum, users) => sum + Object.keys(users).length, 0)
@@ -615,12 +739,14 @@ class InviteStore {
     if (this._c2cSaveTimer) { clearTimeout(this._c2cSaveTimer); this._c2cSaveTimer = null }
     if (this._atIdSaveTimer) { clearTimeout(this._atIdSaveTimer); this._atIdSaveTimer = null }
     if (this._recallRunsSaveTimer) { clearTimeout(this._recallRunsSaveTimer); this._recallRunsSaveTimer = null }
+    if (this._groupInvitersSaveTimer) { clearTimeout(this._groupInvitersSaveTimer); this._groupInvitersSaveTimer = null }
     if (this.type === 'json' && this._ready) {
       this._writeJsonAtomic(this._dataJsonPath(), this._data, '_writeQueue')
       this._writeJsonAtomic(this._c2cJsonPath(), this._c2c, '_c2cWriteQueue')
       this._writeJsonAtomic(this._atIdJsonPath(), this._atId, '_atIdWriteQueue')
       this._writeJsonAtomic(this._recallRunsJsonPath(), this._recallRuns, '_recallRunsWriteQueue')
-      await Promise.allSettled([this._writeQueue, this._c2cWriteQueue, this._atIdWriteQueue, this._recallRunsWriteQueue])
+      this._writeJsonAtomic(this._groupInvitersJsonPath(), this._groupInviters, '_groupInvitersWriteQueue')
+      await Promise.allSettled([this._writeQueue, this._c2cWriteQueue, this._atIdWriteQueue, this._recallRunsWriteQueue, this._groupInvitersWriteQueue])
     }
     if (this._db) {
       try { this._db.close() } catch {}
