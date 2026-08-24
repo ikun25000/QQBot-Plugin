@@ -25,7 +25,7 @@ function weekKey (date = new Date()) {
 class AdvancedWelcomeStore {
   constructor () {
     this.type = 'level'
-    this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {} }
+    this._data = { groups: {}, pendingComplaints: {}, complaintBlacklist: {}, messageIds: {}, localMessageIds: {} }
     this._db = null
     this._ready = false
     this._saveTimer = null
@@ -39,7 +39,7 @@ class AdvancedWelcomeStore {
 
   async init () {
     if (this._ready) return
-    this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {} }
+    this._data = { groups: {}, pendingComplaints: {}, complaintBlacklist: {}, messageIds: {}, localMessageIds: {} }
     this._indexCounts = { messageIds: new Map(), localMessageIds: new Map() }
     this._lastCleanup = Date.now()
     try {
@@ -48,7 +48,7 @@ class AdvancedWelcomeStore {
       this._db = new Level(LEVEL_DATA_DIR)
       await this._db.open({ cleanup: false })
       const deletes = []
-      for (const prefix of ['group:', 'pending:']) {
+      for (const prefix of ['group:', 'pending:', 'complaintBlack:']) {
         for await (const [key, value] of this._db.db.iterator({ gte: prefix, lt: `${prefix}\uffff` })) {
           if (this._isStoredRecordExpired(key, value)) deletes.push(String(key))
           else this._setByKey(key, value)
@@ -61,12 +61,13 @@ class AdvancedWelcomeStore {
       logger.error('[QQBot-Plugin] advancedWelcomeStore LevelDB init failed, fallback to json:', err.message)
       this.type = 'json'
       if (this._db) { try { this._db.close() } catch {}; this._db = null }
-      this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {} }
+      this._data = { groups: {}, pendingComplaints: {}, complaintBlacklist: {}, messageIds: {}, localMessageIds: {} }
       this._indexCounts = { messageIds: new Map(), localMessageIds: new Map() }
       fs.mkdirSync(JSON_DATA_DIR, { recursive: true })
       try {
-        const data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {}, ...JSON.parse(fs.readFileSync(this._jsonPath(), 'utf-8')) }
+        const data = { groups: {}, pendingComplaints: {}, complaintBlacklist: {}, messageIds: {}, localMessageIds: {}, ...JSON.parse(fs.readFileSync(this._jsonPath(), 'utf-8')) }
         this._data.groups = data.groups || {}
+        this._data.complaintBlacklist = data.complaintBlacklist || {}
         for (const [key, value] of Object.entries(data.pendingComplaints || {})) {
           if (!this._isPendingExpired(value)) this._data.pendingComplaints[key] = value
         }
@@ -81,7 +82,7 @@ class AdvancedWelcomeStore {
         deletes.push(...this._pruneIndexStore('messageIds', MESSAGE_INDEX_MAX_PER_BOT), ...this._pruneIndexStore('localMessageIds', LOCAL_MESSAGE_INDEX_MAX_PER_BOT))
         if (deletes.length || Object.keys(data.pendingComplaints || {}).length !== Object.keys(this._data.pendingComplaints).length || Object.keys(data.messageIds || {}).length !== Object.keys(this._data.messageIds).length || Object.keys(data.localMessageIds || {}).length !== Object.keys(this._data.localMessageIds).length) this._scheduleSave()
       } catch {
-        this._data = { groups: {}, pendingComplaints: {}, messageIds: {}, localMessageIds: {} }
+        this._data = { groups: {}, pendingComplaints: {}, complaintBlacklist: {}, messageIds: {}, localMessageIds: {} }
         this._indexCounts = { messageIds: new Map(), localMessageIds: new Map() }
       }
     }
@@ -94,6 +95,7 @@ class AdvancedWelcomeStore {
       this._data.groups[String(key).slice(6)] = value
     }
     else if (String(key).startsWith('pending:')) this._data.pendingComplaints[String(key).slice(8)] = value
+    else if (String(key).startsWith('complaintBlack:')) this._data.complaintBlacklist[String(key).slice(15)] = value
     else if (String(key).startsWith('localmsg:')) this._setIndexItem('localMessageIds', String(key).slice(9), value)
     else if (String(key).startsWith('msg:')) this._setIndexItem('messageIds', String(key).slice(4), value)
   }
@@ -463,6 +465,40 @@ class AdvancedWelcomeStore {
     delete item.complaints[userOpenid]
     await this.saveGroup(item)
     return { withdrawn: true, item }
+  }
+
+  _complaintBlackKey (selfId = '', groupOpenid = '') {
+    return `${selfId}:${groupOpenid}`
+  }
+
+  isComplaintBlacklisted (selfId = '', groupOpenid = '') {
+    return Boolean(this._data.complaintBlacklist[this._complaintBlackKey(selfId, groupOpenid)])
+  }
+
+  async setComplaintBlacklisted (selfId = '', groupOpenid = '', enabled = true, operator = '') {
+    if (!selfId || !groupOpenid) return false
+    const key = this._complaintBlackKey(selfId, groupOpenid)
+    if (enabled) {
+      const item = { self_id: selfId, group_openid: groupOpenid, operator, time: nowIso() }
+      this._data.complaintBlacklist[key] = item
+      await this._save(`complaintBlack:${key}`, item)
+    } else {
+      delete this._data.complaintBlacklist[key]
+      if (this.type === 'level' && this._db) {
+        try { await this._db.db.del(`complaintBlack:${key}`) } catch {}
+      } else this._scheduleSave()
+    }
+    return true
+  }
+
+  listComplaintBlacklist (selfId = '', page = 1, size = 10) {
+    const list = Object.values(this._data.complaintBlacklist)
+      .filter(item => item.self_id === selfId)
+      .sort((a, b) => String(b.time || '').localeCompare(String(a.time || '')))
+    const total = list.length
+    const pageCount = Math.max(1, Math.ceil(total / size))
+    const current = Math.min(pageCount, Math.max(1, Number(page) || 1))
+    return { list: list.slice((current - 1) * size, current * size), total, page: current, pageCount }
   }
 
   getSummary (selfId = '') {
