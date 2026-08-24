@@ -1,6 +1,8 @@
 import makeConfig from '../../../lib/plugins/config.js'
-import YAML from 'yaml'
-import fs from 'node:fs'
+import { allowNextQQBotCredentialRemoval, flushQQBotCredentialLossNotification, installQQBotConfigSafetyHook, prepareQQBotConfig, reloadSafeQQBotConfig, setQQBotCredentialLossNotifier, setQQBotCredentialLossSync, startQQBotConfigBackupCheck } from './configSafety.js'
+
+installQQBotConfigSafetyHook()
+await prepareQQBotConfig()
 
 let { config, configSave } = await makeConfig('QQBot', {
   tips: '',
@@ -9,6 +11,10 @@ let { config, configSave } = await makeConfig('QQBot', {
   toCallback: false,
   toBotUpload: true,
   forceSilk: true,
+  audioErrorFallback: true,
+  audioErrorFallbackPriority: 'file',
+  audioCorrectFileName: true,
+  markdownReference: false,
   groupEvent: false,
   hideGuildRecall: false,
   toQQUin: false,
@@ -81,12 +87,20 @@ let { config, configSave } = await makeConfig('QQBot', {
   ]
 })
 
-function refConfig () {
-  config = YAML.parse(fs.readFileSync('config/QQBot.yaml', 'utf-8'))
+startQQBotConfigBackupCheck()
+
+async function refConfig () {
+  const next = await reloadSafeQQBotConfig()
+  for (const key of Object.keys(config)) delete config[key]
+  Object.assign(config, next)
 }
 
 export {
   config,
   configSave,
-  refConfig
+  refConfig,
+  allowNextQQBotCredentialRemoval,
+  setQQBotCredentialLossNotifier,
+  setQQBotCredentialLossSync,
+  flushQQBotCredentialLossNotification
 }
