@@ -77,6 +77,9 @@ class GroupInfoStore {
       await this._db.open({ cleanup: false })
       for await (const [key, value] of this._db.db.iterator({ gte: 'group:', lt: 'group:\uffff' })) this._data.set(String(key).slice(6), value)
     } catch (err) {
+      if (this._db) {
+        try { await this._db.close() } catch {}
+      }
       this._db = null
       fs.mkdirSync(JSON_DATA_DIR, { recursive: true })
       try {
@@ -90,11 +93,14 @@ class GroupInfoStore {
   }
 
   getGroup (selfId, groupOpenid) {
-    return clone(this._data.get(keyOf(selfId, groupOpenid)) || null)
+    return clone(this.peekGroup(selfId, groupOpenid))
   }
 
+  peekGroup (selfId, groupOpenid) { return this._data.get(keyOf(selfId, groupOpenid)) || null }
   getInfo (selfId, groupOpenid) { return this.getGroup(selfId, groupOpenid)?.info || null }
   getBotState (selfId, groupOpenid) { return this.getGroup(selfId, groupOpenid)?.bot_state || null }
+  peekInfo (selfId, groupOpenid) { return this.peekGroup(selfId, groupOpenid)?.info || null }
+  peekBotState (selfId, groupOpenid) { return this.peekGroup(selfId, groupOpenid)?.bot_state || null }
   getGroupMemberCount (selfId, groupOpenid) { return Number(this.getInfo(selfId, groupOpenid)?.group_member_num) || 0 }
 
   async _save (key, value) {
@@ -133,6 +139,13 @@ class GroupInfoStore {
     const old = this._data.get(key)
     if (old) return Promise.resolve(clone(old))
     return this._update(selfId, groupOpenid, { created_at: now(), last_seen_at: now() })
+  }
+
+  ensureGroup (selfId, groupOpenid) {
+    if (!selfId || !groupOpenid || String(groupOpenid).startsWith('qg_')) return Promise.resolve(false)
+    const key = keyOf(selfId, groupOpenid)
+    if (this._data.has(key)) return Promise.resolve(false)
+    return this._update(selfId, groupOpenid, { created_at: now(), last_seen_at: now() }).then(() => true)
   }
 
   async _request (selfId, groupOpenid, kind, request, options = {}) {
@@ -287,6 +300,23 @@ class GroupInfoStore {
   async listMemberCountRank (selfId, limit = 0) {
     const list = [...this._data.values()].filter(item => item.self_id === String(selfId) && item.info).sort((a, b) => (b.info.group_member_num || 0) - (a.info.group_member_num || 0))
     return (Number(limit) > 0 ? list.slice(0, Number(limit)) : list).map(clone)
+  }
+
+  async close () {
+    await Promise.allSettled([...this._queues.values(), ...this._updateQueues.values(), ...this._refreshing.values()])
+    if (this._db) {
+      try { await this._db.close() } catch {}
+      this._db = null
+    }
+    this._data.clear()
+    this._queues.clear()
+    this._requestTimes.clear()
+    this._pending.clear()
+    this._refreshing.clear()
+    this._lastRefresh.clear()
+    this._counters.clear()
+    this._updateQueues.clear()
+    this._ready = false
   }
 }
 
