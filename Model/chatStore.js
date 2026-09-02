@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import { join } from 'node:path'
-import { pluginPath } from './common.js'
+import { getTime, pluginPath } from './common.js'
 
 const JSON_DATA_DIR = join(process.cwd(), 'data', 'QQBotChat')
 const LEVEL_DATA_DIR = join(pluginPath, 'db', 'chat')
@@ -16,6 +16,15 @@ function dayKey (offset = 0) {
   const date = new Date()
   date.setDate(date.getDate() + offset)
   return date.toISOString().slice(0, 10)
+}
+
+function parseTimestamp (value) {
+  if (!value) return new Date()
+  const numeric = Number(value)
+  if (Number.isFinite(numeric) && String(value).trim()) {
+    return new Date(numeric > 10000000000 ? numeric : numeric * 1000)
+  }
+  return new Date(value)
 }
 
 function periodDays (period) {
@@ -61,7 +70,7 @@ class ChatStore {
     } catch (err) {
       logger.error('[QQBot-Plugin] chatStore LevelDB init failed, fallback to json:', err.message)
       this.type = 'json'
-      if (this._db) { try { this._db.close() } catch {} this._db = null }
+      if (this._db) { try { await this._db.close() } catch {} this._db = null }
       this._data = {}
       this._userRecords.clear()
       this._cacheOrder.clear()
@@ -194,19 +203,34 @@ class ChatStore {
     return this._cacheRecord(key, item)
   }
 
-  async _updateRecord (key, create, update) {
+  async _updateRecord (key, create, update, persist = true) {
     let lane = 0
     for (let index = 0; index < key.length; index++) lane = (lane * 31 + key.charCodeAt(index)) % UPDATE_LANE_COUNT
     const pending = this._updateLanes[lane].catch(() => {}).then(async () => {
       const item = await this._getRecord(key) || create()
       update(item)
       this._cacheRecord(key, item)
-      if (this.type === 'level' && this._db) await this._db.set(key, { ...item }, 31)
-      else this._scheduleSave()
+      if (persist) await this._persistRecords([[key, item]])
       return item
     })
     this._updateLanes[lane] = pending.then(() => undefined, () => undefined)
     return pending
+  }
+
+  async _persistRecords (records = []) {
+    const unique = new Map()
+    for (const [key, item] of records) if (key && item) unique.set(String(key), item)
+    if (!unique.size) return
+    if (this.type === 'level' && this._db) {
+      const expiredTime = getTime(30)
+      await this._db.db.batch([...unique.entries()].map(([key, item]) => ({
+        type: 'put',
+        key,
+        value: { ...item, expiredTime }
+      })))
+    } else {
+      this._scheduleSave()
+    }
   }
 
   _statsCacheKey (selfId, userOpenid, scope, targetOpenid) {
@@ -365,6 +389,7 @@ class ChatStore {
       if (this.type === 'level' && this._db) await this._db.set(key, { ...item }, 31)
       else this._scheduleSave()
     } else {
+      if (!this._data[key]) return false
       this._removeRecord(key)
       if (this.type === 'level' && this._db) { try { await this._db.db.del(key) } catch {} } else this._scheduleSave()
     }
@@ -381,12 +406,13 @@ class ChatStore {
   async recordUserMessage (selfId = '', userOpenid = '', scope = '', targetOpenid = '', timestamp = '', extra = {}) {
     if (!selfId || !userOpenid || !['group', 'private'].includes(scope)) return null
     this._maybeCleanup()
-    let date = timestamp ? new Date(timestamp) : new Date()
+    let date = parseTimestamp(timestamp)
     if (!Number.isNaN(date.getTime()) && date.getTime() > Date.now() + 24 * 60 * 60 * 1000) date = new Date()
     const day = Number.isNaN(date.getTime()) ? dayKey() : date.toISOString().slice(0, 10)
     if (this._isExpired({ day })) return this.getUserStats(selfId, userOpenid, scope, targetOpenid)
     const key = this._makeKey(selfId, userOpenid, scope, targetOpenid, day)
     const now = new Date().toISOString()
+    const pendingRecords = []
     const item = await this._updateRecord(
       key,
       () => ({ self_id: selfId, user_openid: userOpenid, scope, target_openid: targetOpenid || '', day, count: 0, first_time: '', last_time: '' }),
@@ -394,13 +420,14 @@ class ChatStore {
         item.count = Number(item.count) + 1
         if (!item.first_time) item.first_time = now
         item.last_time = now
-      }
+      }, false
     )
+    pendingRecords.push([key, item])
     this._incrementCachedStats(item)
 
     if (scope === 'group' && targetOpenid) {
       const rankKey = this._makeRankKey(selfId, targetOpenid, userOpenid, day)
-      await this._updateRecord(
+      const rankItem = await this._updateRecord(
         rankKey,
         () => ({ self_id: selfId, group_openid: targetOpenid, user_openid: userOpenid, day, count: 0, nickname: '', bot: false }),
         rankItem => {
@@ -408,23 +435,25 @@ class ChatStore {
           rankItem.nickname = extra.nickname || rankItem.nickname || ''
           rankItem.bot = extra.bot === true || rankItem.bot === true
           rankItem.updated_at = now
-        }
+        }, false
       )
+      pendingRecords.push([rankKey, rankItem])
     }
+    await this._persistRecords(pendingRecords)
     return this.getUserStats(selfId, userOpenid, scope, targetOpenid)
   }
 
   async recordGroupRank (selfId = '', groupOpenid = '', userOpenid = '', timestamp = '', extra = {}) {
     if (!selfId || !groupOpenid || !userOpenid) return false
     this._maybeCleanup()
-    let date = timestamp ? new Date(timestamp) : new Date()
+    let date = parseTimestamp(timestamp)
     if (!Number.isNaN(date.getTime()) && date.getTime() > Date.now() + 24 * 60 * 60 * 1000) date = new Date()
     const day = Number.isNaN(date.getTime()) ? dayKey() : date.toISOString().slice(0, 10)
     if (this._isExpired({ day })) return false
     await this.setGroupMemberLeft(selfId, groupOpenid, userOpenid, false)
     const now = new Date().toISOString()
     const rankKey = this._makeRankKey(selfId, groupOpenid, userOpenid, day)
-    await this._updateRecord(
+    const rankItem = await this._updateRecord(
       rankKey,
       () => ({ self_id: selfId, group_openid: groupOpenid, user_openid: userOpenid, day, count: 0, nickname: '', bot: false }),
       rankItem => {
@@ -432,8 +461,9 @@ class ChatStore {
         rankItem.nickname = extra.nickname || rankItem.nickname || ''
         rankItem.bot = extra.bot === true || rankItem.bot === true
         rankItem.updated_at = now
-      }
+      }, false
     )
+    await this._persistRecords([[rankKey, rankItem]])
     return true
   }
 
@@ -572,7 +602,7 @@ class ChatStore {
       })
       await this._writeQueue.catch(() => {})
     }
-    if (this._db) { try { this._db.close() } catch {}; this._db = null }
+    if (this._db) { try { await this._db.close() } catch {}; this._db = null }
     this._userRecords.clear()
     this._cacheOrder.clear()
     this._statsCache.clear()
