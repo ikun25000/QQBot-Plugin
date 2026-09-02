@@ -62,6 +62,8 @@ class JoinRequestStore {
     this._mutationQueue = Promise.resolve()
     this._writeSeq = 0
     this._nextOrder = 1
+    this._unreadBySelf = new Map()
+    this._unreadByGroup = new Map()
   }
 
   _jsonPath () { return join(JSON_DATA_DIR, 'join_requests.json') }
@@ -87,6 +89,8 @@ class JoinRequestStore {
       this.type = type === 'json' ? 'json' : 'level'
       this._records = new Map()
       this._nextOrder = 1
+      this._unreadBySelf.clear()
+      this._unreadByGroup.clear()
 
       if (this.type === 'level') {
         try {
@@ -129,6 +133,26 @@ class JoinRequestStore {
     item.store_order = Number(item.store_order) || this._nextOrder
     this._nextOrder = Math.max(this._nextOrder, item.store_order + 1)
     this._records.set(this._recordKey(item.self_id, item.group_openid, item.join_request_id), item)
+    if (item.unread === true) this._incrementUnread(item)
+  }
+
+  _unreadKey (selfId, groupOpenid = '') { return `${String(selfId)}:${String(groupOpenid)}` }
+
+  _incrementUnread (item) {
+    this._unreadBySelf.set(item.self_id, (this._unreadBySelf.get(item.self_id) || 0) + 1)
+    const key = this._unreadKey(item.self_id, item.group_openid)
+    this._unreadByGroup.set(key, (this._unreadByGroup.get(key) || 0) + 1)
+  }
+
+  _decrementUnread (item) {
+    if (item?.unread !== true) return
+    const selfCount = Math.max(0, (this._unreadBySelf.get(item.self_id) || 1) - 1)
+    if (selfCount) this._unreadBySelf.set(item.self_id, selfCount)
+    else this._unreadBySelf.delete(item.self_id)
+    const key = this._unreadKey(item.self_id, item.group_openid)
+    const groupCount = Math.max(0, (this._unreadByGroup.get(key) || 1) - 1)
+    if (groupCount) this._unreadByGroup.set(key, groupCount)
+    else this._unreadByGroup.delete(key)
   }
 
   _loadJson () {
@@ -274,6 +298,7 @@ class JoinRequestStore {
         store_order: existing?.store_order || this._nextOrder++
       }
       this._records.set(key, item)
+      if (!existing && item.unread === true) this._incrementUnread(item)
       await this._persist([item])
       return clone(item)
     })
@@ -351,6 +376,7 @@ class JoinRequestStore {
       const changed = []
       for (const item of page) {
         if (item.unread !== true) continue
+        this._decrementUnread(item)
         item.unread = false
         item.seen_at = time
         item.updated_at = time
@@ -392,6 +418,7 @@ class JoinRequestStore {
       const time = nowIso()
       for (const item of this._records.values()) {
         if (item.self_id !== selfId || (groupOpenid && item.group_openid !== groupOpenid) || (requestId && item.join_request_id !== requestId) || item.unread !== true) continue
+        this._decrementUnread(item)
         item.unread = false
         item.seen_at = time
         item.updated_at = time
@@ -411,7 +438,9 @@ class JoinRequestStore {
     selfId = String(selfId || '')
     groupOpenid = String(groupOpenid || '')
     if (!selfId) return false
-    return [...this._records.values()].some(item => item.self_id === selfId && (!groupOpenid || item.group_openid === groupOpenid) && item.unread === true)
+    return groupOpenid
+      ? (this._unreadByGroup.get(this._unreadKey(selfId, groupOpenid)) || 0) > 0
+      : (this._unreadBySelf.get(selfId) || 0) > 0
   }
 
   async clear (selfId = '') {
@@ -420,7 +449,10 @@ class JoinRequestStore {
     if (!selfId) return 0
     return this._enqueueMutation(async () => {
       const removed = [...this._records.values()].filter(item => item.self_id === selfId)
-      for (const item of removed) this._records.delete(this._recordKey(item.self_id, item.group_openid, item.join_request_id))
+      for (const item of removed) {
+        this._decrementUnread(item)
+        this._records.delete(this._recordKey(item.self_id, item.group_openid, item.join_request_id))
+      }
       if (removed.length) await this._persist([], removed)
       return removed.length
     })
@@ -455,6 +487,7 @@ class JoinRequestStore {
       const key = this._recordKey(selfId, groupOpenid, requestId)
       const item = this._records.get(key)
       if (!item) return null
+      const wasUnread = item.unread === true
       const status = this._resolutionStatus(resolution)
       const time = nowIso()
       const safeDetails = jsonObject(typeof resolution === 'object' ? resolution : details)
@@ -466,6 +499,7 @@ class JoinRequestStore {
       item.resolved_at = toIso(safeDetails.resolved_at, time)
       item.reason = safeDetails.reason ?? item.reason ?? ''
       item.block = safeDetails.block === true || safeDetails.block === 1 || ['1', 'yes', 'true'].includes(String(safeDetails.block || '').toLowerCase())
+      if (wasUnread) this._decrementUnread(item)
       item.unread = false
       item.seen_at = item.seen_at || time
       item.updated_at = time
@@ -480,6 +514,7 @@ class JoinRequestStore {
           other.resolution = 'invalidated'
           other.invalidated_by = requestId
           other.resolved_at = item.resolved_at
+          if (other.unread === true) this._decrementUnread(other)
           other.unread = false
           other.seen_at = other.seen_at || time
           other.updated_at = time
@@ -559,6 +594,7 @@ class JoinRequestStore {
         item.status = 'expired'
         item.resolution = 'expired'
         item.resolved_at = time
+        if (item.unread === true) this._decrementUnread(item)
         item.unread = false
         item.seen_at = item.seen_at || time
         item.updated_at = time
