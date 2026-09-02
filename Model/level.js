@@ -2,6 +2,8 @@ import { getTime } from './common.js'
 import { Level } from 'level'
 import schedule from 'node-schedule'
 
+const CLEANUP_BATCH_SIZE = 500
+
 export default class level {
   constructor (path) {
     this.db = new Level(path, { valueEncoding: 'json' })
@@ -10,14 +12,28 @@ export default class level {
 
   async cleanup () {
     const today = getTime()
-
+    let deletes = []
+    const flush = async () => {
+      if (!deletes.length) return
+      const operations = []
+      for (const candidate of deletes) {
+        try {
+          const current = await this.db.get(candidate.key)
+          if (current?.expiredTime && new Date(current.expiredTime) < new Date(today)) operations.push({ type: 'del', key: candidate.key })
+        } catch (error) { }
+      }
+      if (operations.length) await this.db.batch(operations)
+      deletes = []
+    }
     for await (const [key, value] of this.db.iterator()) {
       try {
         if (value.expiredTime && new Date(value.expiredTime) < new Date(today)) {
-          await this.db.del(key)
+          deletes.push({ key })
+          if (deletes.length >= CLEANUP_BATCH_SIZE) await flush()
         }
       } catch (error) { }
     }
+    await flush()
   }
 
   setSchedule () {
@@ -89,6 +105,7 @@ export default class level {
   }
 
   close () {
-    this.db.close()
+    try { this.job?.cancel() } catch {}
+    return this.db.close()
   }
 }
