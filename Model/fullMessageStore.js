@@ -5,6 +5,8 @@ import { pluginPath } from './common.js'
 const JSON_DATA_DIR = join(process.cwd(), 'data', 'QQBotFullMessage')
 const LEVEL_DATA_DIR = join(pluginPath, 'db', 'fullMessage')
 const MEMBER_NICKNAME_LIMIT = 20000
+const RECORD_CACHE_LIMIT = 20000
+const RECORD_PAGE_LIMIT = 500
 
 class FullMessageStore {
   constructor () {
@@ -25,6 +27,8 @@ class FullMessageStore {
     this._writeSeq = 0
     this._ready = false
     this._memberNicknameOrder = new Map()
+    this._recordKeys = new Set()
+    this._recordCacheOrder = new Map()
   }
 
   async init (type = 'json') {
@@ -41,6 +45,8 @@ class FullMessageStore {
       blackGroups: {}
     }
     this._memberNicknameOrder.clear()
+    this._recordKeys.clear()
+    this._recordCacheOrder.clear()
 
     if (type === 'level') {
       try {
@@ -48,16 +54,16 @@ class FullMessageStore {
         fs.mkdirSync(LEVEL_DATA_DIR, { recursive: true })
         this._db = new Level(LEVEL_DATA_DIR)
         await this._db.open({ cleanup: false })
-        for await (const [key, value] of this._db.db.iterator()) {
-          if (String(key).startsWith('__meta__')) continue
-          this.records[key] = value
+        for await (const entry of this._db.db.iterator({ keys: true, values: false })) {
+          const key = String(Array.isArray(entry) ? entry[0] : entry?.key ?? entry)
+          if (!key.startsWith('__meta__')) this._recordKeys.add(key)
         }
         this.meta = await this._db.get('__meta__') || this.meta
         if (this._rebuildMemberNicknameOrder()) this._scheduleMetaSave()
       } catch (err) {
         logger.error('[QQBot-Plugin] fullMessageStore LevelDB init failed, fallback to json:', err.message)
         this.type = 'json'
-        if (this._db) { try { this._db.close() } catch {} this._db = null }
+        if (this._db) { try { await this._db.close() } catch {} this._db = null }
       }
     }
 
@@ -65,6 +71,7 @@ class FullMessageStore {
       fs.mkdirSync(JSON_DATA_DIR, { recursive: true })
       this._loadJson()
       this._loadMetaJson()
+      this._recordKeys = new Set(Object.keys(this.records))
       if (this._rebuildMemberNicknameOrder()) this._scheduleMetaSave()
     }
 
@@ -142,6 +149,10 @@ class FullMessageStore {
     }, 1000)
   }
 
+  _scheduleMemberNicknameFlush () {
+    return this._scheduleMetaSave()
+  }
+
   _writeJsonAtomic (file, data, queueKey) {
     this[queueKey] = this[queueKey]
       .catch(() => {})
@@ -188,7 +199,9 @@ class FullMessageStore {
   }
 
   async setRecord (key, value) {
-    this.records[key] = value
+    key = String(key)
+    this._cacheRecord(key, value)
+    this._recordKeys.add(key)
     if (this.type === 'level' && this._db) {
       await this._db.set(key, value, 0)
     } else {
@@ -197,14 +210,111 @@ class FullMessageStore {
   }
 
   getRecord (key) {
-    return this.records[key] || null
+    if (this.records[key]) return this.records[key]
+    key = String(key)
+    if (!this._recordKeys.has(key)) return null
+    const split = key.indexOf(':')
+    return { self_id: split > 0 ? key.slice(0, split) : '', group_openid: split > 0 ? key.slice(split + 1) : '', _lazy: true }
+  }
+
+  _cacheRecord (key, value) {
+    if (!value) return null
+    delete this.records[key]
+    this.records[key] = value
+    if (this.type !== 'level') return value
+    this._recordCacheOrder.delete(key)
+    this._recordCacheOrder.set(key, true)
+    while (this._recordCacheOrder.size > RECORD_CACHE_LIMIT) {
+      const oldest = this._recordCacheOrder.keys().next().value
+      this._recordCacheOrder.delete(oldest)
+      delete this.records[oldest]
+    }
+    return value
+  }
+
+  async getRecordAsync (key) {
+    key = String(key)
+    const cached = this.records[key]
+    if (cached) return cached
+    if (this.type !== 'level' || !this._db) return null
+    try {
+      const value = await this._db.get(key)
+      if (value) this._cacheRecord(key, value)
+      return value || null
+    } catch {
+      return null
+    }
+  }
+
+  hasRecord (key) {
+    return this._recordKeys.has(String(key))
+  }
+
+  async getAnyRecord (selfId = '') {
+    const prefix = selfId ? `${selfId}:` : ''
+    if (this.type !== 'level' || !this._db) {
+      return Object.values(this.records).find(item => !selfId || item.self_id === selfId) || null
+    }
+    for (const key of this._recordKeys) {
+      if (!key.startsWith(prefix)) continue
+      const value = await this.getRecordAsync(key)
+      if (value) return value
+    }
+    return null
+  }
+
+  async getRecordsPage (selfId = '', page = 1, pageSize = 20) {
+    const size = Math.max(1, Number(pageSize) || 20)
+    const requestedPage = Math.max(1, Number(page) || 1)
+    const scanPage = this.type === 'level' && this._db ? Math.min(RECORD_PAGE_LIMIT, requestedPage) : requestedPage
+    const wanted = scanPage * size
+    const records = []
+    const compare = (a, b) => String(b.last_time || '').localeCompare(String(a.last_time || ''))
+    const add = value => {
+      if (!value || (selfId && value.self_id !== selfId)) return
+      records.push(value)
+      records.sort(compare)
+      if (this.type === 'level' && records.length > wanted) records.pop()
+    }
+    if (this.type === 'level' && this._db) {
+      for await (const [key, value] of this._db.db.iterator()) {
+        if (String(key).startsWith('__meta__')) continue
+        add(value)
+      }
+    } else {
+      for (const value of Object.values(this.records)) add(value)
+    }
+    const total = this.type === 'level' && this._db ? this._countRecordKeys(selfId) : records.length
+    const pageCount = Math.max(1, Math.ceil(total / size))
+    const current = Math.min(pageCount, scanPage)
+    return { list: records.slice((current - 1) * size, current * size), total, page: current, pageCount }
+  }
+
+  async getAllRecords () {
+    if (this.type !== 'level' || !this._db) return { ...this.records }
+    const records = {}
+    for await (const [key, value] of this._db.db.iterator()) {
+      if (!String(key).startsWith('__meta__')) records[String(key)] = value
+    }
+    return records
   }
 
   getRecords () {
     return this.records
   }
 
+  _countRecordKeys (selfId = '') {
+    if (!selfId) return this._recordKeys.size
+    const prefix = `${selfId}:`
+    let count = 0
+    for (const key of this._recordKeys) if (key.startsWith(prefix)) count++
+    return count
+  }
+
   getRecordCount (selfId = '') {
+    if (this.type === 'level') {
+      return this._countRecordKeys(selfId)
+    }
     if (!selfId) return Object.keys(this.records).length
     return Object.values(this.records).filter(item => item.self_id === selfId).length
   }
@@ -263,7 +373,7 @@ class FullMessageStore {
       this._memberNicknameOrder.delete(oldest)
       delete this.meta.memberNicknames[oldest]
     }
-    await this.saveMeta()
+    this._scheduleMetaSave()
     return true
   }
 
@@ -328,31 +438,35 @@ class FullMessageStore {
   }
 
   async clearRecords (selfId = '') {
-    const entries = Object.entries(this.records)
-    let count
-    if (!selfId) {
-      count = entries.length
-      this.records = {}
-    } else {
-      const toDelete = entries.filter(([, item]) => item.self_id === selfId)
-      count = toDelete.length
-      for (const [key] of toDelete) {
-        delete this.records[key]
-      }
-    }
-
     if (this.type === 'level' && this._db) {
-      const keysToDelete = !selfId
-        ? entries.map(([k]) => k)
-        : entries.filter(([, item]) => item.self_id === selfId).map(([k]) => k)
-      for (const key of keysToDelete) {
-        try { await this._db.db.del(key) } catch {}
+      const prefix = selfId ? `${selfId}:` : ''
+      const keys = []
+      let count = 0
+      const flush = async () => {
+        if (!keys.length) return
+        await this._db.db.batch(keys.splice(0).map(key => ({ type: 'del', key })))
       }
-    } else {
-      this._scheduleJsonSave()
+      for await (const [rawKey] of this._db.db.iterator()) {
+        const key = String(rawKey)
+        if (key.startsWith('__meta__') || (prefix && !key.startsWith(prefix))) continue
+        count++
+        this._recordKeys.delete(key)
+        this._recordCacheOrder.delete(key)
+        delete this.records[key]
+        keys.push(key)
+        if (keys.length >= 500) await flush()
+      }
+      await flush()
+      return count
     }
 
-    return count
+    const entries = Object.entries(this.records)
+    const toDelete = selfId ? entries.filter(([, item]) => item.self_id === selfId) : entries
+    for (const [key] of toDelete) delete this.records[key]
+    this._recordKeys = new Set(Object.keys(this.records))
+    this._recordCacheOrder.clear()
+    this._scheduleJsonSave()
+    return toDelete.length
   }
 
   async migrateFromConfig (records) {
@@ -361,7 +475,8 @@ class FullMessageStore {
     if (!entries.length) return 0
 
     for (const [key, value] of entries) {
-      this.records[key] = value
+      this._cacheRecord(key, value)
+      this._recordKeys.add(String(key))
     }
 
     if (this.type === 'level' && this._db) {
@@ -440,9 +555,12 @@ class FullMessageStore {
       await Promise.allSettled([this._jsonWriteQueue, this._metaWriteQueue])
     }
     if (this._db) {
-      try { this._db.close() } catch {}
+      try { await this._db.close() } catch {}
       this._db = null
     }
+    this.records = {}
+    this._recordKeys.clear()
+    this._recordCacheOrder.clear()
     this._ready = false
   }
 }
