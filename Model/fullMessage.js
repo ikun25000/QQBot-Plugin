@@ -212,7 +212,7 @@ function migrateLegacyFullMessageOptions (config) {
   return true
 }
 
-function getFullMessageStatusMsg (config, selfId = '', receiveEnabled = true) {
+async function getFullMessageStatusMsg (config, selfId = '', receiveEnabled = true) {
   const fullMessage = ensureFullMessageConfig(config, selfId)
   const total = fullMessageStore.getRecordCount(selfId)
   const blackTotal = fullMessageStore.getBlackGroups(selfId).length
@@ -233,7 +233,8 @@ function getFullMessageStatusMsg (config, selfId = '', receiveEnabled = true) {
   lines.push('', `>WebSocket全量解析: ${receiveEnabled ? '已接入' : '未接入'}`)
   lines.push('', `>已记录群数: ${total}`)
   lines.push('', `>已拉黑群数: ${blackTotal}`)
-  lines.push('', `>机器人member_openid: ${Object.values(fullMessageStore.getRecords()).filter(item => !selfId || item.self_id === selfId).map(item => groupInfoStore.getBotState(item.self_id, item.group_openid)?.member_openid).find(Boolean) || '-'}`)
+  const record = await fullMessageStore.getAnyRecord(selfId)
+  lines.push('', `>机器人member_openid: ${record ? groupInfoStore.getBotState(record.self_id, record.group_openid)?.member_openid || '-' : '-'}`)
   lines.push('', `>存储方式: ${config.fullMessageDB || 'json'}`)
   lines.push('', `><qqbot-cmd-input text="#QQBot全量存储 json" show="切换JSON存储"/>`)
   lines.push('', `><qqbot-cmd-input text="#QQBot全量存储 level" show="切换LevelDB存储"/>`)
@@ -342,7 +343,7 @@ async function recordFullMessageGroup (config, data, event) {
   if (!groupOpenid) return false
 
   const key = `${data.self_id}:${groupOpenid}`
-  const existing = fullMessageStore.getRecord(key)
+  const existing = await fullMessageStore.getRecordAsync(key)
   const eventTime = normalizeRecordTime(event)
   if (!existing) {
     await fullMessageStore.setRecord(key, {
@@ -362,7 +363,7 @@ async function recordFullMessageGroup (config, data, event) {
 
 function isFullMessageGroupRecorded (selfId = '', groupOpenid = '') {
   if (!selfId || !groupOpenid) return false
-  return Boolean(fullMessageStore.getRecord(`${selfId}:${groupOpenid}`))
+  return fullMessageStore.hasRecord(`${selfId}:${groupOpenid}`)
 }
 
 function isFullMessageGroupBlacklisted (selfId = '', groupOpenid = '') {
@@ -412,18 +413,16 @@ function getFullMessageAllNotifyMsg (data) {
   ].join('\n')
 }
 
-function getFullMessageRecordsMsg (config, page = 1, pageSize = 20, selfId = '') {
+async function getFullMessageRecordsMsg (config, page = 1, pageSize = 20, selfId = '') {
   const blackGroups = new Set(fullMessageStore.getBlackGroups(selfId).map(item => item.group_openid))
-  const records = Object.values(fullMessageStore.getRecords())
-    .filter(item => !selfId || item.self_id === selfId)
-    .sort((a, b) => String(b.last_time || '').localeCompare(String(a.last_time || '')))
-  const total = records.length
-  const maxPage = Math.max(1, Math.ceil(total / pageSize))
-  page = Math.max(1, Math.min(maxPage, Number(page) || 1))
+  const records = await fullMessageStore.getRecordsPage(selfId, page, pageSize)
+  const total = records.total
+  const maxPage = records.pageCount
+  page = records.page
   const start = (page - 1) * pageSize
-  const list = records.slice(start, start + pageSize)
+  const list = records.list
   const prefix = selfId ? `[${selfId}] ` : ''
-  const memberOpenid = records.map(item => groupInfoStore.getBotState(item.self_id, item.group_openid)?.member_openid).find(Boolean) || '-'
+  const memberOpenid = list.map(item => groupInfoStore.getBotState(item.self_id, item.group_openid)?.member_openid).find(Boolean) || '-'
   const lines = [`#${prefix.trimEnd()}`, '', `>全量消息记录: 共 ${total} 个,当前第 ${page}/${maxPage} 页`, '', `>机器人member_openid: ${memberOpenid}\n`, '```QbotAllMsgNum']
 
   if (!list.length) {
@@ -689,7 +688,7 @@ async function switchFullMessageDB (config, configSave, type) {
   const oldType = config.fullMessageDB || 'json'
   if (oldType === type) return `存储方式已经是 ${type}`
 
-  const oldRecords = { ...fullMessageStore.getRecords() }
+  const oldRecords = await fullMessageStore.getAllRecords()
   const oldMeta = fullMessageStore.getMeta()
   await fullMessageStore.close()
 
