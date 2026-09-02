@@ -377,6 +377,22 @@ function startQQBotConfigBackupCheck () {
   globalThis[TIMER_KEY] = state.interval
 }
 
+function stopQQBotConfigBackupCheck () {
+  if (state.watchTimer) {
+    clearTimeout(state.watchTimer)
+    state.watchTimer = null
+  }
+  if (state.watcher) {
+    try { state.watcher.close() } catch {}
+    state.watcher = null
+  }
+  if (state.interval) {
+    clearInterval(state.interval)
+    state.interval = null
+  }
+  if (globalThis[TIMER_KEY]) globalThis[TIMER_KEY] = null
+}
+
 async function reloadSafeQQBotConfig () {
   await prepareQQBotConfig()
   return parseValidConfig(await originalReadFile(CONFIG_FILE, 'utf8'))
@@ -390,6 +406,7 @@ export {
   prepareQQBotConfig,
   reloadSafeQQBotConfig,
   startQQBotConfigBackupCheck,
+  stopQQBotConfigBackupCheck,
   setQQBotCredentialLossNotifier,
   setQQBotCredentialLossSync,
   flushQQBotCredentialLossNotification
