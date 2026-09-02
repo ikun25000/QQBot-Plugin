@@ -829,7 +829,6 @@ offlineDetect:
         # ...
     ```
 11. `config/QQBot.yaml`中`simplifiedSdkLog`是否简化sdk日志,若设置为`true`则不会打印` recv from Group(xxx):  xxx`,并且会简化发送为`send to Group(xxx): <markdown><button>`
-12. ~~`#QQBot一键群发`: 需要先配置模版 `template/oneKeySendGroupMsg_default.js`~~
 13. `config/QQBot.yaml`中`markdownImgScale: 1`是否对markdown中的图片进行等比例缩放,0.5为缩小50%,1.5为放大50%,以此类推
 14. `config/QQBot.yaml`中`sendButton: true`未开启全局MD时是否单独发送按钮
 15. `config/QQBot.yaml`中`dauDB: level`选择存储dau数据的数据库,可选: `level`, `redis`,以及`false`关闭dau统计(仅每日发言用户和群)
@@ -839,7 +838,6 @@ offlineDetect:
     - `redis`
       - 优点: 大部分使用redis存储,不会缓存
       - 缺点: 没有缓存所以有些没统计
-16. 已适配YePanel,提供dau统计和设置功能
 17. `config/QQBot.yaml`中`bus`是否使用ws中转站
 - 使用ws中转站可以降低成本,只需要一台低性能云服务器即可通过IP白名单验证,后端可使用本地服务器
 - 填写格式:
@@ -1807,3 +1805,38 @@ markdownReference: false
 - 搜索结果始终显示“选私聊”和“选群聊”；无匹配类型时显示 openid 输入按钮。
 - 选择按钮不附加按钮级 `permission`，命令本身仍使用 `config.permission`。
 - 支持任意顺序选择用户和群，`openid:内容` 可强制按 openid 解析，禁言最长 30 天，`0` 解禁。
+
+---
+
+## 当前版本补充（保留以上历史原文）
+
+以上内容保留旧版插件的原始说明和示例。本节仅追加当前版本差异，未删除或改写上述历史段落。完整当前说明请查看 [README.md](README.md) 的“当前版本补充：性能、用户管理与功能变更”。
+
+### 性能与用户数据
+
+- 高级群欢迎启动先加载群、待处理投诉和投诉黑名单；`msg:`、`localmsg:` 的过期和超量清理改为 ready 后后台执行，避免索引清理阻塞账号连接。
+- 普通消息索引按 Bot 最多 50,000 条，机器人自身消息索引最多 20,000 条，均按 24 小时 TTL 清理；超限时保留约 90% 的较新索引。
+- 用户管理、白名单、可信群、统计和缓存均按 `self_id` 隔离。频道事件不写入用户管理群/好友缓存。
+- 当前实现使用有界缓存和队列；不要通过删除 LevelDB 文件、强制 JSON fallback 或复制旧版运行时代码处理性能问题。
+
+### 消息防护新增入口
+
+```text
+#QQBot高级设置 消息防护设置
+#QQBot高级设置 消息防护设置 总览 [图片|文本]
+#QQBot高级设置 消息防护观察 查看 [图片|文本]
+#QQBot高级设置 消息防护白名单 添加/删除/查看/清空 确认
+#QQBot高级设置 消息防护可信群 添加/删除/查看/清空 确认
+```
+
+- 设置页共 3 页；旧第 4 页和旧观察页码仍兼容。
+- 观察模式只记录预计拦截，不会阻止消息处理；正式防护与观察态的限流状态相互隔离。
+- 图片总览只使用脱敏标识和聚合统计；渲染或发送失败会回退文本。
+- 白名单只在管理员/白名单旁路开启时生效；可信群只绕过群级总量，不绕过用户级、重复内容或队列保护。
+
+### 已删除的旧功能
+
+- `YePanel` 不再随插件提供。
+- `#QQBot一键群发`、`oneKeySendGroupMsg` 不再提供。
+- `deleteNotExistGroup` 自动删除群数据的旧维护逻辑不再提供。
+- 上述旧功能的配置、脚本和示例仅供历史对照，不是当前受支持接口。
