@@ -78,14 +78,22 @@ class UserManageStore {
     this._historyCache = new Map()
     this._recentGroupIndexes = new Map()
     this._recentUserIndexes = new Map()
+    this._recentGroupIndexBySeq = new Map()
+    this._recentUserIndexBySeq = new Map()
     this._jsonHistories = {}
     this._historyKeys = new Set()
     this._historyWriteQueues = new Map()
     this._entityCaches = { user: new Map(), group: new Map() }
     this._entityWriteQueues = new Map()
+    this._dirtyEntityWrites = new Map()
+    this._dirtyEntityWaiters = []
+    this._dirtyEntityFlushTimer = null
+    this._dirtyEntityFlushPromise = null
     this._jsonWriteQueue = Promise.resolve()
     this._writeSeq = 0
     this._recentSnapshots = new Map()
+    this._legacyIndexMigrationPending = false
+    this._legacyIndexMigrationPromises = new Map()
   }
 
   _empty () {
@@ -108,70 +116,47 @@ class UserManageStore {
 
   async init () {
     if (this._ready) return
+    this.type = 'level'
     this._data = this._empty()
     this._historyCache.clear()
     this._recentGroupIndexes.clear()
     this._recentUserIndexes.clear()
+    this._recentGroupIndexBySeq.clear()
+    this._recentUserIndexBySeq.clear()
     this._recentSnapshots.clear()
+    this._legacyIndexMigrationPending = false
+    this._legacyIndexMigrationPromises.clear()
     this._jsonHistories = {}
     this._historyKeys.clear()
     this._historyWriteQueues.clear()
     this._entityCaches.user.clear()
     this._entityCaches.group.clear()
     this._entityWriteQueues.clear()
+    this._dirtyEntityWrites.clear()
+    this._dirtyEntityWaiters = []
+    if (this._dirtyEntityFlushTimer) clearTimeout(this._dirtyEntityFlushTimer)
+    this._dirtyEntityFlushTimer = null
+    this._dirtyEntityFlushPromise = null
     try {
       const { default: Level } = await import('./level.js')
       fs.mkdirSync(LEVEL_DATA_DIR, { recursive: true })
       this._db = new Level(LEVEL_DATA_DIR)
       await this._db.open({ cleanup: false })
-      const legacyRecent = new Map()
-      const legacyUserRecent = new Map()
-      for await (const [key, value] of this._db.db.iterator({ gte: 'recentGroup:', lt: 'recentGroup:\uffff' })) {
-        this._addRecentGroupIndex(value, String(key))
-      }
-      for await (const [key, value] of this._db.db.iterator({ gte: 'recentUser:', lt: 'recentUser:\uffff' })) {
-        this._addRecentUserIndex(value, String(key))
-      }
-      for (const prefix of ['blackUser:', 'blackGroup:', 'cancel:', 'pendingCancel:', 'fullBinding:', 'fullGroupEvent:']) {
+       for await (const [key, value] of this._db.db.iterator({ gte: 'recentGroup:', lt: 'recentGroup:\uffff' })) {
+         this._addRecentGroupIndex(value, String(key))
+       }
+       for await (const [key, value] of this._db.db.iterator({ gte: 'recentUser:', lt: 'recentUser:\uffff' })) {
+         this._addRecentUserIndex(value, String(key))
+       }
+       for (const prefix of ['blackUser:', 'blackGroup:', 'cancel:', 'pendingCancel:', 'fullBinding:', 'fullGroupEvent:']) {
         for await (const [key, value] of this._db.db.iterator({ gte: prefix, lt: `${prefix}\uffff` })) this._setByKey(String(key), value)
       }
-      const indexVersion = Number(await this._db.get(INDEX_VERSION_KEY)) || 0
-      if (indexVersion < INDEX_VERSION) {
-        for await (const [key, value] of this._db.db.iterator({ gte: 'history:', lt: 'history:\uffff' })) {
-          const historyKey = String(key).slice(8)
-          this._historyKeys.add(historyKey)
-          if (historyKey.startsWith('user:')) this._collectLegacyUserRecent(legacyUserRecent, historyKey, value)
-          else this._collectLegacyRecent(legacyRecent, historyKey, value)
-        }
-        for await (const [key, value] of this._db.db.iterator({ gte: 'historyItem:', lt: 'historyItem:\uffff' })) {
-          const itemKey = String(key).slice(12)
-          const split = itemKey.lastIndexOf(':')
-          if (split <= 0) continue
-          const historyKey = itemKey.slice(0, split)
-          this._historyKeys.add(historyKey)
-          if (historyKey.startsWith('user:')) this._collectLegacyUserRecentItem(legacyUserRecent, historyKey, value)
-          else this._collectLegacyRecentItem(legacyRecent, historyKey, value)
-        }
-      }
-      for (const [selfId, items] of legacyRecent) {
-        if ((this._recentGroupIndexes.get(selfId) || []).length) continue
-        const recent = items.sort((a, b) => a.time_ms - b.time_ms || a.seq - b.seq).slice(-RECENT_GROUP_LIMIT)
-          .map(item => ({ ...item, key: this._recentIndexKey(item) }))
-        this._recentGroupIndexes.set(selfId, recent)
-        if (recent.length) await this._db.db.batch(recent.map(item => ({ type: 'put', key: item.key, value: item })))
-      }
-      for (const [selfId, items] of legacyUserRecent) {
-        if ((this._recentUserIndexes.get(selfId) || []).length) continue
-        const recent = items.sort((a, b) => a.time_ms - b.time_ms || a.seq - b.seq).slice(-RECENT_GROUP_LIMIT)
-          .map(item => ({ ...item, key: this._recentUserIndexKey(item) }))
-        this._recentUserIndexes.set(selfId, recent)
-        if (recent.length) await this._db.db.batch(recent.map(item => ({ type: 'put', key: item.key, value: item })))
-      }
-      if (indexVersion < INDEX_VERSION) await this._db.set(INDEX_VERSION_KEY, INDEX_VERSION, 0)
+       const indexVersion = Number(await this._db.get(INDEX_VERSION_KEY)) || 0
+       this._legacyIndexMigrationPending = indexVersion < INDEX_VERSION
     } catch (err) {
       logger.error('[QQBot-Plugin] userManageStore LevelDB init failed, fallback to json:', err.message)
       this.type = 'json'
-      if (this._db) { try { this._db.close() } catch {}; this._db = null }
+      if (this._db) { try { await this._db.close() } catch {}; this._db = null }
       fs.mkdirSync(JSON_DATA_DIR, { recursive: true })
       try {
         const stored = { ...this._empty(), ...JSON.parse(fs.readFileSync(this._jsonPath(), 'utf-8')) }
@@ -182,6 +167,8 @@ class UserManageStore {
           if (key.startsWith('user:')) this._collectLegacyUserRecent(this._recentUserIndexes, key, list, true)
           else this._collectLegacyRecent(this._recentGroupIndexes, key, list, true)
         }
+        for (const [, items] of this._recentGroupIndexes) for (const item of items) this._addRecentIndexLookup('group', item)
+        for (const [, items] of this._recentUserIndexes) for (const item of items) this._addRecentIndexLookup('user', item)
         delete stored.histories
         this._data = stored
       } catch { this._data = this._empty() }
@@ -257,6 +244,63 @@ class UserManageStore {
 
   _recentUserIndexKey (item) {
     return `recentUser:${item.self_id}:${String(item.time_ms).padStart(13, '0')}:${item.user_openid}:${String(item.seq).padStart(12, '0')}`
+  }
+
+  async _writeRecentMigrationBatch (type, items = []) {
+    if (!items.length || this.type !== 'level' || !this._db) return
+    const keyFor = type === 'group' ? item => this._recentIndexKey(item) : item => this._recentUserIndexKey(item)
+    for (let index = 0; index < items.length; index += 500) {
+      const batch = items.slice(index, index + 500).map(item => ({ type: 'put', key: keyFor(item), value: { ...item, key: keyFor(item) } }))
+      await this._db.db.batch(batch)
+    }
+  }
+
+  _legacyIndexMigrationKey (type, selfId) {
+    return `meta:recentIndexMigrated:${type}:${String(selfId)}`
+  }
+
+  async _ensureLegacyRecentIndex (selfId = '', type = 'group') {
+    if (!selfId || !this._legacyIndexMigrationPending || this.type !== 'level' || !this._db) return
+    const id = String(selfId)
+    const migrationKey = `${type}:${id}`
+    const pending = this._legacyIndexMigrationPromises.get(migrationKey)
+    if (pending) return pending
+    const migration = (async () => {
+      if (await this._db.get(this._legacyIndexMigrationKey(type, id))) return
+      const target = type === 'group' ? this._recentGroupIndexes : this._recentUserIndexes
+      const historyPrefix = type === 'group' ? `history:${id}:` : `history:user:${id}:`
+      for await (const [key, value] of this._db.db.iterator({ gte: historyPrefix, lt: `${historyPrefix}\uffff` })) {
+        const historyKey = String(key).slice(8)
+        if (type === 'group') this._collectLegacyRecent(target, historyKey, value, true)
+        else this._collectLegacyUserRecent(target, historyKey, value, true)
+      }
+      const itemPrefix = type === 'group' ? `historyItem:${id}:` : `historyItem:user:${id}:`
+      for await (const [key, value] of this._db.db.iterator({ gte: itemPrefix, lt: `${itemPrefix}\uffff` })) {
+        const itemKey = String(key).slice(12)
+        const split = itemKey.lastIndexOf(':')
+        if (split <= 0) continue
+        const historyKey = itemKey.slice(0, split)
+        if (type === 'group') this._collectLegacyRecentItem(target, historyKey, value)
+        else this._collectLegacyUserRecentItem(target, historyKey, value)
+      }
+      const unique = new Map((target.get(id) || []).map(item => [type === 'group' ? `${item.group_openid}:${item.seq}` : `${item.user_openid}:${item.seq}`, item]))
+      const recent = [...unique.values()]
+        .sort((a, b) => a.time_ms - b.time_ms || a.seq - b.seq)
+        .slice(-RECENT_GROUP_LIMIT)
+        .map(item => ({ ...item, key: type === 'group' ? this._recentIndexKey(item) : this._recentUserIndexKey(item) }))
+      target.set(id, recent)
+      if (type === 'group') this._recentGroupIndexBySeq.set(id, new Map())
+      else this._recentUserIndexBySeq.set(id, new Map())
+      for (const item of recent) this._addRecentIndexLookup(type, item)
+      await this._writeRecentMigrationBatch(type, recent)
+      await this._db.set(this._legacyIndexMigrationKey(type, id), 1, 0)
+    })()
+    this._legacyIndexMigrationPromises.set(migrationKey, migration)
+    try {
+      await migration
+    } finally {
+      this._legacyIndexMigrationPromises.delete(migrationKey)
+    }
   }
 
   _collectLegacyRecent (target, historyKey, list, direct = false) {
@@ -351,6 +395,28 @@ class UserManageStore {
     return list.length > RECENT_GROUP_LIMIT ? list.shift() : null
   }
 
+  _recentIndexLookup (store, selfId) {
+    const target = store === 'group' ? this._recentGroupIndexBySeq : this._recentUserIndexBySeq
+    let lookup = target.get(String(selfId))
+    if (!lookup) {
+      lookup = new Map()
+      target.set(String(selfId), lookup)
+    }
+    return lookup
+  }
+
+  _addRecentIndexLookup (store, item) {
+    const target = this._recentIndexLookup(store, item.self_id)
+    const targetId = store === 'group' ? item.group_openid : item.user_openid
+    target.set(`${targetId}:${Number(item.seq) || 0}`, item)
+  }
+
+  _deleteRecentIndexLookup (store, item) {
+    const target = this._recentIndexLookup(store, item.self_id)
+    const targetId = store === 'group' ? item.group_openid : item.user_openid
+    target.delete(`${targetId}:${Number(item.seq) || 0}`)
+  }
+
   _addRecentGroupIndex (item, key = '') {
     if (!item?.self_id || !item?.group_openid || !item?.seq) return
     const normalized = {
@@ -361,7 +427,9 @@ class UserManageStore {
       key: key || item.key || ''
     }
     const list = this._recentGroupIndexes.get(normalized.self_id) || []
-    this._insertRecentGroupIndex(list, normalized)
+    const removed = this._insertRecentGroupIndex(list, normalized)
+    this._addRecentIndexLookup('group', normalized)
+    if (removed) this._deleteRecentIndexLookup('group', removed)
     this._recentGroupIndexes.set(normalized.self_id, list)
   }
 
@@ -375,7 +443,9 @@ class UserManageStore {
       key: key || item.key || ''
     }
     const list = this._recentUserIndexes.get(normalized.self_id) || []
-    this._insertRecentGroupIndex(list, normalized)
+    const removed = this._insertRecentGroupIndex(list, normalized)
+    this._addRecentIndexLookup('user', normalized)
+    if (removed) this._deleteRecentIndexLookup('user', removed)
     this._recentUserIndexes.set(normalized.self_id, list)
   }
 
@@ -383,10 +453,13 @@ class UserManageStore {
     const normalized = { ...item, key: this._recentIndexKey(item) }
     const list = this._recentGroupIndexes.get(item.self_id) || []
     const removed = this._insertRecentGroupIndex(list, normalized)
+    this._addRecentIndexLookup('group', normalized)
+    if (removed) this._deleteRecentIndexLookup('group', removed)
     this._recentGroupIndexes.set(item.self_id, list)
     if (this.type === 'level' && this._db) {
-      await this._db.set(normalized.key, normalized, 0)
-      if (removed?.key) { try { await this._db.db.del(removed.key) } catch {} }
+      const operations = [{ type: 'put', key: normalized.key, value: normalized }]
+      if (removed?.key) operations.push({ type: 'del', key: removed.key })
+      await this._db.db.batch(operations)
     }
   }
 
@@ -394,10 +467,13 @@ class UserManageStore {
     const normalized = { ...item, key: this._recentUserIndexKey(item) }
     const list = this._recentUserIndexes.get(item.self_id) || []
     const removed = this._insertRecentGroupIndex(list, normalized)
+    this._addRecentIndexLookup('user', normalized)
+    if (removed) this._deleteRecentIndexLookup('user', removed)
     this._recentUserIndexes.set(item.self_id, list)
     if (this.type === 'level' && this._db) {
-      await this._db.set(normalized.key, normalized, 0)
-      if (removed?.key) { try { await this._db.db.del(removed.key) } catch {} }
+      const operations = [{ type: 'put', key: normalized.key, value: normalized }]
+      if (removed?.key) operations.push({ type: 'del', key: removed.key })
+      await this._db.db.batch(operations)
     }
   }
 
@@ -411,38 +487,39 @@ class UserManageStore {
       if (remove) removed.push(item)
       else keep.push(item)
     }
+    for (const item of removed) this._deleteRecentIndexLookup('group', item)
     this._recentGroupIndexes.set(id, keep)
-    if (this.type === 'level' && this._db) {
-      for (const item of removed) {
-        if (item.key) { try { await this._db.db.del(item.key) } catch {} }
-      }
-    }
+    if (this.type === 'level' && this._db && removed.length) await this._db.db.batch(removed.filter(item => item.key).map(item => ({ type: 'del', key: item.key })))
   }
 
-  async _removeRecentGroupSeqs (selfId = '', groupOpenid = '', seqs = []) {
+  async _removeRecentGroupSeqs (selfId = '', groupOpenid = '', seqs = [], persist = true) {
     const targets = new Set(seqs.map(Number).filter(Boolean))
-    if (!targets.size) return
+    if (!targets.size) return []
     const id = String(selfId)
     const list = this._recentGroupIndexes.get(id) || []
-    const removed = list.filter(item => item.group_openid === groupOpenid && targets.has(Number(item.seq) || 0))
-    if (!removed.length) return
+    const lookup = this._recentIndexLookup('group', selfId)
+    const removed = [...targets].map(seq => lookup.get(`${groupOpenid}:${seq}`)).filter(Boolean)
+    if (!removed.length) return []
+    for (const item of removed) this._deleteRecentIndexLookup('group', item)
     this._recentGroupIndexes.set(id, list.filter(item => !removed.includes(item)))
-    if (this.type === 'level' && this._db) {
-      await this._db.db.batch(removed.filter(item => item.key).map(item => ({ type: 'del', key: item.key })))
-    }
+    if (!persist) return removed
+    if (this.type === 'level' && this._db && removed.length) await this._db.db.batch(removed.filter(item => item.key).map(item => ({ type: 'del', key: item.key })))
+    return removed
   }
 
-  async _removeRecentUserSeqs (selfId = '', userOpenid = '', seqs = []) {
+  async _removeRecentUserSeqs (selfId = '', userOpenid = '', seqs = [], persist = true) {
     const targets = new Set(seqs.map(Number).filter(Boolean))
-    if (!targets.size) return
+    if (!targets.size) return []
     const id = String(selfId)
     const list = this._recentUserIndexes.get(id) || []
-    const removed = list.filter(item => item.user_openid === userOpenid && targets.has(Number(item.seq) || 0))
-    if (!removed.length) return
+    const lookup = this._recentIndexLookup('user', selfId)
+    const removed = [...targets].map(seq => lookup.get(`${userOpenid}:${seq}`)).filter(Boolean)
+    if (!removed.length) return []
+    for (const item of removed) this._deleteRecentIndexLookup('user', item)
     this._recentUserIndexes.set(id, list.filter(item => !removed.includes(item)))
-    if (this.type === 'level' && this._db) {
-      await this._db.db.batch(removed.filter(item => item.key).map(item => ({ type: 'del', key: item.key })))
-    }
+    if (!persist) return removed
+    if (this.type === 'level' && this._db && removed.length) await this._db.db.batch(removed.filter(item => item.key).map(item => ({ type: 'del', key: item.key })))
+    return removed
   }
 
   async _removeRecentUserIndexes (selfId = '', userOpenid = '', keepSeqs = null) {
@@ -455,6 +532,7 @@ class UserManageStore {
       if (remove) removed.push(item)
       else keep.push(item)
     }
+    for (const item of removed) this._deleteRecentIndexLookup('user', item)
     this._recentUserIndexes.set(id, keep)
     if (this.type === 'level' && this._db && removed.length) {
       await this._db.db.batch(removed.filter(item => item.key).map(item => ({ type: 'del', key: item.key })))
@@ -513,6 +591,75 @@ class UserManageStore {
       this._jsonHistories[key] = this._getCachedHistory(key)
       this._scheduleSave()
     }
+  }
+
+  _scheduleDirtyEntityFlush () {
+    if (this._dirtyEntityFlushTimer) return
+    this._dirtyEntityFlushTimer = setTimeout(() => {
+      this._dirtyEntityFlushTimer = null
+      this._flushDirtyEntityWrites().catch(err => logger.error('[QQBot-Plugin] userManageStore batch save error:', err.message))
+    }, 0)
+  }
+
+  async _flushDirtyEntityWrites () {
+    if (this._dirtyEntityFlushPromise) return this._dirtyEntityFlushPromise
+    if (!this._dirtyEntityWrites.size) return
+    const entries = [...this._dirtyEntityWrites.values()]
+    const waiters = this._dirtyEntityWaiters.splice(0)
+    this._dirtyEntityWrites.clear()
+    this._dirtyEntityFlushPromise = (async () => {
+      if (this.type === 'level' && this._db) {
+        await this._db.db.batch(entries.map(item => ({ type: 'put', key: item.key, value: item.value })))
+      } else {
+        this._scheduleSave()
+      }
+    })().then(() => {
+      for (const waiter of waiters) waiter.resolve()
+    }).catch(err => {
+      for (const item of entries) this._dirtyEntityWrites.set(item.key, item)
+      for (const waiter of waiters) waiter.reject(err)
+      throw err
+    }).finally(() => {
+      this._dirtyEntityFlushPromise = null
+      if (this._dirtyEntityWrites.size) this._scheduleDirtyEntityFlush()
+    })
+    return this._dirtyEntityFlushPromise
+  }
+
+  _markDirtyEntity (prefix, key, value) {
+    if (this.type === 'level' && this._db) {
+      const dbKey = `${prefix}:${key}`
+      this._dirtyEntityWrites.set(dbKey, { key: dbKey, value })
+      this._scheduleDirtyEntityFlush()
+      return new Promise((resolve, reject) => this._dirtyEntityWaiters.push({ resolve, reject }))
+    } else {
+      this._scheduleSave()
+      return Promise.resolve()
+    }
+  }
+
+  async flush () {
+    while (this._dirtyEntityFlushTimer || this._dirtyEntityWrites.size || this._dirtyEntityFlushPromise) {
+      if (this._dirtyEntityFlushTimer) {
+        clearTimeout(this._dirtyEntityFlushTimer)
+        this._dirtyEntityFlushTimer = null
+      }
+      await this._flushDirtyEntityWrites()
+      if (this._dirtyEntityFlushPromise) await this._dirtyEntityFlushPromise
+    }
+  }
+
+  async close () {
+    await Promise.allSettled([...this._entityWriteQueues.values(), ...this._historyWriteQueues.values()])
+    await Promise.allSettled([...this._legacyIndexMigrationPromises.values()])
+    await this.flush()
+    if (this._db) {
+      try { await this._db.close() } catch {}
+      this._db = null
+    }
+    this._legacyIndexMigrationPromises.clear()
+    this._legacyIndexMigrationPending = false
+    this._ready = false
   }
 
   async _deleteHistoryEntries (key, items = []) {
@@ -585,7 +732,8 @@ class UserManageStore {
     if (info.group_openid) item.groups[info.group_openid] = { group_openid: info.group_openid, nickname: item.nickname, last_seen_at: nowIso() }
     if (this.type === 'level') this._cacheEntity('user', key, item)
     else this._data.users[key] = item
-    await this._save('user', key, item)
+    if (Object.keys(old).length) await this._markDirtyEntity('user', key, item)
+    else await this._save('user', key, item)
     return item
   }
 
@@ -604,7 +752,8 @@ class UserManageStore {
     if (Number(info.group_member_num) > 0) item.group_member_num = Number(info.group_member_num)
     if (this.type === 'level') this._cacheEntity('group', key, item)
     else this._data.groups[key] = item
-    await this._save('group', key, item)
+    if (Object.keys(old).length) await this._markDirtyEntity('group', key, item)
+    else await this._save('group', key, item)
     return item
   }
 
@@ -625,6 +774,7 @@ class UserManageStore {
 
   async _recordHistory (selfId = '', targetOpenid = '', msg = {}) {
     if (!selfId || !targetOpenid || String(targetOpenid).startsWith('qg')) return false
+    await this._ensureLegacyRecentIndex(selfId, (msg.type || 'group') === 'group' ? 'group' : 'user')
     const key = this._historyKey(selfId, targetOpenid, msg.type || 'group')
     const list = await this._loadHistory(key)
     if (typeof this._data.historySeqs[key] === 'undefined' && this.type === 'level' && this._db) {
@@ -650,15 +800,39 @@ class UserManageStore {
     while (list.length > HISTORY_LIMIT) expiredItems.push(list.shift())
     this._historyKeys.add(key)
     this._setHistoryCache(key, list)
+    this._invalidateRecentSnapshots(selfId)
     this._data.historySeqs[key] = Math.max(lastSeq, seq)
-    await this._save('historySeq', key, this._data.historySeqs[key])
-    await this._saveHistoryEntry(key, item, expiredItems)
-    if ((msg.type || 'group') === 'group') {
-      await this._removeRecentGroupSeqs(selfId, targetOpenid, expiredItems.map(item => item.seq))
-      await this._saveRecentGroupIndex({ self_id: String(selfId), group_openid: String(targetOpenid), seq, time_ms: this._historyTimeMs(msg.time) })
+    const isGroup = (msg.type || 'group') === 'group'
+    const recentItem = isGroup
+      ? { self_id: String(selfId), group_openid: String(targetOpenid), seq, time_ms: this._historyTimeMs(msg.time) }
+      : { self_id: String(selfId), user_openid: String(targetOpenid), seq, time_ms: this._historyTimeMs(msg.time) }
+    if (this.type === 'level' && this._db) {
+      const removedIndexes = isGroup
+        ? await this._removeRecentGroupSeqs(selfId, targetOpenid, expiredItems.map(item => item.seq), false)
+        : await this._removeRecentUserSeqs(selfId, targetOpenid, expiredItems.map(item => item.seq), false)
+      const normalizedRecent = { ...recentItem, key: isGroup ? this._recentIndexKey(recentItem) : this._recentUserIndexKey(recentItem) }
+      const recentList = (isGroup ? this._recentGroupIndexes : this._recentUserIndexes).get(String(selfId)) || []
+      const removedRecent = this._insertRecentGroupIndex(recentList, normalizedRecent)
+      ;(isGroup ? this._recentGroupIndexes : this._recentUserIndexes).set(String(selfId), recentList)
+      const operations = [
+        { type: 'put', key: `historySeq:${key}`, value: this._data.historySeqs[key] },
+        { type: 'put', key: this._historyItemKey(key, item.seq), value: item },
+        { type: 'put', key: normalizedRecent.key, value: normalizedRecent }
+      ]
+      for (const old of expiredItems) operations.push({ type: 'del', key: this._historyItemKey(key, old.seq) })
+      for (const old of removedIndexes) if (old?.key) operations.push({ type: 'del', key: old.key })
+      if (removedRecent?.key) operations.push({ type: 'del', key: removedRecent.key })
+      await this._db.db.batch(operations)
     } else {
-      await this._removeRecentUserSeqs(selfId, targetOpenid, expiredItems.map(item => item.seq))
-      await this._saveRecentUserIndex({ self_id: String(selfId), user_openid: String(targetOpenid), seq, time_ms: this._historyTimeMs(msg.time) })
+      await this._save('historySeq', key, this._data.historySeqs[key])
+      await this._saveHistoryEntry(key, item, expiredItems)
+      if (isGroup) {
+        await this._removeRecentGroupSeqs(selfId, targetOpenid, expiredItems.map(item => item.seq))
+        await this._saveRecentGroupIndex(recentItem)
+      } else {
+        await this._removeRecentUserSeqs(selfId, targetOpenid, expiredItems.map(item => item.seq))
+        await this._saveRecentUserIndex(recentItem)
+      }
     }
     return seq
   }
@@ -685,6 +859,7 @@ class UserManageStore {
   }
 
   async listRecentGroupHistories (selfId = '', page = 1, size = 20) {
+    await this._ensureLegacyRecentIndex(selfId, 'group')
     const requested = Math.max(1, Number(page) || 1)
     const windowNo = Math.floor((requested - 1) / RECENT_GROUP_WINDOW_PAGES)
     if (requested > RECENT_GROUP_MAX_PAGES) return { list: [], page: requested, pageCount: requested, total: 0, historyLimit: true }
@@ -738,6 +913,7 @@ class UserManageStore {
   }
 
   async listRecentUserHistories (selfId = '', page = 1, size = 20, allowedOpenids = null) {
+    await this._ensureLegacyRecentIndex(selfId, 'user')
     const allowed = allowedOpenids instanceof Set ? allowedOpenids : null
     const indexes = [...(this._recentUserIndexes.get(String(selfId)) || [])].reverse()
       .filter(item => !allowed || allowed.has(item.user_openid))
@@ -756,6 +932,7 @@ class UserManageStore {
   }
 
   async _deleteRecentHistory (selfId, targetOpenid, count, type, key) {
+    await this._ensureLegacyRecentIndex(selfId, type === 'group' ? 'group' : 'user')
     this._invalidateRecentSnapshots(selfId)
     const list = await this._loadHistory(key)
     if (!list.length) return 0
@@ -774,20 +951,14 @@ class UserManageStore {
   }
 
   async clearGroupHistories (selfId = '') {
+    await this._ensureLegacyRecentIndex(selfId, 'group')
     this._invalidateRecentSnapshots(selfId)
     let messageCount = 0
     let groupCount = 0
-    if (this.type === 'level' && this._db) {
-      const prefix = `historySeq:${selfId}:`
-      for await (const [key, value] of this._db.db.iterator({ gte: prefix, lt: `${prefix}\uffff` })) {
-        const historyKey = String(key).slice(11)
-        this._historyKeys.add(historyKey)
-        this._data.historySeqs[historyKey] = Number(value?.__originalValue ?? value) || 0
-      }
-    }
-    for (const key of this._historyKeys) {
-      if (key.startsWith('user:')) continue
-      if (!key.startsWith(`${selfId}:`)) continue
+    const clearedKeys = new Set()
+    const clearKey = async key => {
+      if (!key || clearedKeys.has(key) || key.startsWith('user:') || !key.startsWith(`${selfId}:`)) return
+      clearedKeys.add(key)
       const result = await this._queueHistoryWrite(key, async () => {
         const list = await this._loadHistory(key)
         if (!list.length) return 0
@@ -800,9 +971,32 @@ class UserManageStore {
         await this._removeRecentGroupIndexes(selfId, key.slice(String(selfId).length + 1), new Set())
         return removed.length
       })
-      if (!result) continue
+      if (!result) return
       messageCount += result
       groupCount++
+    }
+
+    if (this.type === 'level' && this._db) {
+      const seqPrefix = `historySeq:${selfId}:`
+      for await (const [key, value] of this._db.db.iterator({ gte: seqPrefix, lt: `${seqPrefix}\uffff` })) {
+        const historyKey = String(key).slice(11)
+        this._data.historySeqs[historyKey] = Number(value?.__originalValue ?? value) || 0
+        await clearKey(historyKey)
+      }
+      const historyPrefix = `history:${selfId}:`
+      for await (const [key] of this._db.db.iterator({ gte: historyPrefix, lt: `${historyPrefix}\uffff` })) {
+        await clearKey(String(key).slice(8))
+      }
+      const itemPrefix = `historyItem:${selfId}:`
+      for await (const [key] of this._db.db.iterator({ gte: itemPrefix, lt: `${itemPrefix}\uffff` })) {
+        const suffix = String(key).slice(12)
+        const split = suffix.lastIndexOf(':')
+        if (split > 0) await clearKey(suffix.slice(0, split))
+      }
+    }
+
+    for (const key of this._historyKeys) {
+      await clearKey(key)
     }
     return { messageCount, groupCount }
   }
@@ -1040,7 +1234,8 @@ class UserManageStore {
     const old = this._data.fullGroupEvents[key] || {}
     const item = { ...old, self_id: selfId, group_openid: groupOpenid, first_seen_at: old.first_seen_at || nowIso(), last_seen_at: nowIso() }
     this._data.fullGroupEvents[key] = item
-    await this._save('fullGroupEvent', key, item)
+    if (Object.keys(old).length) await this._markDirtyEntity('fullGroupEvent', key, item)
+    else await this._save('fullGroupEvent', key, item)
     return item
   }
 
