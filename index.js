@@ -1,7 +1,8 @@
 import _ from 'lodash'
 import fs from 'node:fs'
 import QRCode from 'qrcode'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import imageSize from 'image-size'
 import { randomUUID } from 'node:crypto'
 import { decode as decodeSilk, encode as encodeSilk, isSilk } from 'silk-wasm'
@@ -93,7 +94,14 @@ import { Bot as QQBot } from 'qq-official-bot'
 import { BindStatus, qrRegister } from './Model/qr-auth.js'
 import fullMessageStore from './Model/fullMessageStore.js'
 const require = createRequire(import.meta.url)
+const QQBOT_PLUGIN_ROOT = dirname(fileURLToPath(import.meta.url))
+const frameworkConfig = await (async () => {
+  try { return (await import('./框架lib/config/config.js')).default }
+  catch { return { master: {} } }
+})()
 const qqbotOriginalEventMap = new WeakMap()
+const qqbotMessageMeta = new WeakMap()
+const qqbotActivityMeta = new WeakMap()
 const qqbotInternalSendStorage = new AsyncLocalStorage()
 const qqbotMessageSuffixApplied = new WeakSet()
 const qqbotMessageSuffixExcluded = new WeakSet()
@@ -101,6 +109,7 @@ const qqbotHelpMarkdownTried = new Set()
 const qqbotHelpMarkdownRestore = new Map()
 const qqbotApiSwitchConfirmations = new Map()
 const qqbotTimedMapExpiries = new Map()
+const qqbotTimedMapWrites = new Map()
 const qqbotMeInfoPromises = new Map()
 const qqbotGroupRefreshBatches = new Map()
 const qqbotAdvancedSearchSessions = new Map()
@@ -111,6 +120,473 @@ const qqbotMessageQueues = new Map()
 const QQBOT_MESSAGE_CONCURRENCY = 8
 const QQBOT_MESSAGE_QUEUE_LIMIT = 500
 const QQBOT_PRIORITY_QUEUE_LIMIT = 1000
+const QQBOT_MESSAGE_SOURCE_QUEUE_LIMIT = 100
+const MESSAGE_PROTECTION_DEFAULTS = {
+  enabled: false,
+  userRateLimit: true,
+  duplicateRateLimit: true,
+  groupRateLimit: true,
+  firstUserBlock: false,
+  observe: false,
+  adminWhitelistBypass: false,
+  trustedGroupBypass: false,
+  messageIdDedupe: true,
+  aggregateStats: true,
+  alert: false,
+  imageMode: false,
+  whitelistUsers: [],
+  trustedGroups: []
+}
+const MESSAGE_PROTECTION_BOOLEAN_KEYS = Object.keys(MESSAGE_PROTECTION_DEFAULTS).filter(key => !['whitelistUsers', 'trustedGroups'].includes(key))
+const MESSAGE_PROTECTION_RULES = {
+  private: { label: '私聊普通消息', limit: 5 },
+  groupFull: { label: '普通全量消息', limit: 5 },
+  groupFullIsYou: { label: '全量 is_you=true', limit: 7 },
+  groupAt: { label: '非全量消息', limit: 10 },
+  callback: { label: '回调按钮事件', limit: 7 }
+}
+const MESSAGE_PROTECTION_SETTING_KEYS = {
+  '总开关': 'enabled',
+  '用户级限流': 'userRateLimit',
+  '重复内容限流': 'duplicateRateLimit',
+  '群级限流': 'groupRateLimit',
+  '首次用户屏蔽': 'firstUserBlock',
+  '管理员旁路': 'adminWhitelistBypass',
+  '管理员/白名单旁路': 'adminWhitelistBypass',
+  '可信群旁路': 'trustedGroupBypass',
+  '消息ID去重': 'messageIdDedupe',
+  '聚合统计': 'aggregateStats',
+  '限流告警': 'alert',
+  '观察模式': 'observe',
+  '图片模式': 'imageMode'
+}
+const messageProtectionUsers = new Map()
+const messageProtectionGroups = new Map()
+const messageProtectionIds = new Map()
+const messageProtectionObserveUsers = new Map()
+const messageProtectionObserveGroups = new Map()
+const messageProtectionObserveIds = new Map()
+const messageProtectionObservations = new Map()
+let messageProtectionRendererPromise
+const messageProtectionRenderRequests = new Map()
+const messageProtectionRenderErrorAt = new Map()
+const messageProtectionAlertAt = new Map()
+const MESSAGE_PROTECTION_RENDER_TIMEOUT_MS = 30000
+
+function getMessageProtectionObservation (selfId, now = Date.now()) {
+  let item = messageProtectionObservations.get(selfId)
+  if (!item || now - item.updatedAt > 24 * 60 * 60 * 1000) {
+    item = {
+      startedAt: now,
+      updatedAt: now,
+        total: 0,
+        allowed: 0,
+        wouldDrop: 0,
+        wouldDropUser: 0,
+        actualDropped: 0,
+        actualDropUser: 0,
+        actualDropDuplicate: 0,
+        actualDropGroup: 0,
+        actualBlocked: 0,
+        actualDropQueue: 0,
+        wouldDropDuplicate: 0,
+        wouldDropGroup: 0,
+        wouldBlockUser: 0,
+        channel: 0,
+        queueDropped: 0,
+        types: {},
+        sources: { user: new Map(), duplicate: new Map(), group: new Map(), queue: new Map() }
+    }
+    messageProtectionObservations.set(selfId, item)
+  }
+  item.updatedAt = now
+  return item
+}
+
+function recordMessageProtectionObservation (selfId, eventName, reason = '', dropped = false, source = '', now = Date.now(), actual = false, payload = {}) {
+  if (ensureMessageProtectionConfig(selfId).aggregateStats === false) return
+  const item = getMessageProtectionObservation(selfId, now)
+  item.total++
+  if (!actual || !dropped) item.allowed++
+  if (!actual && dropped) {
+    item.wouldDrop++
+    if (reason === 'user') item.wouldDropUser++
+    if (reason === 'duplicate') item.wouldDropDuplicate++
+    if (reason === 'group') item.wouldDropGroup++
+  }
+  if (reason === 'channel') item.channel++
+  if (actual && dropped) {
+    item.actualDropped++
+    if (reason === 'user') item.actualDropUser++
+    if (reason === 'duplicate') item.actualDropDuplicate++
+    if (reason === 'group') item.actualDropGroup++
+  }
+  const type = getProtectionRule(eventName, payload) || eventName || 'unknown'
+  const typeStats = item.types[type] || { total: 0, wouldDrop: 0, actualDropped: 0, queueDropped: 0 }
+  typeStats.total++
+  if (!actual && dropped) typeStats.wouldDrop++
+  if (actual && dropped) typeStats.actualDropped++
+  item.types[type] = typeStats
+  if (source && item.sources[reason]) {
+    const fingerprint = crypto.createHash('sha1').update(String(source)).digest('hex').slice(0, 8)
+    const sources = item.sources[reason]
+    sources.set(fingerprint, (sources.get(fingerprint) || 0) + 1)
+    while (sources.size > 100) sources.delete(sources.keys().next().value)
+  }
+}
+
+function recordMessageProtectionBlock (selfId, now = Date.now()) {
+  const cfg = ensureMessageProtectionConfig(selfId)
+  if (cfg.aggregateStats === false || (cfg.enabled !== true && cfg.observe !== true)) return
+  const item = getMessageProtectionObservation(selfId, now)
+  if (cfg.enabled === true && cfg.observe !== true) item.actualBlocked++
+  else item.wouldBlockUser++
+}
+
+function recordMessageProtectionQueueDrop (selfId, event, source = '') {
+  const cfg = ensureMessageProtectionConfig(selfId)
+  if (cfg.aggregateStats === false) return
+  const eventName = event?.post_type || event?.event_name || event?._qqbotRawEvent || 'queue'
+  const item = getMessageProtectionObservation(selfId)
+  item.queueDropped++
+  item.actualDropped++
+  item.actualDropQueue++
+  const type = getProtectionRule(eventName, event) || eventName || 'queue'
+  const typeStats = item.types[type] || { total: 0, wouldDrop: 0, actualDropped: 0, queueDropped: 0 }
+  typeStats.actualDropped++
+  typeStats.queueDropped++
+  item.types[type] = typeStats
+  if (source) {
+    const fingerprint = crypto.createHash('sha1').update(String(source)).digest('hex').slice(0, 8)
+    const sources = item.sources.queue
+    sources.set(fingerprint, (sources.get(fingerprint) || 0) + 1)
+    while (sources.size > 100) sources.delete(sources.keys().next().value)
+  }
+  maybeAlertMessageProtectionDrop(selfId, 'queue')
+}
+
+function clearMessageProtectionObservation (selfId) {
+  messageProtectionObservations.delete(selfId)
+  for (const map of [messageProtectionObserveUsers, messageProtectionObserveGroups, messageProtectionObserveIds]) {
+    for (const key of map.keys()) {
+      if (String(key).startsWith(`${selfId}:`)) map.delete(key)
+    }
+  }
+}
+
+function recordMessageProtectionOutcome (selfId, eventName, reason = '', dropped = false, source = '', now = Date.now(), payload = {}) {
+  const cfg = ensureMessageProtectionConfig(selfId)
+  if (cfg.aggregateStats === false || (cfg.enabled !== true && cfg.observe !== true)) return
+  const actual = cfg.enabled === true && cfg.observe !== true
+  recordMessageProtectionObservation(selfId, eventName, reason, dropped, source, now, actual, payload)
+  if (dropped && actual) maybeAlertMessageProtectionDrop(selfId, reason)
+}
+
+function maybeAlertMessageProtectionDrop (selfId, reason = '') {
+  if (ensureMessageProtectionConfig(selfId).alert !== true) return
+  const now = Date.now()
+  const last = messageProtectionAlertAt.get(selfId) || 0
+  if (now - last < 60 * 1000) return
+  messageProtectionAlertAt.set(selfId, now)
+  globalThis.Bot?.makeLog?.('warn', [`[${selfId}] 消息防护已拦截消息`, { reason, interval: '60秒聚合告警' }], selfId)
+}
+
+function maskMessageProtectionIdentifier (value = '') {
+  const text = String(value || '')
+  if (text.length <= 8) return text ? `${text.slice(0, 2)}...` : '-'
+  return `${text.slice(0, 3)}...${text.slice(-3)}`
+}
+
+function normalizeMessageProtectionGroup (selfId, value = '') {
+  const text = String(value || '').trim().replace(new RegExp(`^${escapeRegExp(String(selfId))}:`), '')
+  return text.replace(/^group:/i, '').trim()
+}
+
+function countBlockedMessageProtectionUsers (selfId, now = Date.now()) {
+  let count = 0
+  for (const [key, state] of messageProtectionUsers) {
+    if (key.startsWith(`${selfId}:`) && Number(state?.blockedUntil) > now) count++
+  }
+  return count
+}
+
+function getMessageProtectionReport (selfId) {
+  const cfg = ensureMessageProtectionConfig(selfId)
+  const data = messageProtectionObservations.get(selfId)
+  const status = value => value === true ? '开启' : '关闭'
+  const rules = Object.entries(MESSAGE_PROTECTION_RULES).map(([key, rule]) => ({
+    key,
+    label: rule.label,
+    value: `${rule.limit} 条/秒`
+  }))
+  const switches = [
+    ['消息防护总开关', cfg.enabled],
+    ['用户级限流', cfg.userRateLimit],
+    ['重复内容限流', cfg.duplicateRateLimit],
+    ['群级限流', cfg.groupRateLimit],
+    ['首次用户屏蔽', cfg.firstUserBlock],
+    ['管理员/白名单旁路', cfg.adminWhitelistBypass],
+    ['可信群旁路', cfg.trustedGroupBypass],
+    ['消息ID去重', cfg.messageIdDedupe],
+    ['限流聚合统计', cfg.aggregateStats],
+    ['限流告警', cfg.alert],
+    ['图片模式', cfg.imageMode],
+    ['观察模式', cfg.observe]
+  ].map(([label, value]) => ({ label, value: status(value) }))
+  const metrics = {
+    total: data ? data.total : null,
+    allowed: data ? data.allowed : null,
+    wouldDrop: data ? data.wouldDrop : null,
+    actualDropped: data ? data.actualDropped : null,
+    wouldDropUser: data ? data.wouldDropUser : null,
+    wouldDropDuplicate: data ? data.wouldDropDuplicate : null,
+    wouldDropGroup: data ? data.wouldDropGroup : null,
+    wouldBlockUser: data ? data.wouldBlockUser : null,
+    actualDropUser: data ? data.actualDropUser : null,
+    actualDropDuplicate: data ? data.actualDropDuplicate : null,
+    actualDropGroup: data ? data.actualDropGroup : null,
+    actualBlocked: data ? data.actualBlocked : null,
+    actualDropQueue: data ? data.actualDropQueue : null,
+    queueDropped: data ? data.queueDropped : null,
+    channel: data ? data.channel : null,
+    blockedUsers: countBlockedMessageProtectionUsers(selfId)
+  }
+  const types = Object.entries(MESSAGE_PROTECTION_RULES).map(([key, rule]) => {
+    const item = data?.types?.[key]
+    return { label: rule.label, total: item?.total ?? null, wouldDrop: item?.wouldDrop ?? null, actualDropped: item?.actualDropped ?? null, queueDropped: item?.queueDropped ?? null }
+  })
+  const statsAvailable = Boolean(data && cfg.aggregateStats !== false)
+  const unavailableReason = cfg.aggregateStats === false ? '聚合统计已关闭' : !data ? '观察/统计尚未采集数据' : ''
+  return {
+    selfId,
+    switches,
+    rules,
+    metrics,
+    types,
+    statsAvailable,
+    unavailableReason,
+    startedAt: data?.startedAt || 0,
+    updatedAt: data?.updatedAt || 0,
+    whitelistCount: cfg.whitelistUsers.length,
+    trustedGroupCount: cfg.trustedGroups.length,
+    whitelistLimit: 1000,
+    trustedGroupLimit: 1000,
+    imageMode: cfg.imageMode === true,
+    observe: cfg.observe === true,
+    status
+  }
+}
+
+function ensureMessageProtectionConfig (selfId = '') {
+  if (!config.messageProtection || typeof config.messageProtection !== 'object' || Array.isArray(config.messageProtection)) config.messageProtection = { bots: {} }
+  if (!config.messageProtection.bots || typeof config.messageProtection.bots !== 'object' || Array.isArray(config.messageProtection.bots)) config.messageProtection.bots = {}
+  const key = selfId || 'default'
+  if (!config.messageProtection.bots[key] || typeof config.messageProtection.bots[key] !== 'object' || Array.isArray(config.messageProtection.bots[key])) config.messageProtection.bots[key] = {}
+  const target = config.messageProtection.bots[key]
+  for (const [name, value] of Object.entries(MESSAGE_PROTECTION_DEFAULTS)) {
+    if (typeof target[name] !== 'undefined') continue
+    target[name] = Array.isArray(value) ? [...value] : value
+  }
+  for (const name of MESSAGE_PROTECTION_BOOLEAN_KEYS) target[name] = target[name] === true
+  if (!Array.isArray(target.whitelistUsers)) target.whitelistUsers = []
+  target.whitelistUsers = [...new Set(target.whitelistUsers.map(normalizeQQBotOpenid).filter(Boolean))].slice(0, 1000)
+  if (!Array.isArray(target.trustedGroups)) target.trustedGroups = []
+  target.trustedGroups = [...new Set(target.trustedGroups.map(value => normalizeMessageProtectionGroup(selfId, value)).filter(Boolean))].slice(0, 1000)
+  return target
+}
+
+function migrateLegacyMessageProtectionConfig () {
+  const root = config.messageProtection
+  const rootValues = root && typeof root === 'object' && !Array.isArray(root)
+    ? Object.fromEntries(Object.keys(MESSAGE_PROTECTION_DEFAULTS).filter(key => typeof root[key] !== 'undefined').map(key => [key, root[key]]))
+    : {}
+  const selfIds = new Set([
+    ...(Array.isArray(config.token) ? config.token.map(token => String(token).split(':')[0]).filter(Boolean) : []),
+    ...(config.bots && typeof config.bots === 'object' && !Array.isArray(config.bots) ? Object.keys(config.bots) : [])
+  ])
+  if (Object.keys(rootValues).length || !selfIds.size) selfIds.add('default')
+  let changed = false
+  for (const selfId of selfIds) {
+    const before = JSON.stringify(config.messageProtection?.bots?.[selfId] || null)
+    const legacy = config.bots?.[selfId]?.messageProtection
+    if (Object.keys(rootValues).length) {
+      if (!config.messageProtection.bots || typeof config.messageProtection.bots !== 'object' || Array.isArray(config.messageProtection.bots)) config.messageProtection.bots = {}
+      if (!config.messageProtection.bots[selfId] || typeof config.messageProtection.bots[selfId] !== 'object' || Array.isArray(config.messageProtection.bots[selfId])) config.messageProtection.bots[selfId] = {}
+      for (const [key, value] of Object.entries(rootValues)) {
+        if (typeof config.messageProtection.bots[selfId][key] === 'undefined') config.messageProtection.bots[selfId][key] = Array.isArray(value) ? [...value] : value
+      }
+    }
+    if (legacy && typeof legacy === 'object' && !Array.isArray(legacy)) {
+      for (const [key, value] of Object.entries(legacy)) {
+        if (Object.prototype.hasOwnProperty.call(MESSAGE_PROTECTION_DEFAULTS, key) && typeof config.messageProtection.bots[selfId][key] === 'undefined') config.messageProtection.bots[selfId][key] = Array.isArray(value) ? [...value] : value
+      }
+    }
+    ensureMessageProtectionConfig(selfId)
+    if (before !== JSON.stringify(config.messageProtection.bots[selfId])) changed = true
+  }
+  return changed
+}
+
+function pruneProtectionTimes (times, now, windowMs = 1000) {
+  return times.filter(time => now - time < windowMs)
+}
+
+function getProtectionState (map, key, now, maxSize = 10000) {
+  let state = map.get(key)
+  if (!state) {
+    state = { lastAt: now, strikes: 0, blockedUntil: 0, types: {}, contents: new Map() }
+    map.set(key, state)
+  } else {
+    state.lastAt = now
+  }
+  for (const [name, times] of Object.entries(state.types)) {
+    state.types[name] = pruneProtectionTimes(times, now)
+    if (!state.types[name].length) delete state.types[name]
+  }
+  for (const [hash, times] of state.contents) {
+    const fresh = pruneProtectionTimes(times, now)
+    if (fresh.length) state.contents.set(hash, fresh)
+    else state.contents.delete(hash)
+  }
+  while (state.contents.size > 128) state.contents.delete(state.contents.keys().next().value)
+  let scanned = 0
+  for (const [existingKey, existing] of map) {
+    if (now - existing.lastAt <= 5 * 60 * 1000 || ++scanned >= 128) break
+    map.delete(existingKey)
+  }
+  map.delete(key)
+  map.set(key, state)
+  while (map.size > maxSize) map.delete(map.keys().next().value)
+  return state
+}
+
+function getProtectionContent (eventName, payload = {}) {
+  if (eventName === 'INTERACTION_CREATE') return String(payload.data?.resolved?.button_data || payload.data?.resolved?.button_id || '').replace(/\s+/g, ' ').trim()
+  return String(payload.content || payload.raw_message || payload._rawContent || '').replace(/\s+/g, ' ').trim()
+}
+
+function isMessageProtectionCommand (content) {
+  return /^\s*(?:<@[^>]+>\s*)*#(?:q+bot|QQBot)高级设置\s+消息防护(?:设置|观察|白名单|可信群)/i.test(String(content || '').trim())
+}
+
+function getProtectionUser (payload = {}) {
+  return normalizeQQBotOpenid(
+    payload.author?.id || payload.author?.user_openid || payload.author?.member_openid ||
+    payload.user_openid || payload.user_id || payload.sender?.user_id || payload.operator_id ||
+    payload.group_member_openid || ''
+  )
+}
+
+function getProtectionGroup (selfId, payload = {}) {
+  return String(
+    payload.group_openid || payload.raw_group_id || payload.group_id ||
+    payload.data?.resolved?.group_openid || payload.data?.resolved?.group_id || ''
+  ).replace(new RegExp(`^${escapeRegExp(String(selfId))}:`), '').trim()
+}
+
+function getProtectionRule (eventName, payload = {}) {
+  if (eventName === 'C2C_MESSAGE_CREATE') return 'private'
+  if (eventName === 'GROUP_AT_MESSAGE_CREATE') return 'groupAt'
+  if (eventName === 'GROUP_MESSAGE_CREATE') {
+    const mentions = payload.mentions || payload._mentions || []
+    return mentions.some(item => item?.is_you === true) ? 'groupFullIsYou' : 'groupFull'
+  }
+  if (eventName === 'INTERACTION_CREATE') return 'callback'
+  return ''
+}
+
+function shouldDropQQBotRawEvent (selfId, eventName, payload = {}) {
+  if (!['C2C_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'GROUP_AT_MESSAGE_CREATE', 'INTERACTION_CREATE'].includes(eventName)) return false
+  const content = getProtectionContent(eventName, payload)
+  if (isMessageProtectionCommand(content)) return false
+  const cfg = ensureMessageProtectionConfig(selfId)
+  if (cfg.enabled !== true && cfg.observe !== true) return false
+  const userStates = cfg.observe === true ? messageProtectionObserveUsers : messageProtectionUsers
+  const groupStates = cfg.observe === true ? messageProtectionObserveGroups : messageProtectionGroups
+  const messageIds = cfg.observe === true ? messageProtectionObserveIds : messageProtectionIds
+  if (payload.guild_id && payload.channel_id) {
+    recordMessageProtectionOutcome(selfId, eventName, 'channel', false, '', Date.now(), payload)
+    return false
+  }
+  const user = getProtectionUser(payload)
+  if (!user) return false
+  const group = eventName === 'C2C_MESSAGE_CREATE' ? '' : normalizeMessageProtectionGroup(selfId, getProtectionGroup(selfId, payload))
+  const authorRole = String(payload.author?.member_role || payload.member_role || payload.sender?.role || '').toLowerCase()
+  const userBypass = cfg.adminWhitelistBypass === true && (
+    frameworkConfig.master?.[selfId]?.some?.(item => String(item) === user) ||
+    cfg.whitelistUsers.includes(user) ||
+    ['admin', 'owner'].includes(authorRole) ||
+    payload.isMaster === true
+  )
+  const trustedGroup = group && cfg.trustedGroupBypass === true && cfg.trustedGroups.includes(group)
+  const scope = group ? `${selfId}:group:${group}:${user}` : `${selfId}:user:${user}`
+  const now = Date.now()
+  const state = getProtectionState(userStates, scope, now)
+  const messageId = String(payload.id || payload.message_id || payload.event_id || '').trim()
+  if (!userBypass && cfg.messageIdDedupe !== false && messageId) {
+    const previous = messageIds.get(`${selfId}:${messageId}`)
+    let scanned = 0
+    for (const [key, time] of messageIds) {
+      if (now - time <= 5 * 60 * 1000 || ++scanned >= 128) break
+      messageIds.delete(key)
+    }
+    if (previous && now - previous < 5 * 60 * 1000) {
+      recordMessageProtectionOutcome(selfId, eventName, 'duplicate', true, messageId, now, payload)
+      return cfg.enabled === true && cfg.observe !== true
+    }
+    messageIds.set(`${selfId}:${messageId}`, now)
+    while (messageIds.size > 10000) messageIds.delete(messageIds.keys().next().value)
+  }
+  if (state.blockedUntil > now) {
+    recordMessageProtectionOutcome(selfId, eventName, 'blocked', true, scope, now, payload)
+    return cfg.enabled === true && cfg.observe !== true
+  }
+  const strike = () => {
+    if (cfg.firstUserBlock !== true) return false
+    const wasBlocked = state.blockedUntil > now
+    state.strikes = Math.min(8, (state.strikes || 0) + 1)
+    const seconds = state.strikes === 1 ? 10 : Math.min(600, 60 * (2 ** Math.min(4, state.strikes - 2)))
+    state.blockedUntil = now + seconds * 1000
+    return !wasBlocked
+  }
+  const ruleName = getProtectionRule(eventName, payload)
+  const rule = MESSAGE_PROTECTION_RULES[ruleName]
+  if (!userBypass && cfg.userRateLimit === true && rule) {
+    const times = state.types[ruleName] || []
+    if (times.length >= rule.limit) {
+      const blocked = strike()
+      recordMessageProtectionOutcome(selfId, eventName, 'user', true, scope, now, payload)
+      if (blocked) recordMessageProtectionBlock(selfId, now)
+      return cfg.enabled === true && cfg.observe !== true
+    }
+    times.push(now)
+    state.types[ruleName] = times
+  }
+  if (!userBypass && cfg.duplicateRateLimit === true && content) {
+    const hash = crypto.createHash('sha1').update(content).digest('hex')
+    const times = state.contents.get(hash) || []
+    if (times.length >= 3) {
+      const blocked = strike()
+      recordMessageProtectionOutcome(selfId, eventName, 'duplicate', true, hash, now, payload)
+      if (blocked) recordMessageProtectionBlock(selfId, now)
+      return cfg.enabled === true && cfg.observe !== true
+    }
+    times.push(now)
+    state.contents.set(hash, times)
+  }
+  if (!trustedGroup && cfg.groupRateLimit === true && group) {
+    const groupState = getProtectionState(groupStates, `${selfId}:group:${group}`, now)
+    const times = pruneProtectionTimes(groupState.types.total || [], now)
+    if (times.length >= 20) {
+      recordMessageProtectionOutcome(selfId, eventName, 'group', true, group, now, payload)
+      return cfg.enabled === true && cfg.observe !== true
+    }
+    times.push(now)
+    groupState.types.total = times
+  }
+  recordMessageProtectionOutcome(selfId, eventName, '', false, '', now, payload)
+  return false
+}
 
 function isPassiveQQBotFullMessage (event = {}) {
   if (event._qqbotFullMessageCreate !== true && event.raw?._qqbotFullMessageCreate !== true) return false
@@ -123,8 +599,44 @@ function isQQBotLikelyCommandEvent (event = {}) {
   return /^\s*[#/]/.test(String(text))
 }
 
+function getQQBotMessageQueueSource (id, event = {}, sep = ':') {
+  const messageType = event.message_type || event.raw?.message_type || ''
+  const groupOpenid = getRawQQBotGroupId(event, id, sep)
+  if (messageType === 'group' || (!messageType && groupOpenid)) return groupOpenid ? `group:${groupOpenid}` : ''
+  const userOpenid = normalizeQQBotOpenid(
+    event.author?.id || event.author?.user_openid || event.author?.member_openid ||
+    event.sender?.user_id || event.user_openid || event.user_id ||
+    event.raw?.author?.id || event.raw?.sender?.user_id || event.raw?.user_openid || event.raw?.user_id || ''
+  )
+  return userOpenid ? `user:${userOpenid}` : ''
+}
+
+function findQQBotQueueDropIndex (id, queue, sep, preferredSource = '', mode = 'passive') {
+  const candidates = []
+  for (let index = 0; index < queue.length; index++) {
+    const event = queue[index]
+    if (mode === 'passive' && (isQQBotLikelyCommandEvent(event) || !isPassiveQQBotFullMessage(event))) continue
+    if (mode === 'noncommand' && isQQBotLikelyCommandEvent(event)) continue
+    candidates.push({ index, source: getQQBotMessageQueueSource(id, event, sep) })
+  }
+  if (!candidates.length) return -1
+  if (preferredSource) {
+    const sameSource = candidates.find(item => item.source === preferredSource)
+    if (sameSource) return sameSource.index
+  }
+  const sourceCounts = new Map()
+  for (const item of candidates) sourceCounts.set(item.source, (sourceCounts.get(item.source) || 0) + 1)
+  let selected = candidates[0]
+  for (const item of candidates) {
+    if ((sourceCounts.get(item.source) || 0) > (sourceCounts.get(selected.source) || 0)) selected = item
+  }
+  return selected.index
+}
+
 function enqueueQQBotMessage (adapter, id, event) {
   rememberQQBotActivityAtEvidence(id, event)
+  const sep = adapter.sep || ':'
+  const source = getQQBotMessageQueueSource(id, event, sep)
   let state = qqbotMessageQueues.get(id)
   if (!state) {
     state = { active: 0, queue: [], lastWarnAt: 0 }
@@ -144,32 +656,52 @@ function enqueueQQBotMessage (adapter, id, event) {
     }
   }
   if (state.active >= QQBOT_MESSAGE_CONCURRENCY) {
-    if (state.queue.length >= QQBOT_MESSAGE_QUEUE_LIMIT) {
-      if (isPassiveQQBotFullMessage(event)) {
-        if (Date.now() - state.lastWarnAt > 60000) {
-          state.lastWarnAt = Date.now()
-          Bot.makeLog('warn', [`[${id}] 消息处理队列已满，丢弃被动全量消息以保护内存`, { active: state.active, queued: state.queue.length }], id)
-        }
+    const sourceCount = source
+      ? state.queue.reduce((count, queued) => count + (isPassiveQQBotFullMessage(queued) && getQQBotMessageQueueSource(id, queued, sep) === source ? 1 : 0), 0)
+      : 0
+    if (source && sourceCount >= QQBOT_MESSAGE_SOURCE_QUEUE_LIMIT && isPassiveQQBotFullMessage(event)) {
+      const sameSourceDrop = findQQBotQueueDropIndex(id, state.queue, sep, source, 'passive')
+      if (sameSourceDrop >= 0) {
+        const dropped = state.queue.splice(sameSourceDrop, 1)[0]
+        recordMessageProtectionQueueDrop(id, dropped, getQQBotMessageQueueSource(id, dropped, sep))
+      } else {
+        recordMessageProtectionQueueDrop(id, event, source)
         return false
       }
-      const passiveIndex = state.queue.findIndex(isPassiveQQBotFullMessage)
-      if (passiveIndex >= 0) state.queue.splice(passiveIndex, 1)
-      else if (state.queue.length >= QQBOT_PRIORITY_QUEUE_LIMIT) {
-        const replaceIndex = isQQBotLikelyCommandEvent(event) ? state.queue.findIndex(item => !isQQBotLikelyCommandEvent(item)) : -1
-        if (replaceIndex >= 0) state.queue.splice(replaceIndex, 1)
-        else {
+    }
+    if (state.queue.length >= QQBOT_MESSAGE_QUEUE_LIMIT) {
+      if (isPassiveQQBotFullMessage(event)) {
+        const passiveIndex = findQQBotQueueDropIndex(id, state.queue, sep, source, 'passive')
+        if (passiveIndex >= 0) {
+          const dropped = state.queue.splice(passiveIndex, 1)[0]
+          recordMessageProtectionQueueDrop(id, dropped, getQQBotMessageQueueSource(id, dropped, sep))
+        } else {
+          if (Date.now() - state.lastWarnAt > 60000) {
+            state.lastWarnAt = Date.now()
+            Bot.makeLog('warn', [`[${id}] 消息处理队列已满，丢弃被动全量消息以保护内存`, { active: state.active, queued: state.queue.length }], id)
+          }
+          recordMessageProtectionQueueDrop(id, event, source)
+          return false
+        }
+      } else if (state.queue.length >= QQBOT_PRIORITY_QUEUE_LIMIT) {
+        const replaceIndex = isQQBotLikelyCommandEvent(event)
+          ? findQQBotQueueDropIndex(id, state.queue, sep, source, 'noncommand')
+          : -1
+        if (replaceIndex >= 0) {
+          const dropped = state.queue.splice(replaceIndex, 1)[0]
+          recordMessageProtectionQueueDrop(id, dropped, getQQBotMessageQueueSource(id, dropped, sep))
+        } else {
           if (Date.now() - state.lastWarnAt > 60000) {
             state.lastWarnAt = Date.now()
             Bot.makeLog('error', [`[${id}] 高优先级消息处理队列已达硬上限，拒绝新消息`, { active: state.active, queued: state.queue.length }], id)
           }
+          recordMessageProtectionQueueDrop(id, event, source)
           return false
         }
       }
     }
-    state.queue.push(event)
-  } else {
-    state.queue.push(event)
   }
+  state.queue.push(event)
   runNext()
   return true
 }
@@ -186,14 +718,24 @@ function setQQBotTimedMapValue (mapName, key, value, ttlMs, maxSize) {
   if (!globalThis[mapName]) globalThis[mapName] = new Map()
   const map = globalThis[mapName]
   const now = Date.now()
-  let scanned = 0
-  for (const existingKey of map.keys()) {
-    const expiryKey = `${mapName}:${existingKey}`
-    if ((qqbotTimedMapExpiries.get(expiryKey) || 0) <= now || map.size >= maxSize) {
-      map.delete(existingKey)
-      qqbotTimedMapExpiries.delete(expiryKey)
+  const writes = (qqbotTimedMapWrites.get(mapName) || 0) + 1
+  qqbotTimedMapWrites.set(mapName, writes)
+  if (map.size >= maxSize || writes % 128 === 0) {
+    let scanned = 0
+    for (const existingKey of map.keys()) {
+      const expiryKey = `${mapName}:${existingKey}`
+      if ((qqbotTimedMapExpiries.get(expiryKey) || 0) <= now) {
+        map.delete(existingKey)
+        qqbotTimedMapExpiries.delete(expiryKey)
+      }
+      if (++scanned >= 256) break
     }
-    if (++scanned >= 1000 && map.size < maxSize) break
+  }
+  while (map.size >= maxSize) {
+    const oldest = map.keys().next().value
+    if (typeof oldest === 'undefined') break
+    map.delete(oldest)
+    qqbotTimedMapExpiries.delete(`${mapName}:${oldest}`)
   }
   map.delete(key)
   map.set(key, value)
@@ -209,7 +751,10 @@ function getQQBotTimedMapValue (mapName, key) {
     qqbotTimedMapExpiries.delete(expiryKey)
     return undefined
   }
-  return map.get(key)
+  const value = map.get(key)
+  map.delete(key)
+  map.set(key, value)
+  return value
 }
 
 function getQQBotMemberRoleTag (role = '', isBot = false) {
@@ -333,29 +878,77 @@ function getQQBotMessageAliases (payload = {}) {
   return aliases
 }
 
+function getQQBotEventMessageMeta (event = {}) {
+  const key = event && typeof event === 'object' ? event : null
+  if (!key) return { aliases: [], contentFingerprint: '', time: Date.now() }
+  let meta = qqbotMessageMeta.get(key)
+  if (meta) return meta
+  meta = {
+    aliases: getQQBotMessageAliases(event),
+    contentFingerprint: getQQBotMessageContentFingerprint(event),
+    time: getQQBotEventTime(event)
+  }
+  qqbotMessageMeta.set(key, meta)
+  return meta
+}
+
+function sameQQBotMapValue (left, right, seen = new Set()) {
+  if (left === right) return true
+  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false
+  if (seen.has(left) || seen.has(right)) return true
+  seen.add(left)
+  seen.add(right)
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((item, index) => sameQQBotMapValue(item, right[index], seen))
+  }
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+  return leftKeys.length === rightKeys.length && leftKeys.every(key => Object.prototype.hasOwnProperty.call(right, key) && sameQQBotMapValue(left[key], right[key], seen))
+}
+
 function getQQBotActivityMentionFacts (event = {}) {
   const original = event._qqbotOriginalEvent || event.raw?._qqbotOriginalEvent
   const mentions = original?.d?.mentions || event._mentions || event.raw?._mentions || event.mentions || event.raw?.mentions || []
   return Array.isArray(mentions) ? mentions : []
 }
 
-function isQQBotActivityAtEvent (selfId = '', event = {}) {
+function getQQBotActivityMeta (selfId = '', event = {}) {
+  if (!event || typeof event !== 'object') return { atEvent: true, aliasKeys: [] }
+  let byBot = qqbotActivityMeta.get(event)
+  if (!byBot) {
+    byBot = new Map()
+    qqbotActivityMeta.set(event, byBot)
+  }
+  const cacheKey = String(selfId || '')
+  const cached = byBot.get(cacheKey)
+  if (cached) return cached
   const original = event._qqbotOriginalEvent || event.raw?._qqbotOriginalEvent
   const eventType = original?.t || event._qqbotRawEvent || event.raw?._qqbotRawEvent || ''
-  if (eventType === 'GROUP_AT_MESSAGE_CREATE') return true
-  if (event._qqbotFullMessageCreate !== true && event.raw?._qqbotFullMessageCreate !== true) return true
+  let atEvent = eventType === 'GROUP_AT_MESSAGE_CREATE'
+  if (!atEvent && event._qqbotFullMessageCreate !== true && event.raw?._qqbotFullMessageCreate !== true) atEvent = true
   const selfOpenid = String(config.selfOpenid?.[selfId] || '')
-  return getQQBotActivityMentionFacts(event).some(item => {
-    if (item?.is_you === true) return true
-    const mentionOpenid = String(item?.id || item?.member_openid || item?.user_openid || '')
-    return Boolean(selfOpenid && mentionOpenid === selfOpenid)
-  })
+  if (!atEvent) {
+    atEvent = getQQBotActivityMentionFacts(event).some(item => {
+      if (item?.is_you === true) return true
+      const mentionOpenid = String(item?.id || item?.member_openid || item?.user_openid || '')
+      return Boolean(selfOpenid && mentionOpenid === selfOpenid)
+    })
+  }
+  const groupOpenid = getRawQQBotGroupId(event, selfId, adapter?.sep || ':')
+  const aliasKeys = groupOpenid
+    ? getQQBotMessageAliases(event).map(alias => `${selfId}:${groupOpenid}:${alias}`)
+    : []
+  const result = { atEvent, aliasKeys }
+  byBot.set(cacheKey, result)
+  return result
+}
+
+function isQQBotActivityAtEvent (selfId = '', event = {}) {
+  return getQQBotActivityMeta(selfId, event).atEvent
 }
 
 function getQQBotActivityAliasKeys (selfId = '', event = {}) {
-  const groupOpenid = getRawQQBotGroupId(event, selfId, adapter?.sep || ':')
-  if (!groupOpenid) return []
-  return getQQBotMessageAliases(event).map(alias => `${selfId}:${groupOpenid}:${alias}`)
+  return getQQBotActivityMeta(selfId, event).aliasKeys
 }
 
 function rememberQQBotActivityAtEvidence (selfId = '', event = {}) {
@@ -1723,6 +2316,8 @@ function patchGroupMessageCreateEvent () {
       const originalDispatchEvent = QQBotClass.prototype.dispatchEvent
       QQBotClass.prototype.dispatchEvent = function (event, wsRes) {
         if (wsRes?.d && typeof event === 'string') {
+          const selfId = this.config?.real_self_id || this.self_id || wsRes.d.self_id || ''
+          if (shouldDropQQBotRawEvent(selfId, event, wsRes.d)) return
           qqbotOriginalEventMap.set(wsRes.d, {
             op: wsRes.op,
             s: wsRes.s,
@@ -2020,6 +2615,7 @@ const startTime = new Date()
 logger.info(logger.yellow('- 正在加载 QQBot 适配器插件'))
 
 const userIdCache = new Map()
+const qqbotExternalUserIdCache = new Map()
 const USER_ID_CACHE_LIMIT = 10000
 
 function cacheQQBotUserId (key, value) {
@@ -2027,6 +2623,16 @@ function cacheQQBotUserId (key, value) {
   userIdCache.delete(key)
   userIdCache.set(key, value)
   while (userIdCache.size > USER_ID_CACHE_LIMIT) userIdCache.delete(userIdCache.keys().next().value)
+}
+
+function cacheQQBotExternalUserId (source, resolved) {
+  if (!source || !resolved) return
+  const key = String(source)
+  qqbotExternalUserIdCache.delete(key)
+  qqbotExternalUserIdCache.set(key, String(resolved))
+  while (qqbotExternalUserIdCache.size > USER_ID_CACHE_LIMIT) {
+    qqbotExternalUserIdCache.delete(qqbotExternalUserIdCache.keys().next().value)
+  }
 }
 const markdown_template = await importJS('Model/template/markdownTemplate.js', 'default')
 const TmplPkg = await importJS('templates/index.js')
@@ -4227,6 +4833,7 @@ const adapter = new class QQBotAdapter {
       bot: Bot[id],
       group_id: group_id.replace?.(`${id}${this.sep}`, '') || group_id
     }
+    const getCachedGroupInfo = () => groupInfoStore.getGroup(id, i.group_id)
     return {
       ...i,
       sendMsg: msg => this.sendGroupMsg(i, msg),
@@ -4241,7 +4848,9 @@ const adapter = new class QQBotAdapter {
       getBotState: () => groupInfoStore.refreshBotState(id, i.group_id),
       get active () { return activeStore.peek(id, i.group_id) },
       refreshInfo: () => groupInfoStore.refreshGroup(id, i.group_id),
-      getinfo: () => groupInfoStore.getGroup(id, i.group_id),
+      get info () { return getCachedGroupInfo() },
+      getInfo: getCachedGroupInfo,
+      getinfo: getCachedGroupInfo,
       refreshinfo: () => groupInfoStore.forceRefresh(id, i.group_id)
     }
   }
@@ -4298,6 +4907,7 @@ const adapter = new class QQBotAdapter {
   }
 
   async makeFriendMessage (data, event) {
+    const messageMeta = getQQBotEventMessageMeta(event)
     data.sender = {
       user_id: `${data.self_id}${this.sep}${event.sender.user_id}`
     }
@@ -4311,8 +4921,8 @@ const adapter = new class QQBotAdapter {
     if (rawUserOpenid) {
       inviteStore.recordC2cUser(data.self_id, rawUserOpenid, event.event_id || '', event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '')
       await userManageStore.recordUser(data.self_id, rawUserOpenid, { nickname: event.sender?.nickname || event.author?.username || '' })
-      const historyAliases = getQQBotMessageAliases(event).filter(Boolean).filter(id => id !== data.message_id)
-      data.seq = await userManageStore.recordHistory(data.self_id, rawUserOpenid, { type: 'user', message_id: data.message_id || event.id || '', aliases: historyAliases, user_openid: rawUserOpenid, nickname: event.sender?.nickname || event.author?.username || '', bot: false, raw_message: data.raw_message, raw: event, time: event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '' })
+      const historyAliases = messageMeta.aliases.filter(Boolean).filter(id => id !== data.message_id)
+      data.seq = await userManageStore.recordHistory(data.self_id, rawUserOpenid, { type: 'user', message_id: data.message_id || event.id || '', aliases: historyAliases, user_openid: rawUserOpenid, nickname: event.sender?.nickname || event.author?.username || '', bot: false, raw_message: data.raw_message, raw: event, time: messageMeta.time })
       if (data.raw) data.raw.seq = data.seq
     }
     // 注入 raw.invite
@@ -4322,11 +4932,12 @@ const adapter = new class QQBotAdapter {
       if (chatStats) data.raw.chat = chatStats
     }
     if (data.message_id && rawUserOpenid) {
-      await advancedWelcomeStore.recordMessageIndex({ message_id: data.message_id, self_id: data.self_id, target_id: rawUserOpenid, type: 'user', author_openid: rawUserOpenid, bot: false, aliases: getQQBotMessageAliases(event).filter(id => id !== data.message_id) })
+      await advancedWelcomeStore.recordMessageIndex({ message_id: data.message_id, self_id: data.self_id, target_id: rawUserOpenid, type: 'user', author_openid: rawUserOpenid, bot: false, aliases: messageMeta.aliases.filter(id => id !== data.message_id) })
     }
   }
 
   async makeGroupMessage (data, event) {
+    const messageMeta = getQQBotEventMessageMeta(event)
     data.sender = {
       user_id: `${data.self_id}${this.sep}${event.sender.user_id}`
     }
@@ -4339,8 +4950,10 @@ const adapter = new class QQBotAdapter {
       data.sender.permission = authorRole
     }
     if (getBotConfigValue(data.self_id, 'toQQUin') && Handler.has('ws.tool.findUserId')) {
-      const user_id = await Handler.call('ws.tool.findUserId', { user_id: data.user_id })
+      const cachedUserId = qqbotExternalUserIdCache.get(String(data.user_id))
+      const user_id = cachedUserId ? { custom: cachedUserId } : await Handler.call('ws.tool.findUserId', { user_id: data.user_id })
       if (user_id?.custom) {
+        cacheQQBotExternalUserId(data.user_id, user_id.custom)
         cacheQQBotUserId(user_id.custom, data.user_id)
         data.sender.user_id = user_id.custom
       }
@@ -4389,19 +5002,21 @@ const adapter = new class QQBotAdapter {
     }
 
     if (rawUserOpenid && data.group_openid) {
-      const historyAliases = getQQBotMessageAliases(event).filter(Boolean).filter(id => id !== data.message_id)
-      await userManageStore.recordUser(data.self_id, rawUserOpenid, { nickname: event.author?.username || event.sender?.nickname || '', group_openid: data.group_openid })
-      const cachedInfo = groupInfoStore.getInfo(data.self_id, data.group_openid)
-      await userManageStore.recordGroup(data.self_id, data.group_openid, {
+      const historyAliases = messageMeta.aliases.filter(Boolean).filter(id => id !== data.message_id)
+      const cachedInfo = groupInfoStore.peekInfo(data.self_id, data.group_openid)
+      await Promise.all([
+        userManageStore.recordUser(data.self_id, rawUserOpenid, { nickname: event.author?.username || event.sender?.nickname || '', group_openid: data.group_openid }),
+        userManageStore.recordGroup(data.self_id, data.group_openid, {
         name: cachedInfo?.group_name || event.group_name || event.raw?.group_name || '',
         group_finger_memo: cachedInfo?.group_finger_memo || '',
         group_class_text: cachedInfo?.group_class_text || '',
         group_tags: cachedInfo?.group_tags || [],
         group_member_num: cachedInfo?.group_member_num || 0
-      })
-      await groupInfoStore.recordGroup(data.self_id, data.group_openid)
+        }),
+        groupInfoStore.ensureGroup(data.self_id, data.group_openid)
+      ])
       groupInfoStore.recordTrigger(data.self_id, data.group_openid, event._qqbotFullMessageCreate === true ? 'full' : 'at')
-      data.seq = await userManageStore.recordHistory(data.self_id, data.group_openid, { message_id: data.message_id || event.id || '', aliases: historyAliases, user_openid: rawUserOpenid, nickname: event.author?.username || event.sender?.nickname || '', bot: event.author?.bot === true, raw_message: data.raw_message, raw: event, time: event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '' })
+      data.seq = await userManageStore.recordHistory(data.self_id, data.group_openid, { message_id: data.message_id || event.id || '', aliases: historyAliases, user_openid: rawUserOpenid, nickname: event.author?.username || event.sender?.nickname || '', bot: event.author?.bot === true, raw_message: data.raw_message, raw: event, time: messageMeta.time })
       if (data.raw) data.raw.seq = data.seq
       if (ensureAdvancedWelcomeConfig(config, data.self_id).enabled) {
         await advancedWelcomeStore.recordSpeech(data.self_id, data.group_openid, data.message_id || event.id || '', event._qqbotFullMessageCreate === true)
@@ -4440,7 +5055,7 @@ const adapter = new class QQBotAdapter {
     }
 
     if (data.message_id && data.group_openid) {
-      const aliases = getQQBotMessageAliases(event).filter(Boolean).filter(id => id !== data.message_id)
+      const aliases = messageMeta.aliases.filter(Boolean).filter(id => id !== data.message_id)
       await advancedWelcomeStore.recordMessageIndex({
         message_id: data.message_id,
         self_id: data.self_id,
@@ -4449,8 +5064,8 @@ const adapter = new class QQBotAdapter {
         author_openid: rawUserOpenid || '',
         member_role: authorRole,
         bot: event.author?.bot === true,
-        content_fingerprint: getQQBotMessageContentFingerprint(event),
-        time: new Date(getQQBotEventTime(event)).toISOString(),
+         content_fingerprint: messageMeta.contentFingerprint,
+         time: new Date(messageMeta.time).toISOString(),
         seq: data.seq || 0,
         aliases
       })
@@ -4529,8 +5144,10 @@ const adapter = new class QQBotAdapter {
       src_channel_id: event.channel_id
     }
     if (getBotConfigValue(data.self_id, 'toQQUin') && Handler.has('ws.tool.findUserId')) {
-      const user_id = await Handler.call('ws.tool.findUserId', { user_id: data.user_id })
+      const cachedUserId = qqbotExternalUserIdCache.get(String(data.user_id))
+      const user_id = cachedUserId ? { custom: cachedUserId } : await Handler.call('ws.tool.findUserId', { user_id: data.user_id })
       if (user_id?.custom) {
+        cacheQQBotExternalUserId(data.user_id, user_id.custom)
         cacheQQBotUserId(user_id.custom, data.user_id)
         data.sender.user_id = user_id.custom
       }
@@ -4549,10 +5166,12 @@ const adapter = new class QQBotAdapter {
   async setFriendMap (data) {
     if (!data.user_id) return
     if (!String(data.user_id).startsWith('qg_')) {
-      await data.bot.fl.set(data.user_id, {
-        ...(data.bot.fl?.get?.(data.user_id) || {}),
+      const currentFriend = data.bot.fl?.get?.(data.user_id)
+      const nextFriend = {
+        ...(currentFriend || {}),
         ...data.sender
-      })
+      }
+      if (!sameQQBotMapValue(currentFriend, nextFriend)) await data.bot.fl.set(data.user_id, nextFriend)
     }
     data.friend = data.bot.pickFriend(data.user_id)
     this.wrapRecallResultReporter(data, data.friend)
@@ -4562,30 +5181,32 @@ const adapter = new class QQBotAdapter {
     if (!data.group_id) return
     if (!String(data.group_id).startsWith('qg_')) {
       const rawGroupId = getRawQQBotGroupId(data, data.self_id, this.sep)
-      const cached = groupInfoStore.getGroup(data.self_id, rawGroupId)
-      await data.bot.gl.set(data.group_id, {
-        ...(data.bot.gl?.get?.(data.group_id) || {}),
+       const cached = groupInfoStore.peekGroup(data.self_id, rawGroupId)
+       const currentGroup = data.bot.gl?.get?.(data.group_id)
+       const nextGroup = {
+        ...(currentGroup || {}),
         group_id: data.group_id,
         group_openid: rawGroupId,
         ...(cached?.info || {}),
         bot_state: cached?.bot_state || null
-      })
+       }
+       if (!sameQQBotMapValue(currentGroup, nextGroup)) await data.bot.gl.set(data.group_id, nextGroup)
     }
     let gml = data.bot.gml.get(data.group_id)
     if (!gml) {
       gml = new Map()
       await data.bot.gml.set(data.group_id, gml)
     }
-    await gml.set(data.user_id, {
-      ...gml.get(data.user_id),
-      ...data.sender
-    })
+    const currentMember = gml.get(data.user_id)
+    const nextMember = { ...currentMember, ...data.sender }
+    const memberChanged = !currentMember || currentMember.user_id !== nextMember.user_id || currentMember.nickname !== nextMember.nickname || currentMember.card !== nextMember.card || currentMember.role !== nextMember.role || currentMember.member_role !== nextMember.member_role || currentMember.permission !== nextMember.permission
+    if (memberChanged) await gml.set(data.user_id, nextMember)
     data.group = data.bot.pickGroup(data.group_id)
     const groupOpenid = getRawQQBotGroupId(data, data.self_id, this.sep)
-    const cache = groupInfoStore.getGroup(data.self_id, groupOpenid)
+     const cache = groupInfoStore.peekGroup(data.self_id, groupOpenid)
     if (data.raw && cache) {
-      data.raw.qqbot_group_info = cache.info || null
-      data.raw.qqbot_bot_state = cache.bot_state || null
+      data.raw.qqbot_group_info = cache.info ? { ...cache.info, group_tags: Array.isArray(cache.info.group_tags) ? [...cache.info.group_tags] : [] } : null
+      data.raw.qqbot_bot_state = cache.bot_state ? { ...cache.bot_state } : null
       data.raw.group_name = cache.info?.group_name || ''
       data.raw.group_member_num = cache.info?.group_member_num || 0
       data.raw.member_openid = cache.bot_state?.member_openid || ''
@@ -4750,8 +5371,18 @@ const adapter = new class QQBotAdapter {
       data.raw._qqbotFullMessageRecorded = isFullMessageGroupRecorded(id, event.group_openid || event.raw?.group_openid || '')
     }
     data.recallMsg = (messageId, targetId, targetType) => this.simpleRecallMsg(data, messageId, targetId, targetType)
+    const resolveChatGroupOpenid = groupOpenid => {
+      const candidates = groupOpenid
+        ? [groupOpenid]
+        : [data.group_openid, event.group_openid, event.raw?.group_openid, event.raw?.group_id, event.group_id, data.group_id]
+      for (const candidate of candidates) {
+        const resolved = getRawQQBotGroupId({ group_id: candidate }, data.self_id, this.sep)
+        if (resolved) return resolved
+      }
+      return ''
+    }
     const getChatRank = async groupOpenid => {
-      const target = groupOpenid || data.group_openid || event.group_openid || event.raw?.group_openid || ''
+      const target = resolveChatGroupOpenid(groupOpenid)
       if (data.message_type !== 'group' || !target || String(data.group_id || '').startsWith('qg_')) return undefined
       const withoutBot = await chatStore.getGroupRank(data.self_id, target, false, data.self_id)
       const withBot = await chatStore.getGroupRank(data.self_id, target, true, data.self_id)
@@ -4768,23 +5399,38 @@ const adapter = new class QQBotAdapter {
     }
     let chatRankCache = null
     data.chatrank = groupOpenid => {
-      const target = groupOpenid || data.group_openid || event.group_openid || event.raw?.group_openid || ''
+      const target = resolveChatGroupOpenid(groupOpenid)
       if (chatRankCache?.target === target) return chatRankCache.value
-      return getChatRank(groupOpenid)
+      if (chatRankCache?.promise?.target === target) return chatRankCache.promise.value
+      const value = getChatRank(groupOpenid)
+      chatRankCache = { promise: { target, value } }
+      value.then(result => {
+        if (chatRankCache?.promise?.value === value) chatRankCache = { target, value: result }
+      }).catch(() => {
+        if (chatRankCache?.promise?.value === value) chatRankCache = null
+      })
+      return value
     }
     const getOtherChat = async (userOpenid, groupOpenid) => {
       const user = String(userOpenid || '').trim()
-      const target = String(groupOpenid || data.group_openid || event.group_openid || event.raw?.group_openid || '').trim()
+      const target = String(resolveChatGroupOpenid(groupOpenid)).trim()
       if (!user) return null
       return chatStore.getUserStats(data.self_id, user, target ? 'group' : '', target)
     }
     const otherChatCache = new Map()
     data.otherchat = (userOpenid, groupOpenid) => {
       const user = String(userOpenid || '').trim()
-      const target = String(groupOpenid || data.group_openid || event.group_openid || event.raw?.group_openid || '').trim()
+      const target = String(resolveChatGroupOpenid(groupOpenid)).trim()
       const key = `${user}:${target}`
       if (otherChatCache.has(key)) return otherChatCache.get(key)
-      return getOtherChat(userOpenid, groupOpenid)
+      const value = getOtherChat(userOpenid, groupOpenid)
+      otherChatCache.set(key, value)
+      value.then(result => {
+        if (otherChatCache.get(key) === value) otherChatCache.set(key, result)
+      }).catch(() => {
+        if (otherChatCache.get(key) === value) otherChatCache.delete(key)
+      })
+      return value
     }
 
     data.reply_id = event.reply_id || getReplyMessageIdFromPayload(event)
@@ -4862,15 +5508,21 @@ const adapter = new class QQBotAdapter {
 
     const eventUserOpenid = normalizeQQBotOpenid(event.author?.id || event.author?.member_openid || event.sender?.user_id || event.operator_id || data.user_id || '')
     const eventGroupOpenid = data.group_openid || event.group_openid || event.raw?.group_openid || ''
-    if (data.raw && (data.message_type === 'group' || data.message_type === 'private') && !String(data.group_id || '').startsWith('qg_')) {
+     if (data.raw && (data.message_type === 'group' || data.message_type === 'private') && !String(data.group_id || '').startsWith('qg_')) {
       if (eventUserOpenid) data.raw.v_id = getVirtualAtIdFromEvent(data.self_id, event) || makeVirtualAtId(data.self_id, eventUserOpenid)
       data.raw.is_has_new_join_request = joinRequestStore.hasUnread(data.self_id)
       if (eventGroupOpenid) {
-        const cachedGroup = groupInfoStore.getGroup(data.self_id, eventGroupOpenid)
-        if (cachedGroup?.info) Object.assign(data.raw, { qqbot_group_info: cachedGroup.info, group_name: cachedGroup.info.group_name, group_member_num: cachedGroup.info.group_member_num })
-        if (cachedGroup?.bot_state) Object.assign(data.raw, { qqbot_bot_state: cachedGroup.bot_state, member_openid: cachedGroup.bot_state.member_openid, member_role: cachedGroup.bot_state.member_role, allow_proactive_msg: cachedGroup.bot_state.allow_proactive_msg })
-        groupInfoStore.scheduleRefresh(data.self_id, eventGroupOpenid, 'message', { info: true, botState: false })
-        if (!cachedGroup?.bot_state?.member_openid) groupInfoStore.scheduleRefresh(data.self_id, eventGroupOpenid, 'missing_member_openid', { info: false, botState: true })
+         const cachedGroup = groupInfoStore.peekGroup(data.self_id, eventGroupOpenid)
+         if (cachedGroup?.info) {
+           const groupInfo = { ...cachedGroup.info, group_tags: Array.isArray(cachedGroup.info.group_tags) ? [...cachedGroup.info.group_tags] : [] }
+           Object.assign(data.raw, { qqbot_group_info: groupInfo, group_name: groupInfo.group_name, group_member_num: groupInfo.group_member_num })
+         }
+         if (cachedGroup?.bot_state) {
+           const botState = { ...cachedGroup.bot_state }
+           Object.assign(data.raw, { qqbot_bot_state: botState, member_openid: botState.member_openid, member_role: botState.member_role, allow_proactive_msg: botState.allow_proactive_msg })
+         }
+         groupInfoStore.scheduleRefresh(data.self_id, eventGroupOpenid, 'message', { info: true, botState: false })
+         if (!cachedGroup?.bot_state?.member_openid) groupInfoStore.scheduleRefresh(data.self_id, eventGroupOpenid, 'missing_member_openid', { info: false, botState: true })
       }
     }
     const cancelState = userManageStore.getCancel(data.self_id, eventUserOpenid)
@@ -4902,13 +5554,13 @@ const adapter = new class QQBotAdapter {
     }
 
     if (data.message_type === 'group' && /^(?:#)?(?:天|周|月)发言榜$/i.test(String(data.raw_message || '').trim())) {
-      const target = data.group_openid || event.group_openid || event.raw?.group_openid || ''
-      chatRankCache = { target, value: await getChatRank(target) }
+      const target = resolveChatGroupOpenid()
+      if (target) chatRankCache = { target, value: await getChatRank(target) }
     } else if (data.message_type === 'group' && /^(?:#)?(?:他|她|它)的发言$/i.test(String(data.raw_message || '').trim())) {
       const mention = (event._mentions || event.mentions || []).find(item => item?.is_you !== true)
       const user = mention?.id || mention?.member_openid || mention?.user_openid || ''
-      const target = data.group_openid || event.group_openid || event.raw?.group_openid || ''
-      if (user) {
+      const target = resolveChatGroupOpenid()
+      if (user && target) {
         otherChatCache.set(`${user}:${target}`, await getOtherChat(user, target))
       }
     }
@@ -6984,6 +7636,7 @@ async connect (token) {
 const cleanedBotConfig = migrateLegacyBotConfig()
 const cleanedSuffixConfig = removeLegacySuffixConfig()
 const migratedAccountConfig = migrateLegacyAccountConfig()
+const migratedMessageProtectionConfig = migrateLegacyMessageProtectionConfig()
 
 if (migratedAccountConfig) {
   try {
@@ -7002,23 +7655,32 @@ const timedStoreInit = async (name, init) => {
   }
 }
 
-qqbotStoresReady = Promise.allSettled([
-  timedStoreInit('fullMessage', () => initFullMessageStore(config)).then(cleanedConfig => {
-    if (cleanedConfig || cleanedBotConfig || cleanedSuffixConfig) return configSave()
-  }),
-  timedStoreInit('invite', () => initInviteStore(config)),
-  timedStoreInit('chat', () => chatStore.init()),
-  timedStoreInit('active', () => activeStore.init()),
-  timedStoreInit('advancedWelcome', () => advancedWelcomeStore.init()),
-  timedStoreInit('userManage', () => userManageStore.init()),
-  timedStoreInit('joinRequest', () => joinRequestStore.init()),
-  timedStoreInit('groupInfo', () => groupInfoStore.init())
-]).then(results => {
-  const failures = results.filter(result => result.status === 'rejected').map(result => result.reason?.message || String(result.reason))
+const qqbotStoreInitializers = [
+  ['fullMessage', () => timedStoreInit('fullMessage', () => initFullMessageStore(config)).then(cleanedConfig => {
+    if (cleanedConfig || cleanedBotConfig || cleanedSuffixConfig || migratedMessageProtectionConfig) return configSave()
+  })],
+  ['invite', () => timedStoreInit('invite', () => initInviteStore(config))],
+  ['chat', () => timedStoreInit('chat', () => chatStore.init())],
+  ['active', () => timedStoreInit('active', () => activeStore.init())],
+  ['advancedWelcome', () => timedStoreInit('advancedWelcome', () => advancedWelcomeStore.init())],
+  ['userManage', () => timedStoreInit('userManage', () => userManageStore.init())],
+  ['joinRequest', () => timedStoreInit('joinRequest', () => joinRequestStore.init())],
+  ['groupInfo', () => timedStoreInit('groupInfo', () => groupInfoStore.init())]
+]
+
+qqbotStoresReady = (async () => {
+  const failures = []
+  for (const [name, initialize] of qqbotStoreInitializers) {
+    try {
+      await initialize()
+    } catch (err) {
+      failures.push(`${name}: ${err?.message || String(err)}`)
+    }
+  }
   if (!failures.length) return
   qqbotStoreInitError = new Error(failures.join('; '))
   Bot.makeLog?.('error', ['QQBot存储初始化失败，已停止账号连接', qqbotStoreInitError.message], 'QQBot-Plugin')
-})
+})()
 
 Bot.adapter.push(adapter)
 
@@ -7100,11 +7762,6 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
-          reg: /^#q+bot一键群发$/i,
-          fnc: 'oneKeySendGroupMsg',
-          permission: config.permission
-        },
-        {
           reg: /^#q+bot账号掉线检测\s*(开启|关闭)$/i,
           fnc: 'setOfflineDetect',
           permission: config.permission
@@ -7150,7 +7807,7 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
-          reg: /^#q+bot高级设置(?:\s*(龙虾菜单|龙虾在线|龙虾json|龙虾code|Markdown(?:引用)?回复)(?:\s+(.+))?)?$/i,
+          reg: /^#q+bot高级设置(?:\s*(消息防护设置|消息防护观察|消息防护白名单|消息防护可信群|龙虾菜单|龙虾在线|龙虾json|龙虾code|Markdown(?:引用)?回复)(?:\s+([\s\S]+))?)?$/i,
           fnc: 'advancedSetting',
           permission: config.permission
         },
@@ -7588,7 +8245,7 @@ export class QQBotAdapter extends plugin {
       '#QQBot添加过滤日志 <消息内容>\n' +
       '#QQBot删除过滤日志 <消息内容>\n' +
       '#QQBot用户管理菜单 - 用户管理\n' +
-      '#QQBot破冰菜单 - 破冰/一键群发设置\n' +
+       '#QQBot破冰菜单 - 破冰设置\n' +
       '#QQBot高级群欢迎菜单 - 高级群欢迎设置\n' +
       '#QQBot高级设置 - 查看/修改高级设置\n' +
       '#QQBot刷新config - 刷新配置文件\n\n' +
@@ -7821,36 +8478,6 @@ export class QQBotAdapter extends plugin {
     config.filterLog[this.e.self_id] = filterLog
     await configSave()
     this.reply(msg, true)
-  }
-
-  async oneKeySendGroupMsg () {
-    if (!this.guardOfficialBot()) return true
-    if (this.e.adapter_name !== 'QQBot') return false
-    const msg = await importJS('Model/template/oneKeySendGroupMsg.js', 'default')
-    if (msg === false) {
-      this.reply('请先设置模版哦', true)
-    } else {
-      const groupList = this.e.bot.dau.dauDB === 'level' ? Object.keys(this.e.bot.dau.all_group) : [...this.e.bot.gl.keys()]
-      const getMsg = typeof msg === 'function' ? msg : () => msg
-      const errGroupList = []
-      for (const key of groupList) {
-        if (key === 'total') continue
-        const id = this.e.bot.dau.dauDB === 'level' ? `${this.e.self_id}${this.e.bot.adapter.sep}${key}` : key
-        const sendMsg = await getMsg(id)
-        if (!sendMsg?.length) continue
-        const sendRet = await withQQBotInternalSend(() => this.e.bot.pickGroup(id).sendMsg(sendMsg))
-        if (sendRet.error.length) {
-          for (const i of sendRet.error) {
-            if (i.message.includes('机器人非群成员')) {
-              errGroupList.push(key)
-              break
-            }
-          }
-        }
-      }
-      if (errGroupList.length) await this.e.bot.dau.deleteNotExistGroup(errGroupList)
-      logger.info(logger.green(`QQBot ${this.e.self_id} 群消息一键发送完成，共${groupList.length - 1}个群，失败${errGroupList.length}个`))
-    }
   }
 
   // ========== 掉线检测命令 ==========
@@ -8379,9 +9006,394 @@ export class QQBotAdapter extends plugin {
     )
   }
 
+  getMessageProtectionMenu (page = 1) {
+    const selfId = this.e.self_id || this.e.bot?.uin || this.e.bot?.self_id || ''
+    const cfg = ensureMessageProtectionConfig(selfId)
+    const report = getMessageProtectionReport(selfId)
+    const currentPage = Number(page) === 4 ? 1 : Math.min(3, Math.max(1, Number(page) || 1))
+    const status = value => value ? '开启' : '关闭'
+    const toggle = (label, key) => ({ text: `${cfg[key] ? '关' : '开'}${label}`, callback: `#QQBot高级设置 消息防护设置 ${label} ${cfg[key] ? '关闭' : '开启'}` })
+    const pageInput = pageNumber => `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 ${pageNumber}" show="打开第${pageNumber}页"/>`
+    if (currentPage === 1) {
+      return [
+        [
+          `#[${selfId}] 消息防护设置 1/3`, '',
+          `消息防护总开关：${status(cfg.enabled)}`,
+          `>用户级限流：${status(cfg.userRateLimit)}`,
+          `>重复内容限流：${status(cfg.duplicateRateLimit)}`,
+          `>群级限流：${status(cfg.groupRateLimit)}`,
+          `>首次用户屏蔽：${status(cfg.firstUserBlock)}`,
+          `>管理员/白名单旁路：${status(cfg.adminWhitelistBypass)}`,
+          `>可信群旁路：${status(cfg.trustedGroupBypass)}`,
+          `>消息ID去重：${status(cfg.messageIdDedupe)}`,
+          `>限流聚合统计：${status(cfg.aggregateStats)}`,
+          `>限流告警：${status(cfg.alert)}`,
+          `>图片模式：${status(cfg.imageMode)}`,
+          `>观察模式：${status(cfg.observe)}`,
+          `>白名单用户：${report.whitelistCount}/${report.whitelistLimit}`,
+          `>可信群：${report.trustedGroupCount}/${report.trustedGroupLimit}`,
+          '',
+          `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 总开关 ${cfg.enabled ? '关闭' : '开启'}" show="${cfg.enabled ? '关闭' : '开启'}总开关"/>`,
+          `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 用户级限流 ${cfg.userRateLimit ? '关闭' : '开启'}" show="${cfg.userRateLimit ? '关闭' : '开启'}用户级限流"/>`,
+          `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 重复内容限流 ${cfg.duplicateRateLimit ? '关闭' : '开启'}" show="${cfg.duplicateRateLimit ? '关闭' : '开启'}重复内容限流"/>`,
+          `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 群级限流 ${cfg.groupRateLimit ? '关闭' : '开启'}" show="${cfg.groupRateLimit ? '关闭' : '开启'}群级限流"/>`,
+          `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 首次用户屏蔽 ${cfg.firstUserBlock ? '关闭' : '开启'}" show="${cfg.firstUserBlock ? '关闭' : '开启'}首次用户屏蔽"/>`,
+          `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 管理员旁路 ${cfg.adminWhitelistBypass ? '关闭' : '开启'}" show="${cfg.adminWhitelistBypass ? '关闭' : '开启'}管理员旁路"/>`,
+          `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 可信群旁路 ${cfg.trustedGroupBypass ? '关闭' : '开启'}" show="${cfg.trustedGroupBypass ? '关闭' : '开启'}可信群旁路"/>`,
+          `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 消息ID去重 ${cfg.messageIdDedupe ? '关闭' : '开启'}" show="${cfg.messageIdDedupe ? '关闭' : '开启'}消息ID去重"/>`,
+          `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 聚合统计 ${cfg.aggregateStats ? '关闭' : '开启'}" show="${cfg.aggregateStats ? '关闭' : '开启'}聚合统计"/>`,
+          `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 限流告警 ${cfg.alert ? '关闭' : '开启'}" show="${cfg.alert ? '关闭' : '开启'}限流告警"/>`,
+          `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 观察模式 ${cfg.observe ? '关闭' : '开启'}" show="${cfg.observe ? '关闭' : '开启'}观察模式"/>`,
+          `><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 图片模式 ${cfg.imageMode ? '关闭' : '开启'}" show="${cfg.imageMode ? '关闭' : '开启'}图片模式"/>`,
+          pageInput(2),
+          pageInput(3),
+          '><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 总览" show="查看完整总览"/>',
+          '>频道消息不执行本组业务限流，仍受全局队列保护。'
+        ].join('\n'),
+        segment.button(
+          [toggle('总开关', 'enabled'), toggle('用户级限流', 'userRateLimit')],
+          [toggle('重复内容限流', 'duplicateRateLimit'), toggle('群级限流', 'groupRateLimit')],
+          [toggle('首次用户屏蔽', 'firstUserBlock'), toggle('管理员旁路', 'adminWhitelistBypass')],
+          [toggle('可信群旁路', 'trustedGroupBypass'), toggle('图片模式', 'imageMode')],
+          [{ text: '总览', callback: '#QQBot高级设置 消息防护设置 总览' }, { text: '观察统计', callback: '#QQBot高级设置 消息防护观察 查看' }]
+        )
+      ]
+    }
+    if (currentPage === 2) {
+      return [
+        [
+          `#[${selfId}] 消息防护设置 2/3`, '',
+          '>私聊普通消息：每用户 1 秒最多 5 条',
+          '>普通全量消息：每用户 1 秒最多 5 条',
+          '>全量 is_you=true：每用户 1 秒最多 7 条',
+          '>非全量/主动@：每用户 1 秒最多 10 条',
+          '>回调按钮事件：每用户 1 秒最多 7 条',
+          '>相同内容：1 秒内前 3 条允许，第 4 条及之后拦截',
+          '>群级总量：1 秒内每群最多 20 条',
+          '>首次用户屏蔽：首次命中 10 秒，重复命中逐步延长，最高 600 秒',
+          '>作用域：私聊按用户，群聊按群+用户，配置按 Bot 账号',
+          '>可信群只绕过群级总量，不绕过用户级、重复内容或全局队列保护。',
+          '',
+          pageInput(1),
+          pageInput(3),
+          '><qqbot-cmd-input text="#QQBot高级设置 消息防护观察 查看" show="查看防护总览"/>'
+        ].join('\n'),
+        segment.button(
+          [{ text: '上一页', callback: '#QQBot高级设置 消息防护设置 1' }, { text: '下一页', callback: '#QQBot高级设置 消息防护设置 3' }],
+          [{ text: '总览', callback: '#QQBot高级设置 消息防护设置 总览' }, { text: '观察统计', callback: '#QQBot高级设置 消息防护观察 查看' }],
+          [{ text: '返回', callback: '#QQBot高级设置' }]
+        )
+      ]
+    }
+    return [
+      [
+        `#[${selfId}] 消息防护设置 3/3`, '',
+        `>管理员/白名单旁路：${status(cfg.adminWhitelistBypass)}`,
+        `>白名单用户：${report.whitelistCount}/${report.whitelistLimit}`,
+        `>可信群旁路：${status(cfg.trustedGroupBypass)}`,
+        `>可信群：${report.trustedGroupCount}/${report.trustedGroupLimit}`,
+        '',
+        '><qqbot-cmd-input text="#QQBot高级设置 消息防护白名单 查看" show="查看白名单"/>',
+        '><qqbot-cmd-input text="#QQBot高级设置 消息防护白名单 添加 " show="添加白名单"/>',
+        '><qqbot-cmd-input text="#QQBot高级设置 消息防护白名单 删除 " show="删除白名单"/>',
+        '><qqbot-cmd-input text="#QQBot高级设置 消息防护可信群 查看" show="查看可信群"/>',
+        '><qqbot-cmd-input text="#QQBot高级设置 消息防护可信群 添加 " show="添加可信群"/>',
+        '><qqbot-cmd-input text="#QQBot高级设置 消息防护可信群 删除 " show="删除可信群"/>',
+        '>清空名单必须使用“清空 确认”；列表只影响当前 Bot，不影响其他业务黑名单。'
+      ].join('\n'),
+      segment.button(
+        [{ text: '查看白名单', callback: '#QQBot高级设置 消息防护白名单 查看' }, { text: '查看可信群', callback: '#QQBot高级设置 消息防护可信群 查看' }],
+        [{ text: '添加白名单', input: '#QQBot高级设置 消息防护白名单 添加 ' }, { text: '添加可信群', input: '#QQBot高级设置 消息防护可信群 添加 ' }],
+        [{ text: '删除白名单', input: '#QQBot高级设置 消息防护白名单 删除 ' }, { text: '删除可信群', input: '#QQBot高级设置 消息防护可信群 删除 ' }],
+        [{ text: '清空白名单', callback: '#QQBot高级设置 消息防护白名单 清空' }, { text: '清空可信群', callback: '#QQBot高级设置 消息防护可信群 清空' }],
+        [{ text: '上一页', callback: '#QQBot高级设置 消息防护设置 1' }, { text: '返回', callback: '#QQBot高级设置' }]
+      )
+    ]
+  }
+
+  getMessageProtectionText (report, title = '消息防护总览') {
+    const value = input => input === null || typeof input === 'undefined' ? '不可用' : String(input)
+    const lines = [`#[${report.selfId}] ${title}`, '']
+    if (report.startedAt && report.updatedAt) lines.push(`>统计时间：${new Date(report.startedAt).toISOString()} - ${new Date(report.updatedAt).toISOString()}`)
+    lines.push(`>统计状态：${report.statsAvailable ? '可用' : `不可用：${report.unavailableReason}`}`, '')
+    lines.push(...report.switches.map(item => `>${item.label}：${item.value}`), '')
+    lines.push('>限流规则：')
+    lines.push(...report.rules.map(item => `>${item.label}：${item.value}`), '')
+    lines.push('>拦截统计：')
+    lines.push(`>原始事件：${value(report.metrics.total)}`)
+    lines.push(`>正常放行：${value(report.metrics.allowed)}`)
+    lines.push(`>预计拦截：${value(report.metrics.wouldDrop)}`)
+    lines.push(`>实际拦截：${value(report.metrics.actualDropped)}`)
+    lines.push(`>用户级拦截：${value(report.metrics.actualDropUser)} / 预计 ${value(report.metrics.wouldDropUser)}`)
+    lines.push(`>重复内容拦截：${value(report.metrics.actualDropDuplicate)} / 预计 ${value(report.metrics.wouldDropDuplicate)}`)
+    lines.push(`>群级拦截：${value(report.metrics.actualDropGroup)} / 预计 ${value(report.metrics.wouldDropGroup)}`)
+    lines.push(`>首次用户屏蔽：${value(report.metrics.actualBlocked)} / 预计 ${value(report.metrics.wouldBlockUser)}`)
+    lines.push(`>队列淘汰：${value(report.metrics.queueDropped)}`)
+    lines.push(`>当前屏蔽用户：${report.metrics.blockedUsers}`, '')
+    lines.push('>事件类型统计（总数 / 预计拦截 / 实际拦截 / 队列淘汰）：')
+    lines.push(...report.types.map(item => `>${item.label}：${value(item.total)} / ${value(item.wouldDrop)} / ${value(item.actualDropped)} / ${value(item.queueDropped)}`))
+    lines.push(`>频道消息：${value(report.metrics.channel)}（不参与业务限流）`, '')
+    lines.push(`>白名单用户：${report.whitelistCount}/${report.whitelistLimit}`)
+    lines.push(`>可信群：${report.trustedGroupCount}/${report.trustedGroupLimit}`)
+    if (report.observe) lines.push('', '>说明：观察模式只统计，不丢弃消息。')
+    return lines.join('\n')
+  }
+
+  async renderMessageProtectionImage (report, title = '消息防护总览') {
+    const selfId = report.selfId
+    const requestKey = `${selfId}:${title}`
+    if (messageProtectionRenderRequests.has(requestKey)) return messageProtectionRenderRequests.get(requestKey)
+    const task = (async () => {
+      try {
+        messageProtectionRendererPromise ||= import('../../lib/puppeteer/puppeteer.js')
+          .catch(() => import('./框架lib/puppeteer/puppeteer.js'))
+          .then(module => module.default)
+        const renderer = await messageProtectionRendererPromise
+        if (!renderer?.screenshot) throw new Error('图片渲染器不可用')
+        const bot = globalThis.Bot?.[selfId] || {}
+        const metric = (label, key) => ({ label, value: report.metrics[key] === null ? '不可用' : String(report.metrics[key]) })
+        const renderData = {
+          title,
+          selfId: maskMessageProtectionIdentifier(selfId),
+          nickname: String(bot.nickname || 'QQBot').slice(0, 80),
+          switches: report.switches,
+          rules: report.rules,
+          metrics: [
+            metric('原始事件', 'total'),
+            metric('正常放行', 'allowed'),
+            metric('预计拦截', 'wouldDrop'),
+            metric('实际拦截', 'actualDropped'),
+            metric('用户级拦截', 'actualDropUser'),
+            metric('重复内容拦截', 'actualDropDuplicate'),
+            metric('群级拦截', 'actualDropGroup'),
+            metric('首次用户屏蔽', 'actualBlocked'),
+            metric('队列淘汰', 'queueDropped'),
+            metric('当前屏蔽用户', 'blockedUsers'),
+            metric('频道消息', 'channel')
+          ],
+          types: report.types.map(item => ({
+            label: item.label,
+            total: item.total === null ? '不可用' : String(item.total),
+            wouldDrop: item.wouldDrop === null ? '不可用' : String(item.wouldDrop),
+            actualDropped: item.actualDropped === null ? '不可用' : String(item.actualDropped),
+            queueDropped: item.queueDropped === null ? '不可用' : String(item.queueDropped)
+          })),
+          whitelist: `${report.whitelistCount}/${report.whitelistLimit}`,
+          trustedGroups: `${report.trustedGroupCount}/${report.trustedGroupLimit}`,
+          statsStatus: report.statsAvailable ? '统计可用' : `统计不可用：${report.unavailableReason}`,
+          observeStatus: report.observe ? '观察模式：开启（只统计，不丢弃）' : '观察模式：关闭',
+          imageStatus: report.imageMode ? '图片模式：开启' : '图片模式：关闭',
+          updatedAt: report.updatedAt ? new Date(report.updatedAt).toISOString() : '暂无数据',
+          tplFile: join(QQBOT_PLUGIN_ROOT, 'resources', 'html', 'MessageProtection', 'MessageProtection.html'),
+          pluResPath: `${join(QQBOT_PLUGIN_ROOT, 'resources')}/`,
+          _res_Path: `${join(QQBOT_PLUGIN_ROOT, 'resources')}/`,
+          saveId: `message-protection-${String(selfId).replace(/\W/g, '').slice(-24)}`
+        }
+        let timeout
+        try {
+          return await Promise.race([
+            renderer.screenshot('MessageProtection', renderData),
+            new Promise((resolve, reject) => {
+              timeout = setTimeout(() => reject(new Error(`图片渲染超过 ${MESSAGE_PROTECTION_RENDER_TIMEOUT_MS / 1000} 秒`)), MESSAGE_PROTECTION_RENDER_TIMEOUT_MS)
+              timeout.unref?.()
+            })
+          ])
+        } finally {
+          if (timeout) clearTimeout(timeout)
+        }
+      } catch (error) {
+        messageProtectionRendererPromise = undefined
+        const now = Date.now()
+        const last = messageProtectionRenderErrorAt.get(selfId) || 0
+        if (now - last >= 60000) {
+          messageProtectionRenderErrorAt.set(selfId, now)
+          Bot.makeLog?.('warn', [`[${selfId}] 消息防护图片渲染失败，回退文本`, error.message || String(error)], selfId)
+        }
+        return false
+      } finally {
+        messageProtectionRenderRequests.delete(requestKey)
+      }
+    })()
+    messageProtectionRenderRequests.set(requestKey, task)
+    return task
+  }
+
+  async getMessageProtectionOutput (selfId, title, mode = 'auto') {
+    const report = getMessageProtectionReport(selfId)
+    const useImage = mode === '图片' || (mode !== '文本' && report.imageMode)
+    if (useImage) {
+      const image = await this.renderMessageProtectionImage(report, title)
+      if (image) return { output: image, report, image: true }
+      return { output: `${this.getMessageProtectionText(report, title)}\n\n>图片渲染失败，已使用文本回退。`, report, image: false }
+    }
+    return { output: this.getMessageProtectionText(report, title), report, image: false }
+  }
+
+  getMessageProtectionOverviewButtons (result) {
+    return segment.button(
+      [{ text: '观察统计', callback: '#QQBot高级设置 消息防护观察 查看' }, { text: '设置', callback: '#QQBot高级设置 消息防护设置 1' }],
+      [{ text: result.image ? '总览文本' : '总览图片', callback: `#QQBot高级设置 消息防护设置 总览 ${result.image ? '文本' : '图片'}` }, { text: '名单管理', callback: '#QQBot高级设置 消息防护设置 3' }],
+      [{ text: '返回高级设置', callback: '#QQBot高级设置' }]
+    )
+  }
+
+  getMessageProtectionObservationButtons (result, selfId) {
+    return segment.button(
+      [{ text: ensureMessageProtectionConfig(selfId).observe ? '关闭观察' : '开启观察', callback: `#QQBot高级设置 消息防护观察 ${ensureMessageProtectionConfig(selfId).observe ? '关闭' : '开启'}` }, { text: result.image ? '总览文本' : '总览图片', callback: `#QQBot高级设置 消息防护观察 查看 ${result.image ? '文本' : '图片'}` }],
+      [{ text: '清空统计', callback: '#QQBot高级设置 消息防护观察 清空' }, { text: '消息防护设置', callback: '#QQBot高级设置 消息防护设置 1' }],
+      [{ text: '返回高级设置', callback: '#QQBot高级设置' }]
+    )
+  }
+
+  async replyMessageProtectionResult (result, title, buttons) {
+    let sent
+    try {
+      sent = await this.reply([result.output, buttons], true)
+    } catch (error) {
+      sent = { error: [error] }
+    }
+    if (!result.image || (sent !== false && !sent?.error?.length)) return sent
+    const selfId = result.report.selfId
+    const now = Date.now()
+    const last = messageProtectionRenderErrorAt.get(selfId) || 0
+    if (now - last >= 60000) {
+      messageProtectionRenderErrorAt.set(selfId, now)
+      Bot.makeLog?.('warn', [`[${selfId}] 消息防护图片发送失败，回退文本`], selfId)
+    }
+    const fallbackResult = { ...result, image: false }
+    const fallbackButtons = title === '消息防护观察总览'
+      ? this.getMessageProtectionObservationButtons(fallbackResult, selfId)
+      : this.getMessageProtectionOverviewButtons(fallbackResult)
+    return this.reply([`${this.getMessageProtectionText(result.report, title)}\n\n>图片发送失败，已使用文本回退。`, fallbackButtons], true)
+  }
+
+  async getMessageProtectionOverview (mode = 'auto') {
+    const selfId = this.e.self_id || this.e.bot?.uin || this.e.bot?.self_id || ''
+    const result = await this.getMessageProtectionOutput(selfId, '消息防护总览', mode)
+    return [result.output, this.getMessageProtectionOverviewButtons(result)]
+  }
+
+  async replyMessageProtectionOverview (mode = 'auto') {
+    const selfId = this.e.self_id || this.e.bot?.uin || this.e.bot?.self_id || ''
+    const result = await this.getMessageProtectionOutput(selfId, '消息防护总览', mode)
+    return this.replyMessageProtectionResult(result, '消息防护总览', this.getMessageProtectionOverviewButtons(result))
+  }
+
+  async getMessageProtectionObservationMenu (mode = 'auto') {
+    const selfId = this.e.self_id || this.e.bot?.uin || this.e.bot?.self_id || ''
+    const result = await this.getMessageProtectionOutput(selfId, '消息防护观察总览', mode)
+    return [result.output, this.getMessageProtectionObservationButtons(result, selfId)]
+  }
+
+  async replyMessageProtectionObservationMenu (mode = 'auto') {
+    const selfId = this.e.self_id || this.e.bot?.uin || this.e.bot?.self_id || ''
+    const result = await this.getMessageProtectionOutput(selfId, '消息防护观察总览', mode)
+    return this.replyMessageProtectionResult(result, '消息防护观察总览', this.getMessageProtectionObservationButtons(result, selfId))
+  }
+
+  getMessageProtectionListMenu (kind, page = 1) {
+    const selfId = this.e.self_id || this.e.bot?.uin || this.e.bot?.self_id || ''
+    const cfg = ensureMessageProtectionConfig(selfId)
+    const field = kind === 'whitelist' ? 'whitelistUsers' : 'trustedGroups'
+    const title = kind === 'whitelist' ? '消息防护白名单' : '消息防护可信群'
+    const values = cfg[field]
+    const size = 10
+    const pageCount = Math.max(1, Math.ceil(values.length / size))
+    const current = Math.min(pageCount, Math.max(1, Number(page) || 1))
+    const start = (current - 1) * size
+    const rows = values.slice(start, start + size).map((value, index) => `${start + index + 1}. ${value}`)
+    const addCommand = `#QQBot高级设置 ${kind === 'whitelist' ? '消息防护白名单' : '消息防护可信群'} 添加 `
+    const deleteCommand = `#QQBot高级设置 ${kind === 'whitelist' ? '消息防护白名单' : '消息防护可信群'} 删除 `
+    const clearCommand = `#QQBot高级设置 ${kind === 'whitelist' ? '消息防护白名单' : '消息防护可信群'} 清空`
+    const message = [
+      `#[${selfId}] ${title} ${current}/${pageCount}`,
+      '',
+      `>当前数量：${values.length}/1000`,
+      ...(rows.length ? rows : ['>暂无记录']),
+      '',
+      `><qqbot-cmd-input text="${addCommand}" show="添加${kind === 'whitelist' ? '用户' : '群'}"/>`,
+      `><qqbot-cmd-input text="${deleteCommand}" show="删除${kind === 'whitelist' ? '用户' : '群'}"/>`,
+      `><qqbot-cmd-input text="${clearCommand}" show="清空列表"/>`
+    ].join('\n')
+    const base = kind === 'whitelist' ? '消息防护白名单' : '消息防护可信群'
+    const buttons = [
+      [current > 1 ? { text: '上一页', callback: `#QQBot高级设置 ${base} 查看 ${current - 1}` } : { text: '设置', callback: '#QQBot高级设置 消息防护设置 3' }, current < pageCount ? { text: '下一页', callback: `#QQBot高级设置 ${base} 查看 ${current + 1}` } : { text: '设置', callback: '#QQBot高级设置 消息防护设置 3' }],
+      [{ text: `添加${kind === 'whitelist' ? '用户' : '群'}`, input: addCommand }, { text: `删除${kind === 'whitelist' ? '用户' : '群'}`, input: deleteCommand }],
+      [{ text: '清空列表', callback: `#QQBot高级设置 ${base} 清空` }, { text: '返回设置', callback: '#QQBot高级设置 消息防护设置 3' }]
+    ]
+    return [message, segment.button(...buttons)]
+  }
+
+  async messageProtectionListCommand (kind, args = '') {
+    const selfId = this.e.self_id || this.e.bot?.uin || this.e.bot?.self_id || ''
+    const cfg = ensureMessageProtectionConfig(selfId)
+    const whitelist = kind === 'whitelist'
+    const commandName = whitelist ? '消息防护白名单' : '消息防护可信群'
+    const field = whitelist ? 'whitelistUsers' : 'trustedGroups'
+    const label = whitelist ? '用户' : '群'
+    const parts = String(args || '').trim().split(/\s+/).filter(Boolean)
+    const operation = parts.shift() || '查看'
+    if (operation === '查看') return this.reply(this.getMessageProtectionListMenu(kind, parts[0] || 1), true)
+    if (operation === '清空' && parts[0] !== '确认') {
+      return this.reply([`清空${label}列表需要确认。\n\n><qqbot-cmd-input text="#QQBot高级设置 ${commandName} 清空 确认" show="确认清空"/>`, segment.button([{ text: '确认清空', callback: `#QQBot高级设置 ${commandName} 清空 确认` }, { text: '取消', callback: `#QQBot高级设置 ${commandName} 查看` }])], true)
+    }
+    if (operation === '清空' && parts[0] === '确认') {
+      const previous = [...cfg[field]]
+      cfg[field] = []
+      try {
+        await configSave()
+      } catch (error) {
+        cfg[field] = previous
+        return this.reply(`消息防护${label}列表清空失败：${error.message || String(error)}`, true)
+      }
+      return this.reply([`[${selfId}] 消息防护${label}列表已清空`, segment.button([{ text: '返回名单管理', callback: '#QQBot高级设置 消息防护设置 3' }])], true)
+    }
+    if (!['添加', '删除'].includes(operation) || parts.length !== 1) return this.reply(`用法：#QQBot高级设置 ${commandName} 添加/删除 ${whitelist ? 'user_openid' : 'group_openid'}`, true)
+    const value = whitelist ? normalizeQQBotOpenid(parts[0]) : normalizeMessageProtectionGroup(selfId, parts[0])
+    if (!value || /[\u0000-\u001f\u007f\s]/.test(value) || value.length > 256) return this.reply(`无效${label}标识，请提供不含空格的有效标识。`, true)
+    const index = cfg[field].indexOf(value)
+    if (operation === '添加') {
+      if (index >= 0) return this.reply(`${label}已存在：${value}`, true)
+      if (cfg[field].length >= 1000) return this.reply(`消息防护${label}列表已达到 1000 条上限。`, true)
+      const previous = [...cfg[field]]
+      cfg[field].push(value)
+      try {
+        await configSave()
+      } catch (error) {
+        cfg[field] = previous
+        return this.reply(`消息防护${label}添加失败：${error.message || String(error)}`, true)
+      }
+      return this.reply([`${label}已添加：${value}`, segment.button([{ text: '查看列表', callback: `#QQBot高级设置 ${commandName} 查看` }, { text: '返回设置', callback: '#QQBot高级设置 消息防护设置 3' }])], true)
+    }
+    if (index < 0) return this.reply(`消息防护${label}不存在：${value}`, true)
+    const previous = [...cfg[field]]
+    cfg[field].splice(index, 1)
+    try {
+      await configSave()
+    } catch (error) {
+      cfg[field] = previous
+      return this.reply(`消息防护${label}删除失败：${error.message || String(error)}`, true)
+    }
+    return this.reply([`${label}已删除：${value}`, segment.button([{ text: '查看列表', callback: `#QQBot高级设置 ${commandName} 查看` }, { text: '返回设置', callback: '#QQBot高级设置 消息防护设置 3' }])], true)
+  }
+
+  async saveMessageProtectionSetting (selfId, key, value) {
+    const cfg = ensureMessageProtectionConfig(selfId)
+    const previous = cfg[key]
+    cfg[key] = value
+    try {
+      await configSave()
+      return true
+    } catch (err) {
+      cfg[key] = previous
+      await this.reply(`消息防护配置保存失败：${err.message || String(err)}`, true)
+      return false
+    }
+  }
+
   async advancedSetting () {
     if (!this.guardOfficialBot()) return true
-    const match = /^#q+bot高级设置(?:\s*(龙虾菜单|龙虾在线|龙虾json|龙虾code|Markdown(?:引用)?回复)(?:\s+(.+))?)?$/i.exec(this.e.msg)
+    const match = /^#q+bot高级设置(?:\s*(消息防护设置|消息防护观察|消息防护白名单|消息防护可信群|龙虾菜单|龙虾在线|龙虾json|龙虾code|Markdown(?:引用)?回复)(?:\s+([\s\S]+))?)?$/i.exec(this.e.msg)
     const action = match?.[1]
     const args = (match?.[2] || '').trim()
     const selfId = this.e.self_id || this.e.bot?.uin || this.e.bot?.self_id || ''
@@ -8390,15 +9402,87 @@ export class QQBotAdapter extends plugin {
     if (!action) {
       const reference = getBotConfigValue(selfId, 'markdownReference') === true
       return this.reply([
-        `#[${selfId}] 高级设置\n\n>Markdown引用回复：${reference ? '开启' : '关闭'}\n\n>内部 #QQBot 命令始终不添加引用；此开关只控制外部插件 Markdown 显式引用。\n\n>龙虾配置已压缩到独立菜单。`,
+        `#[${selfId}] 高级设置\n\n>Markdown引用回复：${reference ? '开启' : '关闭'}\n\n>消息防护：${ensureMessageProtectionConfig(selfId).enabled ? '开启' : '关闭'}\n\n>内部 #QQBot 命令始终不添加引用；此开关只控制外部插件 Markdown 显式引用。`,
         segment.button(
           [
             { text: `${reference ? '关闭' : '开启'}MD引用`, callback: `#QQBot高级设置 Markdown回复 ${reference ? '关闭' : '开启'}` },
-            { text: '龙虾设置', callback: '#QQBot高级设置 龙虾菜单' }
+            { text: '消息防护', callback: '#QQBot高级设置 消息防护设置 1' }
           ],
-          [{ text: '返回', callback: '#QQBot帮助' }]
+          [{ text: '龙虾设置', callback: '#QQBot高级设置 龙虾菜单' }, { text: '返回', callback: '#QQBot帮助' }]
         )
       ])
+    }
+
+    if (action === '消息防护设置') {
+      if (!args) return this.reply(this.getMessageProtectionMenu(1), true)
+      if (/^\d+$/.test(args)) {
+        const page = Number(args)
+        if (page < 1 || page > 4) return this.reply(['页码只能是 1、2、3。\n\n><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 1" show="第1页"/>\n\n><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 2" show="第2页"/>\n\n><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 3" show="第3页"/>', segment.button([{ text: '第1页', callback: '#QQBot高级设置 消息防护设置 1' }, { text: '第2页', callback: '#QQBot高级设置 消息防护设置 2' }], [{ text: '第3页', callback: '#QQBot高级设置 消息防护设置 3' }])], true)
+        return this.reply(this.getMessageProtectionMenu(page), true)
+      }
+      const overview = /^总览(?:\s+(图片|文本))?$/.exec(args)
+      if (overview) return this.replyMessageProtectionOverview(overview[1] || 'auto')
+      const imageMode = /^图片模式\s+(开启|关闭|图片|文本)$/.exec(args)
+      if (imageMode) {
+        const state = imageMode[1] === '开启' || imageMode[1] === '图片'
+        if (!await this.saveMessageProtectionSetting(selfId, 'imageMode', state)) return
+        return this.reply([`[${selfId}] 图片模式已${state ? '开启' : '关闭'}`, segment.button([{ text: '查看总览', callback: '#QQBot高级设置 消息防护设置 总览' }, { text: '返回设置', callback: '#QQBot高级设置 消息防护设置 1' }])], true)
+      }
+      const listMatch = /^(白名单|可信群)(?:\s+([\s\S]+))?$/.exec(args)
+      if (listMatch) return this.messageProtectionListCommand(listMatch[1] === '白名单' ? 'whitelist' : 'trustedGroup', listMatch[2] || '')
+      const settingMatch = /^(\S+)\s*(开启|关闭)?$/i.exec(args)
+      const label = settingMatch?.[1] || ''
+      const key = MESSAGE_PROTECTION_SETTING_KEYS[label]
+      if (!key) {
+        return this.reply([
+          `缺少或不支持设置项。\n\n>用法：#QQBot高级设置 消息防护设置 设置项 开启/关闭\n\n><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 总开关 " show="设置总开关"/>`,
+          segment.button([{ text: '总开关', input: '#QQBot高级设置 消息防护设置 总开关 ' }, { text: '用户限流', input: '#QQBot高级设置 消息防护设置 用户级限流 ' }], [{ text: '重复限流', input: '#QQBot高级设置 消息防护设置 重复内容限流 ' }, { text: '群级限流', input: '#QQBot高级设置 消息防护设置 群级限流 ' }], [{ text: '返回设置', callback: '#QQBot高级设置 消息防护设置 1' }])
+        ], true)
+      }
+      if (!settingMatch?.[2]) {
+        return this.reply([
+          `缺少开启或关闭参数，请选择：\n\n><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 ${label} 开启" show="开启${label}"/>\n\n><qqbot-cmd-input text="#QQBot高级设置 消息防护设置 ${label} 关闭" show="关闭${label}"/>`,
+          segment.button([{ text: `开启${label}`, callback: `#QQBot高级设置 消息防护设置 ${label} 开启` }, { text: `关闭${label}`, callback: `#QQBot高级设置 消息防护设置 ${label} 关闭` }], [{ text: '返回设置', callback: '#QQBot高级设置 消息防护设置 1' }])
+        ], true)
+      }
+      const state = settingMatch[2] === '开启'
+      if (!await this.saveMessageProtectionSetting(selfId, key, state)) return
+      return this.reply([`[${selfId}] ${label}已${state ? '开启' : '关闭'}`, segment.button([{ text: '返回设置', callback: '#QQBot高级设置 消息防护设置 1' }])], true)
+    }
+
+    if (action === '消息防护观察') {
+      if (!args) {
+        return this.reply([
+          '缺少观察操作。\n\n><qqbot-cmd-input text="#QQBot高级设置 消息防护观察 开启" show="开启观察"/>\n\n><qqbot-cmd-input text="#QQBot高级设置 消息防护观察 查看" show="查看统计"/>',
+          segment.button([{ text: '开启观察', callback: '#QQBot高级设置 消息防护观察 开启' }, { text: '关闭观察', callback: '#QQBot高级设置 消息防护观察 关闭' }], [{ text: '查看统计', callback: '#QQBot高级设置 消息防护观察 查看' }, { text: '清空统计', callback: '#QQBot高级设置 消息防护观察 清空' }])
+        ], true)
+      }
+      if (/^(开启|关闭)$/.test(args)) {
+        const state = args === '开启'
+        if (!await this.saveMessageProtectionSetting(selfId, 'observe', state)) return
+        return this.reply([`[${selfId}] 消息防护观察已${state ? '开启' : '关闭'}`, segment.button([{ text: '查看统计', callback: '#QQBot高级设置 消息防护观察 查看' }, { text: '返回设置', callback: '#QQBot高级设置 消息防护设置 1' }])], true)
+      }
+      const view = /^查看(?:\s+(图片|文本|\d+))?$/.exec(args)
+      if (view) {
+        const mode = ['图片', '文本'].includes(view[1]) ? view[1] : 'auto'
+        return this.replyMessageProtectionObservationMenu(mode)
+      }
+      if (args === '清空') {
+        return this.reply(['清空观察统计需要确认。\n\n><qqbot-cmd-input text="#QQBot高级设置 消息防护观察 清空 确认" show="确认清空"/>', segment.button([{ text: '确认清空', callback: '#QQBot高级设置 消息防护观察 清空 确认' }, { text: '取消', callback: '#QQBot高级设置 消息防护观察 查看' }])], true)
+      }
+      if (args === '清空 确认') {
+        clearMessageProtectionObservation(selfId)
+        return this.reply([`[${selfId}] 消息防护观察统计已清空`, segment.button([{ text: '返回设置', callback: '#QQBot高级设置 消息防护设置 1' }])], true)
+      }
+      return this.reply('不支持的观察操作，请使用 开启、关闭、查看、清空 确认。', true)
+    }
+
+    if (action === '消息防护白名单') {
+      return this.messageProtectionListCommand('whitelist', args)
+    }
+
+    if (action === '消息防护可信群') {
+      return this.messageProtectionListCommand('trustedGroup', args)
     }
 
     if (action === '龙虾菜单') {
@@ -9823,7 +10907,7 @@ export class QQBotAdapter extends plugin {
     const msg = String(this.e.msg || '')
     const args = msg.replace(/^#q+bot全量消息设置/i, '').trim()
     if (!args) {
-      this.reply([getFullMessageStatusMsg(config, this.e.self_id), segment.button(...getFullMessageStatusButtons(config, this.e.self_id))], true)
+      this.reply([await getFullMessageStatusMsg(config, this.e.self_id), segment.button(...getFullMessageStatusButtons(config, this.e.self_id))], true)
       return
     }
 
@@ -9891,11 +10975,11 @@ export class QQBotAdapter extends plugin {
     if (ret) this.reply(`[${this.e.self_id}] ${ret}`, true)
   }
 
-  fullMessageRecords () {
+  async fullMessageRecords () {
     if (!this.guardOfficialBot()) return true
     const match = /^#q+bot全量查看(?:\s+(\d+))?$/i.exec(this.e.msg)
     this.reply([
-      getFullMessageRecordsMsg(config, match?.[1], 20, this.e.self_id),
+      await getFullMessageRecordsMsg(config, match?.[1], 20, this.e.self_id),
       segment.button(...getFullMessageRecordsButtons(config, match?.[1], 20, this.e.self_id))
     ], true)
   }
@@ -9932,16 +11016,14 @@ export class QQBotAdapter extends plugin {
       ], true)
     }
 
-  fullMessageOfficialRecords () {
+  async fullMessageOfficialRecords () {
     if (!this.guardOfficialBot()) return true
     const match = /^#q+bot查看官方接口记录(?:\s+(\d+))?$/i.exec(this.e.msg)
     const pageSize = 10
-    const records = Object.values(fullMessageStore.getRecords())
-      .filter(item => item.self_id === this.e.self_id)
-      .sort((a, b) => String(b.last_time || '').localeCompare(String(a.last_time || '')))
-    const pageCount = Math.max(1, Math.ceil(records.length / pageSize))
-    const page = Math.min(pageCount, Math.max(1, Number(match?.[1]) || 1))
-    const list = records.slice((page - 1) * pageSize, page * pageSize)
+    const records = await fullMessageStore.getRecordsPage(this.e.self_id, match?.[1], pageSize)
+    const pageCount = records.pageCount
+    const page = records.page
+    const list = records.list
     const body = list.length
       ? list.map((item, index) => {
           const info = groupInfoStore.getInfo(item.self_id, item.group_openid)
