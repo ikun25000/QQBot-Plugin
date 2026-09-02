@@ -38,6 +38,15 @@ const numToChinese = {
 const _path = process.cwd()
 // DAU follows node-schedule's local business day. Production runs in Asia/Shanghai.
 const getDauDate = (offset = 0) => moment().add(offset, 'day').format('YYYY-MM-DD')
+const dauRedisErrorAt = new Map()
+
+function logDauRedisError (selfId, error) {
+  const now = Date.now()
+  const last = dauRedisErrorAt.get(String(selfId)) || 0
+  if (now - last < 60000) return
+  dauRedisErrorAt.set(String(selfId), now)
+  logger.error(`[QQBot-Plugin] DAU Redis计数失败(${selfId})`, error)
+}
 
 export default class Dau {
   constructor (self_id, sep, dauDB) {
@@ -56,12 +65,25 @@ export default class Dau {
     switch (this.dauDB) {
       case 'redis': {
         const prefix = `QQBot:${this.self_id}:`
+        const normalizeRedisKey = key => {
+          const params = String(key).split(':')
+          if (params.length < 2) params.push(this.today)
+          return `${prefix}${params.join(':')}`
+        }
+        const incrementRedisKeys = async (keys = []) => {
+          const redisKeys = [...new Set(keys.filter(Boolean).map(normalizeRedisKey))]
+          if (!redisKeys.length) return []
+          if (typeof redis.multi === 'function') {
+            const batch = redis.multi()
+            for (const redisKey of redisKeys) batch.incr(redisKey)
+            return batch.exec()
+          }
+          if (typeof redis.incr === 'function') return Promise.all(redisKeys.map(redisKey => redis.incr(redisKey)))
+          throw new Error('Redis client does not support incr or multi')
+        }
         this.db = {
           get: async (key) => {
-            key = key.split(':')
-            if (key.length < 2) key.push(this.today)
-            key = key.join(':')
-            const data = await redis.get(`${prefix}${key}`)
+            const data = await redis.get(normalizeRedisKey(key))
             switch (typeof data) {
               case 'number':
                 return data
@@ -102,7 +124,8 @@ export default class Dau {
               default:
                 break
             }
-          }
+          },
+          increment: incrementRedisKeys
         }
         break
       }
@@ -163,7 +186,7 @@ export default class Dau {
   async getStats (time = this.today) {
     if (String(time) !== String(this.today)) return this.getArchivedStats(time)
     if (this.dauDB === 'level') {
-      return this.stats
+      return { ...this.stats }
     } else {
       return {
         receive_msg_count: await this.db.get(`receive_msg_count:${time}`) || 0,
@@ -282,8 +305,8 @@ export default class Dau {
       yesterdayDau: yesterdayDau || {},
       todayDAU: await this.getStats(),
       monthly: data.time,
-      groupNum: this.all_group?.total || e.bot.gl.size,
-      userNum: this.all_user?.total || e.bot.fl.size,
+       groupNum: e.bot.gl.size,
+       userNum: e.bot.fl.size,
       nickname: Bot[this.self_id].nickname,
       avatar: Bot[this.self_id].avatar,
       tplFile: `${_path}/plugins/QQBot-Plugin/resources/html/DAU/DAU.html`,
@@ -371,18 +394,31 @@ export default class Dau {
     let yesterday_user_count
     let userCount
     let groupCount
-    let allUserScope = { full: 0, at: 0 }
-    let allGroupScope = { full: 0, at: 0 }
+    let todayActiveUserCount = 0
+    let todayActiveGroupCount = 0
+    let allUserScope = { full: '未知', at: '未知' }
+    let allGroupScope = { full: '未知', at: '未知' }
     if (this.dauDB === 'level') {
-      userCount = this.all_user.total
-      groupCount = this.all_group.total
-      allUserScope = this.getReceiveScopeCounts(this.all_user)
-      allGroupScope = this.getReceiveScopeCounts(this.all_group)
+      userCount = e.bot?.fl?.size || 0
+      groupCount = e.bot?.gl?.size || 0
+      todayActiveUserCount = Object.keys(this.today_user_data.user || {}).length
+      todayActiveGroupCount = Object.keys(this.today_user_data.group || {}).length
+      allUserScope = {
+        full: this.today_user_data.user_scope_available ? Object.keys(this.today_user_data.user_full || {}).length : '未知',
+        at: this.today_user_data.user_scope_available ? Object.keys(this.today_user_data.user_at || {}).length : '未知'
+      }
+      allGroupScope = {
+        full: this.today_user_data.group_scope_available ? Object.keys(this.today_user_data.group_full || {}).length : '未知',
+        at: this.today_user_data.group_scope_available ? Object.keys(this.today_user_data.group_at || {}).length : '未知'
+      }
       yesterday_user_count = _.size(this.yestoday_user_data.user)
       user_same_count = _.intersection(_.keys(this.today_user_data.user), _.keys(this.yestoday_user_data.user)).length
     } else {
       userCount = e.bot.fl.size
       groupCount = e.bot.gl.size
+      const todayStats = await this.getStats()
+      todayActiveUserCount = Number(todayStats?.user_count) || 0
+      todayActiveGroupCount = Number(todayStats?.group_count) || 0
       const m = moment()
       const data = []
       for (let i = 0; i < 2; i++) {
@@ -402,14 +438,15 @@ export default class Dau {
       user_same_count = _.intersection(data[0], data[1]).length
     }
     const msg = [
-      '总计数据:',
-      '总用户量: ' + userCount,
-      `总用户量(全量/非全量): ${allUserScope.full}/${allUserScope.at}`,
-      '总群聊量: ' + groupCount,
-      `总群聊量(全量/非全量): ${allGroupScope.full}/${allGroupScope.at}`,
+      '当前数据:',
+      '当前用户量: ' + userCount,
+      `今日活跃用户(全量/非全量): ${allUserScope.full}/${allUserScope.at}`,
+      '当前群聊量: ' + groupCount,
+      `今日活跃群聊(全量/非全量): ${allGroupScope.full}/${allGroupScope.at}`,
       '',
-      '新增数据:',
-      `新增用户: ${this.user_increase.length}`,
+      '今日数据:',
+      `今日活跃用户: ${todayActiveUserCount}`,
+      `今日活跃群聊: ${todayActiveGroupCount}`,
       `新增群数: ${_.size(this.group_increase)}`,
       `减少群数: ${_.size(this.group_decrease)}`,
       '',
@@ -472,8 +509,19 @@ export default class Dau {
   async initData () {
     if (this.dauDB == 'level') {
       // 用户和群统计
-      this.today_user_data = await this.getDB('user_group_stats') || { user: {}, group: {} }
-      this.yestoday_user_data = await this.getDB('user_group_stats', this.yesterday) || { user: {}, group: {} }
+      const normalizeDailyData = data => ({
+        ...(data && typeof data === 'object' ? data : {}),
+        user: data?.user && typeof data.user === 'object' ? data.user : {},
+        group: data?.group && typeof data.group === 'object' ? data.group : {},
+        user_full: data?.user_full && typeof data.user_full === 'object' ? data.user_full : {},
+        user_at: data?.user_at && typeof data.user_at === 'object' ? data.user_at : {},
+        group_full: data?.group_full && typeof data.group_full === 'object' ? data.group_full : {},
+        group_at: data?.group_at && typeof data.group_at === 'object' ? data.group_at : {},
+        user_scope_available: data?.user_scope_available === true || Object.prototype.hasOwnProperty.call(data || {}, 'user_full') || Object.prototype.hasOwnProperty.call(data || {}, 'user_at'),
+        group_scope_available: data?.group_scope_available === true || Object.prototype.hasOwnProperty.call(data || {}, 'group_full') || Object.prototype.hasOwnProperty.call(data || {}, 'group_at')
+      })
+      this.today_user_data = normalizeDailyData(await this.getDB('user_group_stats'))
+      this.yestoday_user_data = normalizeDailyData(await this.getDB('user_group_stats', this.yesterday))
 
       // DAU统计
       this.stats = await this.getDB('dau_stats') || _.reduce(_.keys(dauAttr), (acc, key) => {
@@ -490,12 +538,12 @@ export default class Dau {
       this.group_decrease = await this.getDB('group_decrease') || {}
       this.friend_add = await this.getDB('friend_add') || {}
       this.friend_delete = await this.getDB('friend_delete') || {}
-      this.user_increase = await this.getDB('user_increase') || []
 
-      // 所有用户, 群聊, 群员统计
-      this.all_user = await this.getDB('all_user', null) || { total: 0 }
-      this.all_group = await this.getDB('all_group', null) || { total: 0 }
-      this.all_group_member = await this.getDB('all_group_member', null) || {}
+      // 保留旧的 all_* key，但不再把历史明细加载到内存。
+      // 当前统计使用实时好友/群列表和 user_group_stats，避免大对象常驻及整对象写回。
+      this.all_user = { total: 0 }
+      this.all_group = { total: 0 }
+      this.all_group_member = {}
     } else {
       this.group_decrease = await this.getDB('group_decrease') || {}
       this.group_increase = await this.getDB('group_increase') || {}
@@ -544,7 +592,11 @@ export default class Dau {
     switch (type) {
       case 'send_msg':
         if (this.dauDB === 'redis') {
-          this.db.set('send_msg_count')
+          try {
+            await this.db.increment(['send_msg_count'])
+          } catch (error) {
+            logDauRedisError(this.self_id, error)
+          }
         } else {
           this.stats[key]++
         }
@@ -553,8 +605,14 @@ export default class Dau {
       case 'receive_msg':
         const scope = this.getReceiveMsgScope(data)
         if (this.dauDB === 'redis') {
-          this.db.set('receive_msg_count')
-          this.db.set(scope === 'full' ? 'receive_msg_full_count' : 'receive_msg_at_count')
+          try {
+            await this.db.increment([
+              'receive_msg_count',
+              scope === 'full' ? 'receive_msg_full_count' : 'receive_msg_at_count'
+            ])
+          } catch (error) {
+            logDauRedisError(this.self_id, error)
+          }
         } else {
           this.stats[key]++
           this.stats[scope === 'full' ? 'receive_msg_full_count' : 'receive_msg_at_count']++
@@ -569,7 +627,6 @@ export default class Dau {
             this.stats[key]++
             await this.setDB('group_decrease', this.group_decrease, 2)
           }
-          if (this.all_group[group_id]) await this.deleteNotExistGroup([group_id])
         } else {
           if (!this.group_decrease[group_id]) {
             this.group_decrease[group_id] = 0
@@ -622,6 +679,11 @@ export default class Dau {
     if (this.dauDB === 'level') await this.setDB('dau_stats', this.stats)
   }
 
+  async close () {
+    try { this.job?.cancel() } catch {}
+    if (this.db?.close) await this.db.close().catch(() => {})
+  }
+
   async setLogFnc (user_id, group_id, logFnc, message_id) {
     if (!logFnc) return
     const logReg = /\[.*?\[(.*?\))\]/
@@ -641,76 +703,12 @@ export default class Dau {
     if (!this.call_stats[logFnc]) this.call_stats[logFnc] = 0
     this.call_stats[logFnc]++
     await this.setDB('call_stats', this.call_stats, 2)
-    if (this.dauDB === 'level') {
-      if (group_id) {
-        if (!this.all_group[group_id]) {
-          this.all_group.total++
-          this.all_group[group_id] = {
-            receive_msg_count: 0,
-            send_msg_count: 0,
-            call_stats: {
-              total: 0
-            }
-          }
-        }
-        if (!this.all_group[group_id].call_stats[logFnc]) {
-          this.all_group[group_id].call_stats.total++
-          this.all_group[group_id].call_stats[logFnc] = 0
-        }
-        this.all_group[group_id].send_msg_count++
-        this.all_group[group_id].call_stats[logFnc]++
-        await this.setDB('all_group', this.all_group, 0)
-      }
-
-      if (user_id) {
-        if (!this.all_user[user_id]) {
-          this.all_user.total++
-          this.all_user[user_id] = {
-            receive_msg_count: 0,
-            send_msg_count: 0,
-            call_stats: {
-              total: 0
-            }
-          }
-        }
-        if (!this.all_user[user_id].call_stats[logFnc]) {
-          this.all_user[user_id].call_stats.total++
-          this.all_user[user_id].call_stats[logFnc] = 0
-        }
-        this.all_user[user_id].send_msg_count++
-        this.all_user[user_id].call_stats[logFnc]++
-        await this.setDB('all_user', this.all_user, 0)
-      }
-
-      if (group_id && user_id) {
-        if (!this.all_group_member[group_id]) {
-          this.all_group_member[group_id] = {
-            total: 0
-          }
-        }
-        if (!this.all_group_member[group_id][user_id]) {
-          this.all_group_member[group_id].total++
-          this.all_group_member[group_id][user_id] = {
-            receive_msg_count: 0,
-            send_msg_count: 0,
-            call_stats: {
-              total: 0
-            }
-          }
-        }
-        if (!this.all_group_member[group_id][user_id].call_stats[logFnc]) {
-          this.all_group_member[group_id][user_id].call_stats.total++
-          this.all_group_member[group_id][user_id].call_stats[logFnc] = 0
-        }
-        this.all_group_member[group_id][user_id].send_msg_count++
-        this.all_group_member[group_id][user_id].call_stats[logFnc]++
-        await this.setDB('all_group_member', this.all_group_member, 0)
-      }
-    }
   }
 
   async setUserOrGroupStats (user_id, group_id, scope = 'at') {
     const isFull = scope === 'full'
+    this.today_user_data.user_scope_available = true
+    this.today_user_data.group_scope_available = true
     this.today_user_data.user_full ||= {}
     this.today_user_data.user_at ||= {}
     this.today_user_data.group_full ||= {}
@@ -732,24 +730,6 @@ export default class Dau {
       }
       scopeUser[user_id]++
 
-      if (!this.all_user[user_id]) {
-        this.all_user.total++
-        this.user_increase.push(user_id)
-        this.all_user[user_id] = {
-          receive_msg_count: 0,
-          receive_msg_full_count: 0,
-          receive_msg_at_count: 0,
-          send_msg_count: 0,
-          call_stats: {
-            total: 0
-          }
-        }
-        await this.setDB('user_increase', this.user_increase, 1)
-      }
-      this.ensureReceiveScopeStats(this.all_user[user_id])
-      this.all_user[user_id].receive_msg_count++
-      this.all_user[user_id][isFull ? 'receive_msg_full_count' : 'receive_msg_at_count']++
-      await this.setDB('all_user', this.all_user, 0)
     }
 
     if (group_id) {
@@ -768,65 +748,9 @@ export default class Dau {
       }
       scopeGroup[group_id]++
 
-      if (!this.all_group[group_id]) {
-        this.all_group.total++
-        this.all_group[group_id] = {
-          receive_msg_count: 0,
-          receive_msg_full_count: 0,
-          receive_msg_at_count: 0,
-          send_msg_count: 0,
-          call_stats: {
-            total: 0
-          }
-        }
-      }
-      this.ensureReceiveScopeStats(this.all_group[group_id])
-      this.all_group[group_id].receive_msg_count++
-      this.all_group[group_id][isFull ? 'receive_msg_full_count' : 'receive_msg_at_count']++
-      await this.setDB('all_group', this.all_group, 0)
-    }
-
-    if (user_id && group_id) {
-      if (!this.all_group_member[group_id]) {
-        this.all_group_member[group_id] = {
-          total: 0
-        }
-      }
-        if (!this.all_group_member[group_id][user_id]) {
-          this.all_group_member[group_id].total++
-          this.all_group_member[group_id][user_id] = {
-            receive_msg_count: 0,
-            receive_msg_full_count: 0,
-            receive_msg_at_count: 0,
-            send_msg_count: 0,
-            call_stats: {
-              total: 0
-            }
-          }
-        }
-      this.ensureReceiveScopeStats(this.all_group_member[group_id][user_id])
-      this.all_group_member[group_id][user_id].receive_msg_count++
-      this.all_group_member[group_id][user_id][isFull ? 'receive_msg_full_count' : 'receive_msg_at_count']++
-      await this.setDB('all_group_member', this.all_group_member, 0)
     }
 
     await this.setDB('user_group_stats', this.today_user_data, 2)
-  }
-
-  /**
-   * 删除不存在的群
-   * @param {string[]} groupIdList
-   */
-  async deleteNotExistGroup (groupIdList) {
-    if (this.dauDB !== 'level') return
-    for (const i of groupIdList) {
-      if (!this.all_group[i]) continue
-      delete this.all_group[i]
-      this.all_group.total--
-      delete this.all_group_member[i]
-    }
-    await this.setDB('all_group', this.all_group, 0)
-    await this.setDB('all_group_member', this.all_group_member, 0)
   }
 
   async getDB (key, date = this.today) {
