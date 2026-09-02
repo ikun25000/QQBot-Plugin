@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="{{pluResPath}}html/MessageProtection/MessageProtection.css" />
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">QQBOT / MESSAGE PROTECTION</div>
+        <h1>{{title}}</h1>
+        <p class="meta">{{nickname}} · Bot {{selfId}} · 更新于 {{updatedAt}}</p>
+      </div>
+      <div class="status-stack">
+        <span class="status">{{statsStatus}}</span>
+        <span>{{observeStatus}}</span>
+        <span>{{imageStatus}}</span>
+      </div>
+    </header>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>运行开关</h2>
+        <span>按 Bot 账号独立生效</span>
+      </div>
+      <div class="switch-grid">
+        {{each switches item}}
+        <div class="switch-item">
+          <span>{{item.label}}</span>
+          <strong class="{{item.value === '开启' ? 'on' : 'off'}}">{{item.value}}</strong>
+        </div>
+        {{/each}}
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>拦截概览</h2>
+        <span>实际数据和观察数据分开显示</span>
+      </div>
+      <div class="metric-grid">
+        {{each metrics item}}
+        <div class="metric">
+          <span>{{item.label}}</span>
+          <strong>{{item.value}}</strong>
+        </div>
+        {{/each}}
+      </div>
+    </section>
+
+    <section class="columns">
+      <div class="section panel">
+        <div class="section-head">
+          <h2>限流规则</h2>
+          <span>滑动窗口</span>
+        </div>
+        <div class="rule-list">
+          {{each rules item}}
+          <div class="rule-item"><span>{{item.label}}</span><strong>{{item.value}}</strong></div>
+          {{/each}}
+        </div>
+      </div>
+      <div class="section panel">
+        <div class="section-head">
+          <h2>事件类型</h2>
+          <span>总数 / 预计 / 实际 / 队列</span>
+        </div>
+        <div class="type-list">
+          {{each types item}}
+          <div class="type-item">
+            <span>{{item.label}}</span>
+            <strong>{{item.total}} / {{item.wouldDrop}} / {{item.actualDropped}} / {{item.queueDropped}}</strong>
+          </div>
+          {{/each}}
+        </div>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span>白名单用户：{{whitelist}}</span>
+      <span>可信群：{{trustedGroups}}</span>
+      <span>频道消息不参与本组业务限流，仍受全局队列保护</span>
+    </footer>
+  </main>
+</body>
+</html>
