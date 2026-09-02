@@ -10,6 +10,9 @@ const LOCAL_MESSAGE_INDEX_MAX_PER_BOT = 20000
 const PENDING_COMPLAINT_MAX_PER_BOT = 1000
 const ACTUAL_MESSAGE_IDS_MAX = 100
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000
+const LEVEL_INDEX_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000
+const INDEX_MEMORY_CACHE_MAX = 2000
+const INDEX_DELETE_BATCH_SIZE = 1000
 
 function nowIso () { return new Date().toISOString() }
 function dayKey (date = new Date()) { return date.toISOString().slice(0, 10) }
@@ -33,15 +36,48 @@ class AdvancedWelcomeStore {
     this._writeSeq = 0
     this._indexCounts = { messageIds: new Map(), localMessageIds: new Map() }
     this._lastCleanup = 0
+    this._indexCacheOrder = { messageIds: new Map(), localMessageIds: new Map() }
+    this._levelIndexCleanupPromise = null
+    this._levelIndexCleanupTimer = null
+    this._levelIndexCleanupRequested = false
+    this._lastLevelIndexCleanup = 0
+    this._pendingGroupSaves = new Set()
+    this._groupSaveTimer = null
+    this._groupSavePromise = null
+    this._groupSaveWaiters = []
+    this._pendingIndexPuts = new Map()
+    this._pendingIndexDeletes = new Set()
+    this._indexWriteWaiters = []
+    this._indexWriteTimer = null
+    this._indexWritePromise = null
   }
 
   _jsonPath () { return join(JSON_DATA_DIR, 'advancedWelcome.json') }
 
   async init () {
     if (this._ready) return
+    this.type = 'level'
     this._data = { groups: {}, pendingComplaints: {}, complaintBlacklist: {}, messageIds: {}, localMessageIds: {} }
     this._indexCounts = { messageIds: new Map(), localMessageIds: new Map() }
     this._lastCleanup = Date.now()
+    this._indexCacheOrder.messageIds.clear()
+    this._indexCacheOrder.localMessageIds.clear()
+    this._levelIndexCleanupPromise = null
+    this._levelIndexCleanupRequested = false
+    this._lastLevelIndexCleanup = 0
+    if (this._levelIndexCleanupTimer) clearTimeout(this._levelIndexCleanupTimer)
+    this._levelIndexCleanupTimer = null
+    this._pendingGroupSaves.clear()
+    if (this._groupSaveTimer) clearTimeout(this._groupSaveTimer)
+    this._groupSaveTimer = null
+    this._groupSavePromise = null
+    this._groupSaveWaiters = []
+    this._pendingIndexPuts.clear()
+    this._pendingIndexDeletes.clear()
+    this._indexWriteWaiters = []
+    if (this._indexWriteTimer) clearTimeout(this._indexWriteTimer)
+    this._indexWriteTimer = null
+    this._indexWritePromise = null
     try {
       const { default: Level } = await import('./level.js')
       fs.mkdirSync(LEVEL_DATA_DIR, { recursive: true })
@@ -60,9 +96,11 @@ class AdvancedWelcomeStore {
     } catch (err) {
       logger.error('[QQBot-Plugin] advancedWelcomeStore LevelDB init failed, fallback to json:', err.message)
       this.type = 'json'
-      if (this._db) { try { this._db.close() } catch {}; this._db = null }
+      if (this._db) { try { await this._db.close() } catch {}; this._db = null }
       this._data = { groups: {}, pendingComplaints: {}, complaintBlacklist: {}, messageIds: {}, localMessageIds: {} }
       this._indexCounts = { messageIds: new Map(), localMessageIds: new Map() }
+      this._indexCacheOrder.messageIds.clear()
+      this._indexCacheOrder.localMessageIds.clear()
       fs.mkdirSync(JSON_DATA_DIR, { recursive: true })
       try {
         const data = { groups: {}, pendingComplaints: {}, complaintBlacklist: {}, messageIds: {}, localMessageIds: {}, ...JSON.parse(fs.readFileSync(this._jsonPath(), 'utf-8')) }
@@ -87,6 +125,7 @@ class AdvancedWelcomeStore {
       }
     }
     this._ready = true
+    this._scheduleLevelIndexCleanup(30000)
   }
 
   _setByKey (key, value) {
@@ -112,12 +151,12 @@ class AdvancedWelcomeStore {
     const expires = Number(item?.expire_at)
     if (Number.isFinite(expires) && expires > 0) return expires <= now
     const time = this._indexTime(item)
-    return !time || now - time >= MESSAGE_INDEX_TTL_MS
+    return time > 0 && now - time >= MESSAGE_INDEX_TTL_MS
   }
 
   _isPendingExpired (item, now = Date.now()) {
     const expires = Number(item?.expire_at)
-    return !Number.isFinite(expires) || expires <= now
+    return Number.isFinite(expires) && expires > 0 && expires <= now
   }
 
   _isStoredRecordExpired (key, value, now = Date.now()) {
@@ -131,7 +170,7 @@ class AdvancedWelcomeStore {
     const old = this._data[store][key]
     const oldBot = String(old?.self_id || '')
     const bot = String(item?.self_id || '')
-    if (!old || oldBot !== bot) {
+    if (this.type !== 'level' && (!old || oldBot !== bot)) {
       if (old) {
         const oldCount = Math.max(0, (this._indexCounts[store].get(oldBot) || 1) - 1)
         if (oldCount) this._indexCounts[store].set(oldBot, oldCount)
@@ -140,19 +179,33 @@ class AdvancedWelcomeStore {
       this._indexCounts[store].set(bot, (this._indexCounts[store].get(bot) || 0) + 1)
     }
     this._data[store][key] = item
+    if (this.type === 'level') {
+      const order = this._indexCacheOrder[store]
+      order.delete(key)
+      order.set(key, true)
+      while (order.size > INDEX_MEMORY_CACHE_MAX) {
+        const oldest = order.keys().next().value
+        order.delete(oldest)
+        delete this._data[store][oldest]
+      }
+    }
   }
 
   _deleteIndexItem (store, key) {
     const item = this._data[store][key]
     if (!item) return
     const bot = String(item.self_id || '')
-    const count = Math.max(0, (this._indexCounts[store].get(bot) || 1) - 1)
-    if (count) this._indexCounts[store].set(bot, count)
-    else this._indexCounts[store].delete(bot)
+    if (this.type !== 'level') {
+      const count = Math.max(0, (this._indexCounts[store].get(bot) || 1) - 1)
+      if (count) this._indexCounts[store].set(bot, count)
+      else this._indexCounts[store].delete(bot)
+    }
     delete this._data[store][key]
+    this._indexCacheOrder[store]?.delete(key)
   }
 
   _pruneIndexStore (store, max, selfId = '') {
+    if (this.type === 'level') return []
     const prefix = store === 'messageIds' ? 'msg:' : 'localmsg:'
     const bots = selfId ? [String(selfId)] : [...this._indexCounts[store].keys()]
     const deletes = []
@@ -160,8 +213,8 @@ class AdvancedWelcomeStore {
       if ((this._indexCounts[store].get(bot) || 0) <= max) continue
       const items = Object.entries(this._data[store])
         .filter(([, item]) => String(item?.self_id || '') === bot)
-        .sort((a, b) => this._indexTime(b[1]) - this._indexTime(a[1]))
-      for (const [key] of items.slice(Math.floor(max * 0.9))) {
+        .sort((a, b) => this._indexTime(a[1]) - this._indexTime(b[1]))
+      for (const [key] of items.slice(0, Math.max(0, items.length - Math.floor(max * 0.9)))) {
         this._deleteIndexItem(store, key)
         deletes.push(`${prefix}${key}`)
       }
@@ -205,6 +258,238 @@ class AdvancedWelcomeStore {
     else this._scheduleSave()
   }
 
+  async _cleanupLevelIndexes (now = Date.now()) {
+    if (this.type !== 'level' || !this._db) return
+    if (this._levelIndexCleanupPromise) return this._levelIndexCleanupPromise
+    this._lastLevelIndexCleanup = now
+    this._levelIndexCleanupRequested = false
+    this._levelIndexCleanupPromise = (async () => {
+      for (const [prefix, max] of [['msg:', MESSAGE_INDEX_MAX_PER_BOT], ['localmsg:', LOCAL_MESSAGE_INDEX_MAX_PER_BOT]]) {
+        let expiredDeletes = []
+        const flushExpiredDeletes = async () => {
+          if (!expiredDeletes.length) return
+          await this._deleteExpiredIndexKeys(expiredDeletes)
+          expiredDeletes = []
+        }
+        const counts = new Map()
+        for await (const [key, value] of this._db.db.iterator({ gte: prefix, lt: `${prefix}\uffff` })) {
+          if (this._isStoredRecordExpired(key, value, now)) {
+            expiredDeletes.push(String(key))
+          } else {
+            const bot = String(value?.self_id || '')
+            if (bot) counts.set(bot, (counts.get(bot) || 0) + 1)
+          }
+          if (expiredDeletes.length >= INDEX_DELETE_BATCH_SIZE) await flushExpiredDeletes()
+        }
+        await flushExpiredDeletes()
+
+        const overflowBots = new Set([...counts].filter(([, count]) => count > max).map(([bot]) => bot))
+        if (!overflowBots.size) continue
+
+        const isOlder = (a, b) => a.time < b.time || (a.time === b.time && a.key < b.key)
+        const pushHeap = (heap, item) => {
+          heap.push(item)
+          let index = heap.length - 1
+          while (index > 0) {
+            const parent = Math.floor((index - 1) / 2)
+            if (!isOlder(heap[index], heap[parent])) break
+            ;[heap[index], heap[parent]] = [heap[parent], heap[index]]
+            index = parent
+          }
+        }
+        const popHeap = heap => {
+          const first = heap[0]
+          const last = heap.pop()
+          if (heap.length && last) {
+            heap[0] = last
+            let index = 0
+            while (true) {
+              const left = index * 2 + 1
+              const right = left + 1
+              let smallest = index
+              if (left < heap.length && isOlder(heap[left], heap[smallest])) smallest = left
+              if (right < heap.length && isOlder(heap[right], heap[smallest])) smallest = right
+              if (smallest === index) break
+              ;[heap[index], heap[smallest]] = [heap[smallest], heap[index]]
+              index = smallest
+            }
+          }
+          return first
+        }
+        let overflowDeletes = []
+        const flushOverflowDeletes = async () => {
+          if (!overflowDeletes.length) return
+          await this._deleteIndexKeys(overflowDeletes)
+          overflowDeletes = []
+        }
+        const keep = Math.floor(max * 0.9)
+        const heaps = new Map([...overflowBots].map(bot => [bot, []]))
+        for await (const [key, value] of this._db.db.iterator({ gte: prefix, lt: `${prefix}\uffff` })) {
+          const bot = String(value?.self_id || '')
+          if (this._isStoredRecordExpired(key, value, now) || !overflowBots.has(bot)) continue
+          const heap = heaps.get(bot)
+          pushHeap(heap, { key: String(key), time: this._indexTime(value), expireAt: Number(value?.expire_at) || 0, selfId: bot })
+          if (heap.length > keep) overflowDeletes.push(popHeap(heap))
+          if (overflowDeletes.length >= INDEX_DELETE_BATCH_SIZE) {
+            await flushOverflowDeletes()
+          }
+        }
+        await flushExpiredDeletes()
+        await flushOverflowDeletes()
+      }
+    })().finally(() => { this._levelIndexCleanupPromise = null })
+    return this._levelIndexCleanupPromise
+  }
+
+  _scheduleLevelIndexCleanup (delay = 6 * 60 * 60 * 1000) {
+    if (this._ready !== true || this.type !== 'level' || !this._db) return
+    if (this._levelIndexCleanupTimer) {
+      if (!this._levelIndexCleanupRequested || delay >= LEVEL_INDEX_CLEANUP_INTERVAL_MS) return
+      clearTimeout(this._levelIndexCleanupTimer)
+      this._levelIndexCleanupTimer = null
+    }
+    this._levelIndexCleanupTimer = setTimeout(() => {
+      this._levelIndexCleanupTimer = null
+      this._cleanupLevelIndexes()
+        .catch(err => logger.error('[QQBot-Plugin] advancedWelcomeStore index cleanup error:', err))
+        .finally(() => {
+          if (this._ready && this.type === 'level' && this._db) this._scheduleLevelIndexCleanup(LEVEL_INDEX_CLEANUP_INTERVAL_MS)
+        })
+    }, delay)
+    this._levelIndexCleanupTimer.unref?.()
+  }
+
+  async _deleteIndexKeys (items = []) {
+    if (this.type !== 'level' || !this._db || !items.length) return
+    const operations = []
+    for (const item of items) {
+      const key = String(item?.key || item)
+      let current = null
+      try { current = await this._db.get(key) } catch {}
+      if (!current) continue
+      if (item?.selfId && String(current.self_id || '') !== String(item.selfId)) continue
+      if (Number.isFinite(item?.time) && this._indexTime(current) !== item.time) continue
+      if (Number.isFinite(item?.expireAt) && Number(current.expire_at || 0) !== item.expireAt) continue
+      operations.push({ type: 'del', key })
+    }
+    if (operations.length) {
+      await this._db.db.batch(operations)
+      for (const operation of operations) {
+        const key = String(operation.key)
+        if (key.startsWith('msg:')) this._deleteIndexItem('messageIds', key.slice(4))
+        else if (key.startsWith('localmsg:')) this._deleteIndexItem('localMessageIds', key.slice(9))
+      }
+    }
+  }
+
+  async _deleteExpiredIndexKeys (keys = [], now = Date.now()) {
+    if (this.type !== 'level' || !this._db || !keys.length) return
+    const operations = []
+    for (const key of new Set(keys.map(String))) {
+      let current = null
+      try { current = await this._db.get(key) } catch {}
+      if (this._isStoredRecordExpired(key, current, now)) operations.push({ type: 'del', key })
+    }
+    if (operations.length) {
+      await this._db.db.batch(operations)
+      for (const key of operations.map(operation => String(operation.key))) {
+        if (key.startsWith('msg:')) this._deleteIndexItem('messageIds', key.slice(4))
+        else if (key.startsWith('localmsg:')) this._deleteIndexItem('localMessageIds', key.slice(9))
+      }
+    }
+  }
+
+  async _persistIndexBatch (puts = [], deletes = []) {
+    if (this.type !== 'level' || !this._db) {
+      if (puts.length || deletes.length) this._scheduleSave()
+      return
+    }
+    for (const item of puts) {
+      const key = String(item.key)
+      this._pendingIndexPuts.set(key, { key, value: item.value })
+      this._pendingIndexDeletes.delete(key)
+    }
+    for (const key of new Set(deletes.map(String))) {
+      if (this._pendingIndexPuts.has(key)) this._pendingIndexPuts.delete(key)
+      this._pendingIndexDeletes.add(key)
+    }
+    const promise = new Promise((resolve, reject) => this._indexWriteWaiters.push({ resolve, reject }))
+    if (this._indexWriteTimer || this._indexWritePromise) return promise
+    this._indexWriteTimer = setTimeout(() => {
+      this._indexWriteTimer = null
+      this._flushIndexWrites().catch(err => logger.error('[QQBot-Plugin] advancedWelcomeStore index save error:', err))
+    }, 0)
+    return promise
+  }
+
+  async _readIndexItem (store, key) {
+    const cached = this._data[store][key]
+    if (cached) return cached
+    if (this.type !== 'level' || !this._db) return null
+    const prefix = store === 'messageIds' ? 'msg:' : 'localmsg:'
+    const item = await this._db.get(`${prefix}${key}`)
+    if (!item) return null
+    if (this._isMessageIndexExpired(item)) {
+      this._queueDeletes([`${prefix}${key}`])
+      return null
+    }
+    this._setIndexItem(store, key, item)
+    return item
+  }
+
+  async _forEachMessageIndex (visit) {
+    if (this.type === 'level' && this._db) {
+      let deletes = []
+      for await (const [key, item] of this._db.db.iterator({ gte: 'msg:', lt: 'msg:\uffff' })) {
+        if (this._isMessageIndexExpired(item)) {
+          deletes.push(String(key))
+          if (deletes.length >= INDEX_DELETE_BATCH_SIZE) {
+            await this._deleteExpiredIndexKeys(deletes)
+            deletes = []
+          }
+          continue
+        }
+        await visit(item)
+      }
+      if (deletes.length) await this._deleteExpiredIndexKeys(deletes)
+      return
+    }
+    for (const item of Object.values(this._data.messageIds)) await visit(item)
+  }
+
+  async _flushIndexWrites () {
+    if (this._indexWritePromise) return this._indexWritePromise
+    if (!this._pendingIndexPuts.size && !this._pendingIndexDeletes.size) return
+    const puts = [...this._pendingIndexPuts.values()]
+    const deletes = [...this._pendingIndexDeletes]
+    const waiters = this._indexWriteWaiters.splice(0)
+    this._pendingIndexPuts.clear()
+    this._pendingIndexDeletes.clear()
+    const putKeys = new Set(puts.map(item => item.key))
+    this._indexWritePromise = this._db.db.batch([
+      ...puts.map(item => ({ type: 'put', key: item.key, value: item.value })),
+      ...deletes.filter(key => !putKeys.has(key)).map(key => ({ type: 'del', key }))
+    ]).then(() => {
+      for (const waiter of waiters) waiter.resolve()
+      this._levelIndexCleanupRequested = true
+      this._scheduleLevelIndexCleanup(30000)
+    }).catch(err => {
+      for (const item of puts) this._pendingIndexPuts.set(item.key, item)
+      for (const key of deletes) this._pendingIndexDeletes.add(key)
+      for (const waiter of waiters) waiter.reject(err)
+      throw err
+    }).finally(() => {
+      this._indexWritePromise = null
+      if (this._pendingIndexPuts.size || this._pendingIndexDeletes.size) {
+        this._indexWriteTimer = setTimeout(() => {
+          this._indexWriteTimer = null
+          this._flushIndexWrites().catch(err => logger.error('[QQBot-Plugin] advancedWelcomeStore index save error:', err))
+        }, 0)
+      }
+    })
+    return this._indexWritePromise
+  }
+
   _queueDeletes (keys) {
     this._persistDeletes(keys).catch(err => logger.error('[QQBot-Plugin] advancedWelcomeStore cleanup error:', err))
   }
@@ -214,6 +499,9 @@ class AdvancedWelcomeStore {
     if (now - this._lastCleanup < CLEANUP_INTERVAL_MS) return
     this._lastCleanup = now
     this._queueDeletes(this._removeExpired(now))
+    if (now - this._lastLevelIndexCleanup >= LEVEL_INDEX_CLEANUP_INTERVAL_MS) {
+      this._cleanupLevelIndexes(now).catch(err => logger.error('[QQBot-Plugin] advancedWelcomeStore index cleanup error:', err))
+    }
   }
 
   _scheduleSave () {
@@ -294,6 +582,51 @@ class AdvancedWelcomeStore {
     return true
   }
 
+  _scheduleGroupSave (key) {
+    if (this.type !== 'level' || !this._db) {
+      this._scheduleSave()
+      return Promise.resolve()
+    }
+    if (key) this._pendingGroupSaves.add(key)
+    const promise = new Promise((resolve, reject) => this._groupSaveWaiters.push({ resolve, reject }))
+    if (this._groupSaveTimer) return promise
+    this._groupSaveTimer = setTimeout(() => {
+      this._groupSaveTimer = null
+      this._flushGroupSaves().catch(err => logger.error('[QQBot-Plugin] advancedWelcomeStore batch group save error:', err))
+    }, 0)
+    return promise
+  }
+
+  async _flushGroupSaves () {
+    if (this._groupSavePromise) return this._groupSavePromise
+    if (!this._pendingGroupSaves.size) return
+    const keys = [...this._pendingGroupSaves]
+    const waiters = this._groupSaveWaiters.splice(0)
+    this._pendingGroupSaves.clear()
+    this._groupSavePromise = (async () => {
+      const operations = keys
+        .map(key => ({ key: `group:${key}`, value: this._data.groups[key] }))
+        .filter(item => item.value)
+        .map(item => ({ type: 'put', key: item.key, value: item.value }))
+      if (operations.length) await this._db.db.batch(operations)
+    })().then(() => {
+      for (const waiter of waiters) waiter.resolve()
+    }).catch(err => {
+      for (const key of keys) this._pendingGroupSaves.add(key)
+      for (const waiter of waiters) waiter.reject(err)
+      throw err
+    }).finally(() => {
+      this._groupSavePromise = null
+      if (this._pendingGroupSaves.size && !this._groupSaveTimer) {
+        this._groupSaveTimer = setTimeout(() => {
+          this._groupSaveTimer = null
+          this._flushGroupSaves().catch(err => logger.error('[QQBot-Plugin] advancedWelcomeStore batch group save error:', err))
+        }, 0)
+      }
+    })
+    return this._groupSavePromise
+  }
+
   async setGroupDisabled (selfId = '', groupOpenid = '', disabled = false, source = '') {
     const item = this.getGroup(selfId, groupOpenid, true)
     item.disabled = !!disabled
@@ -336,7 +669,7 @@ class AdvancedWelcomeStore {
     }
     if (fullMessageCreate) item.speech_since_sent = (Number(item.speech_since_sent) || 0) + 1
     else item.speech_since_sent = 0
-    await this.saveGroup(item)
+    await this._scheduleGroupSave(this._groupKey(selfId, groupOpenid))
     return true
   }
 
@@ -521,7 +854,7 @@ class AdvancedWelcomeStore {
   async recordMessageIndex (record = {}) {
     if (!record.message_id) return false
     this._maybeCleanup()
-    const storedItem = this._data.messageIds[record.message_id]
+    const storedItem = await this._readIndexItem('messageIds', record.message_id)
     const oldItem = storedItem && !this._isMessageIndexExpired(storedItem) ? storedItem : null
     const sameContext = oldItem?.self_id === record.self_id && oldItem?.target_id === record.target_id && oldItem?.type === record.type
     const item = {
@@ -530,16 +863,18 @@ class AdvancedWelcomeStore {
       time: record.time || nowIso(),
       expire_at: Date.now() + MESSAGE_INDEX_TTL_MS
     }
+    const puts = []
+    const put = (key, value) => puts.push({ key: `msg:${key}`, value })
     this._setIndexItem('messageIds', record.message_id, item)
-    await this._save(`msg:${record.message_id}`, item)
-    for (const alias of Array.isArray(record.aliases) ? record.aliases : []) {
+    put(record.message_id, item)
+    for (const alias of new Set(Array.isArray(record.aliases) ? record.aliases : [])) {
       if (!alias || alias === record.message_id) continue
       const aliasItem = { ...item, message_id: alias, actual_message_id: record.message_id }
       this._setIndexItem('messageIds', alias, aliasItem)
-      await this._save(`msg:${alias}`, aliasItem)
+      put(alias, aliasItem)
       if (record.self_id && record.target_id && record.type) {
         const scopedAlias = this._messageAliasKey(record.self_id, record.type, record.target_id, alias)
-        const storedScoped = this._data.messageIds[scopedAlias]
+        const storedScoped = await this._readIndexItem('messageIds', scopedAlias)
         const oldScoped = storedScoped && !this._isMessageIndexExpired(storedScoped) ? storedScoped : null
         const oldActualId = oldScoped?.actual_message_id || oldScoped?.message_id || ''
         const actualMessageIds = [...new Set([...(oldScoped?.actual_message_ids || [oldActualId]), record.message_id].filter(Boolean))].slice(-ACTUAL_MESSAGE_IDS_MAX)
@@ -549,10 +884,10 @@ class AdvancedWelcomeStore {
           actual_message_ids: actualMessageIds
         }
         this._setIndexItem('messageIds', scopedAlias, scopedItem)
-        await this._save(`msg:${scopedAlias}`, scopedItem)
+        put(scopedAlias, scopedItem)
       }
     }
-    await this._persistDeletes(this._pruneIndexStore('messageIds', MESSAGE_INDEX_MAX_PER_BOT, record.self_id))
+    await this._persistIndexBatch(puts, this._pruneIndexStore('messageIds', MESSAGE_INDEX_MAX_PER_BOT, record.self_id))
     return true
   }
 
@@ -568,9 +903,10 @@ class AdvancedWelcomeStore {
     if (!record.message_id || !record.self_id || !record.type || !record.target_id) return false
     this._maybeCleanup()
     const aliases = [...new Set([record.message_id, ...(record.aliases || [])].filter(Boolean).map(String))]
+    const puts = []
     for (const alias of aliases) {
       const key = this._localMessageKey(record.self_id, record.type, record.target_id, alias)
-      const stored = this._data.localMessageIds[key]
+      const stored = await this._readIndexItem('localMessageIds', key)
       const old = stored && !this._isMessageIndexExpired(stored) ? stored : null
       const actualMessageIds = [...new Set([
         ...(old?.actual_message_ids || []),
@@ -587,9 +923,9 @@ class AdvancedWelcomeStore {
         expire_at: Date.now() + MESSAGE_INDEX_TTL_MS
       }
       this._setIndexItem('localMessageIds', key, item)
-      await this._save(`localmsg:${key}`, item)
+      puts.push({ key: `localmsg:${key}`, value: item })
     }
-    await this._persistDeletes(this._pruneIndexStore('localMessageIds', LOCAL_MESSAGE_INDEX_MAX_PER_BOT, record.self_id))
+    await this._persistIndexBatch(puts, this._pruneIndexStore('localMessageIds', LOCAL_MESSAGE_INDEX_MAX_PER_BOT, record.self_id))
     return true
   }
 
@@ -597,11 +933,7 @@ class AdvancedWelcomeStore {
     if (!messageId || !context.selfId || !context.type || !context.targetId) return null
     this._maybeCleanup()
     const key = this._localMessageKey(context.selfId, context.type, context.targetId, messageId)
-    let item = this._data.localMessageIds[key] || null
-    if (!item && this.type === 'level' && this._db) {
-      item = await this._db.get(`localmsg:${key}`)
-      if (item) this._setIndexItem('localMessageIds', key, item)
-    }
+    const item = await this._readIndexItem('localMessageIds', key)
     if (item && this._isMessageIndexExpired(item)) {
       this._deleteIndexItem('localMessageIds', key)
       this._queueDeletes([`localmsg:${key}`])
@@ -615,21 +947,13 @@ class AdvancedWelcomeStore {
     this._maybeCleanup()
     if (context.selfId && context.type && context.targetId) {
       const scopedKey = this._messageAliasKey(context.selfId, context.type, context.targetId, messageId)
-      let scoped = this._data.messageIds[scopedKey]
-      if (!scoped && this.type === 'level' && this._db) {
-        scoped = await this._db.get(`msg:${scopedKey}`)
-        if (scoped) this._setIndexItem('messageIds', scopedKey, scoped)
-      }
+      const scoped = await this._readIndexItem('messageIds', scopedKey)
       if (scoped && this._isMessageIndexExpired(scoped)) {
         this._deleteIndexItem('messageIds', scopedKey)
         this._queueDeletes([`msg:${scopedKey}`])
       } else if (scoped) return scoped.ambiguous ? null : scoped
     }
-    let item = this._data.messageIds[messageId] || null
-    if (!item && this.type === 'level' && this._db) {
-      item = await this._db.get(`msg:${messageId}`)
-      if (item) this._setIndexItem('messageIds', messageId, item)
-    }
+    const item = await this._readIndexItem('messageIds', messageId)
     if (!item) return null
     if (this._isMessageIndexExpired(item)) {
       this._deleteIndexItem('messageIds', messageId)
@@ -651,33 +975,31 @@ class AdvancedWelcomeStore {
     const limitMs = Math.max(1, Number(options.limitMs) || 10 * 60 * 1000)
     const limit = Math.max(1, Number(options.limit) || 20)
     const excludedIds = new Set((options.excludeMessageIds || []).filter(Boolean).map(String))
-    let source = Object.values(this._data.messageIds)
-    if (this.type === 'level' && this._db) {
-      source = []
-      for await (const [key, item] of this._db.db.iterator({ gte: 'msg:', lt: 'msg:\uffff' })) {
-        if (this._isMessageIndexExpired(item)) continue
-        source.push(item)
-        if (source.length > 50000) source.shift()
-      }
-    }
-    const candidates = source
-      .filter(item => {
-        if (!item || item.actual_message_id || item.self_id !== selfId || item.target_id !== targetId || item.type !== 'group') return false
-        if (excludedIds.has(String(item.message_id || ''))) return false
-        if (!/^ROBOT\d+\.\d+_/i.test(String(item.message_id || ''))) return false
+    let total = 0
+    const candidates = []
+    await this._forEachMessageIndex(async item => {
+        if (!item || item.actual_message_id || item.self_id !== selfId || item.target_id !== targetId || item.type !== 'group') return
+        if (excludedIds.has(String(item.message_id || ''))) return
+        if (!/^ROBOT\d+\.\d+_/i.test(String(item.message_id || ''))) return
         const localBot = item.local_bot === true
-        if (!localBot && (item.bot === true || item.member_role !== 'member')) return false
-        if (String(item.content_fingerprint || '').replace(/\s+/g, ' ').trim() !== text) return false
+        if (!localBot && (item.bot === true || item.member_role !== 'member')) return
+        if (String(item.content_fingerprint || '').replace(/\s+/g, ' ').trim() !== text) return
         const itemTime = Date.parse(item.time || '') || Number(item.time) || 0
-        if (!(itemTime > 0 && itemTime <= beforeTime && beforeTime - itemTime <= limitMs)) return false
+        if (!(itemTime > 0 && itemTime <= beforeTime && beforeTime - itemTime <= limitMs)) return
         const itemSeq = Number(item.seq) || 0
-        return !(beforeSeq && itemSeq && itemSeq >= beforeSeq)
+        if (beforeSeq && itemSeq && itemSeq >= beforeSeq) return
+        total++
+        candidates.push(item)
+        if (candidates.length > limit) {
+          candidates.sort((a, b) => (Date.parse(b.time || '') || Number(b.time) || 0) - (Date.parse(a.time || '') || Number(a.time) || 0))
+          candidates.pop()
+        }
       })
-      .sort((a, b) => (Date.parse(b.time || '') || Number(b.time) || 0) - (Date.parse(a.time || '') || Number(a.time) || 0))
+    candidates.sort((a, b) => (Date.parse(b.time || '') || Number(b.time) || 0) - (Date.parse(a.time || '') || Number(a.time) || 0))
     return {
-      items: candidates.slice(0, limit),
-      total: candidates.length,
-      truncated: candidates.length > limit
+      items: candidates,
+      total,
+      truncated: total > limit
     }
   }
 
@@ -688,25 +1010,60 @@ class AdvancedWelcomeStore {
     const limitMs = Number(options.limitMs) || 10 * 60 * 1000
     const authorBot = options.bot
     const now = Date.now()
-    let source = Object.values(this._data.messageIds)
-    if (this.type === 'level' && this._db) {
-      source = []
-      for await (const [, item] of this._db.db.iterator({ gte: 'msg:', lt: 'msg:\uffff' })) {
-        if (!this._isMessageIndexExpired(item)) source.push(item)
-        if (source.length > 50000) source.shift()
-      }
-    }
-    const items = source
-      .filter(item => {
-        if (!item || item.actual_message_id) return false
-        if (item.self_id !== selfId || item.target_id !== targetId || item.type !== 'group') return false
-        if (item.content_fingerprint !== text) return false
-        if (authorBot !== undefined && item.bot !== authorBot) return false
+    let latest = null
+    let latestTime = -Infinity
+    await this._forEachMessageIndex(async item => {
+        if (!item || item.actual_message_id) return
+        if (item.self_id !== selfId || item.target_id !== targetId || item.type !== 'group') return
+        if (item.content_fingerprint !== text) return
+        if (authorBot !== undefined && item.bot !== authorBot) return
         const time = Date.parse(item.time || '')
-        return !Number.isFinite(time) || now - time <= limitMs
+        if (!Number.isFinite(time) || now - time <= limitMs) {
+          const comparableTime = Number.isFinite(time) ? time : 0
+          if (!latest || comparableTime >= latestTime) {
+            latest = item
+            latestTime = comparableTime
+          }
+        }
       })
-      .sort((a, b) => Date.parse(b.time || '') - Date.parse(a.time || ''))
-    return items[0] || null
+    return latest
+  }
+
+  async close () {
+    this._ready = false
+    if (this._levelIndexCleanupTimer) {
+      clearTimeout(this._levelIndexCleanupTimer)
+      this._levelIndexCleanupTimer = null
+    }
+    await this._levelIndexCleanupPromise?.catch?.(() => {})
+    if (this._levelIndexCleanupTimer) {
+      clearTimeout(this._levelIndexCleanupTimer)
+      this._levelIndexCleanupTimer = null
+    }
+    if (this._saveTimer) {
+      clearTimeout(this._saveTimer)
+      this._saveTimer = null
+    }
+    if (this._groupSaveTimer) {
+      clearTimeout(this._groupSaveTimer)
+      this._groupSaveTimer = null
+    }
+    await this._flushGroupSaves().catch(() => {})
+    if (this._indexWriteTimer) {
+      clearTimeout(this._indexWriteTimer)
+      this._indexWriteTimer = null
+    }
+    await this._flushIndexWrites().catch(() => {})
+    await this._groupSavePromise?.catch?.(() => {})
+    await this._indexWritePromise?.catch?.(() => {})
+    if (this.type === 'json') {
+      this._scheduleSave()
+      await this._writeQueue.catch(() => {})
+    }
+    if (this._db) {
+      try { await this._db.close() } catch {}
+      this._db = null
+    }
   }
 }
 
