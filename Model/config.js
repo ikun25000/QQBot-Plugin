@@ -1,5 +1,5 @@
 import makeConfig from '../../../lib/plugins/config.js'
-import { allowNextQQBotCredentialRemoval, flushQQBotCredentialLossNotification, installQQBotConfigSafetyHook, prepareQQBotConfig, reloadSafeQQBotConfig, setQQBotCredentialLossNotifier, setQQBotCredentialLossSync, startQQBotConfigBackupCheck } from './configSafety.js'
+import { allowNextQQBotCredentialRemoval, flushQQBotCredentialLossNotification, installQQBotConfigSafetyHook, prepareQQBotConfig, reloadSafeQQBotConfig, setQQBotCredentialLossNotifier, setQQBotCredentialLossSync, startQQBotConfigBackupCheck, stopQQBotConfigBackupCheck } from './configSafety.js'
 
 installQQBotConfigSafetyHook()
 await prepareQQBotConfig()
@@ -27,6 +27,9 @@ let { config, configSave } = await makeConfig('QQBot', {
   sendButton: true,
   customMD: {},
   messageSuffix: {
+    bots: {}
+  },
+  messageProtection: {
     bots: {}
   },
   filterLog: {},
@@ -99,6 +102,7 @@ export {
   config,
   configSave,
   refConfig,
+  stopQQBotConfigBackupCheck,
   allowNextQQBotCredentialRemoval,
   setQQBotCredentialLossNotifier,
   setQQBotCredentialLossSync,
