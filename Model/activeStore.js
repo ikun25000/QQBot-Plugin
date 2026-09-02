@@ -4,6 +4,7 @@ import { pluginPath } from './common.js'
 
 const LEVEL_DATA_DIR = join(pluginPath, 'db', 'active')
 const JSON_DATA_DIR = join(process.cwd(), 'data', 'QQBotActive')
+const KNOWN_USER_CACHE_LIMIT = 20000
 
 function encodeKeyPart (value) {
   return encodeURIComponent(String(value || ''))
@@ -15,6 +16,7 @@ class ActiveStore {
     this._db = null
     this._ready = false
     this._stats = new Map()
+    this._knownUsers = new Set()
     this._json = { users: {}, stats: {} }
     this._queues = new Map()
     this._versions = new Map()
@@ -41,7 +43,9 @@ class ActiveStore {
 
   async init () {
     if (this._ready) return
+    this.type = 'level'
     this._stats.clear()
+    this._knownUsers.clear()
     this._versions.clear()
     this._json = { users: {}, stats: {} }
     try {
@@ -55,7 +59,7 @@ class ActiveStore {
     } catch (err) {
       logger.error('[QQBot-Plugin] activeStore LevelDB init failed, fallback to json:', err.message)
       this.type = 'json'
-      if (this._db) { try { this._db.close() } catch {}; this._db = null }
+      if (this._db) { try { await this._db.close() } catch {}; this._db = null }
       fs.mkdirSync(JSON_DATA_DIR, { recursive: true })
       try {
         const value = JSON.parse(fs.readFileSync(this._jsonPath(), 'utf8'))
@@ -64,6 +68,7 @@ class ActiveStore {
           stats: value?.stats && typeof value.stats === 'object' ? value.stats : {}
         }
         for (const [key, stats] of Object.entries(this._json.stats)) this._stats.set(key, this._normalizeStats(stats))
+        for (const key of Object.keys(this._json.users)) this._knownUsers.add(key.startsWith('user:') ? key.slice(5) : key)
       } catch {}
     }
     this._ready = true
@@ -82,8 +87,25 @@ class ActiveStore {
   }
 
   async _hasUserKey (key) {
-    if (this.type === 'level' && this._db) return Boolean(await this._db.get(key))
-    return this._json.users[key] === true
+    const knownKey = String(key).startsWith('user:') ? String(key).slice(5) : String(key)
+    if (this._knownUsers.has(knownKey)) return true
+    if (this.type === 'level' && this._db) {
+      try {
+        const exists = await this._db.get(key)
+        if (exists === true) this._rememberKnownUser(knownKey)
+        return exists === true
+      } catch (err) {
+        if (err?.notFound || err?.code === 'LEVEL_NOT_FOUND') return false
+        throw err
+      }
+    }
+    return this._json.users[key] === true || this._json.users[knownKey] === true
+  }
+
+  _rememberKnownUser (key) {
+    this._knownUsers.delete(key)
+    this._knownUsers.add(key)
+    while (this._knownUsers.size > KNOWN_USER_CACHE_LIMIT) this._knownUsers.delete(this._knownUsers.keys().next().value)
   }
 
   async _persist (groupKey, stats, newKeys, deletedKeys = []) {
@@ -93,6 +115,7 @@ class ActiveStore {
         ...deletedKeys.map(key => ({ type: 'del', key })),
         { type: 'put', key: this._statsKey(groupKey), value: stats }
       ])
+      for (const key of deletedKeys) this._knownUsers.delete(key.slice(5))
       return
     }
     for (const key of newKeys) this._json.users[key] = true
@@ -151,6 +174,7 @@ class ActiveStore {
         newKeys.push(typeKey)
       }
       if (newKeys.length) await this._persist(groupKey, stats, newKeys)
+      for (const key of newKeys) this._rememberKnownUser(key.slice(5))
       this._stats.set(groupKey, stats)
       return detailed ? { stats: { ...stats }, token, addedType: !hasType } : { ...stats }
     })
@@ -180,6 +204,7 @@ class ActiveStore {
       const stats = await this._getStats(groupKey)
       stats[type] = Math.max(0, stats[type] - 1)
       await this._persist(groupKey, stats, [], [typeKey])
+      this._knownUsers.delete(typeKey.slice(5))
       this._stats.set(groupKey, stats)
       this._versions.set(typeKey, token + 1)
       return { ...stats }
@@ -194,6 +219,17 @@ class ActiveStore {
   async get (selfId = '', groupOpenid = '') {
     if (!selfId || !groupOpenid) return this._emptyStats()
     return { ...await this._getStats(this._groupKey(selfId, groupOpenid)) }
+  }
+
+  async close () {
+    await Promise.allSettled([...this._queues.values()])
+    if (this._saveTimer) clearTimeout(this._saveTimer)
+    this._saveTimer = null
+    if (this._db) {
+      try { await this._db.close() } catch {}
+      this._db = null
+    }
+    this._ready = false
   }
 
   peek (selfId = '', groupOpenid = '') {
