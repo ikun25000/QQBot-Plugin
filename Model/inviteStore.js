@@ -24,6 +24,7 @@ class InviteStore {
     this._atIdWriteQueue = Promise.resolve()
     this._recallRunsWriteQueue = Promise.resolve()
     this._groupInvitersWriteQueue = Promise.resolve()
+    this._pendingWrites = new Set()
     this._writeSeq = 0
     this._ready = false
   }
@@ -51,27 +52,11 @@ class InviteStore {
         fs.mkdirSync(LEVEL_DATA_DIR, { recursive: true })
         this._db = new Level(LEVEL_DATA_DIR)
         await this._db.open({ cleanup: false })
-        for await (const [key, value] of this._db.db.iterator()) {
-          if (String(key).startsWith('__c2c__')) {
-            const selfId = String(key).replace('__c2c__', '')
-            this._c2c[selfId] = value
-          } else if (String(key).startsWith('__at_id__')) {
-            const selfId = String(key).replace('__at_id__', '')
-            this._atId[selfId] = value
-          } else if (String(key).startsWith('__recall_runs__')) {
-            const selfId = String(key).replace('__recall_runs__', '')
-            this._recallRuns[selfId] = Array.isArray(value) ? value : []
-          } else if (String(key).startsWith('__group_inviters__')) {
-            const selfId = String(key).replace('__group_inviters__', '')
-            this._groupInviters[selfId] = value && typeof value === 'object' ? value : {}
-          } else {
-            this._data[key] = value
-          }
-        }
+        await this._loadLevelData()
       } catch (err) {
         logger.error('[QQBot-Plugin] inviteStore LevelDB init failed, fallback to json:', err.message)
         this.type = 'json'
-        if (this._db) { try { this._db.close() } catch {} this._db = null }
+        if (this._db) { try { await this._db.close() } catch {} this._db = null }
       }
     }
 
@@ -93,6 +78,27 @@ class InviteStore {
       this[field] = JSON.parse(raw) || {}
     } catch {
       this[field] = {}
+    }
+  }
+
+  async _loadLevelData () {
+    for await (const [key, value] of this._db.db.iterator()) {
+      const name = String(key)
+      if (name.startsWith('__c2c__')) {
+        const selfId = name.slice('__c2c__'.length)
+        if (selfId) this._c2c[selfId] = value && typeof value === 'object' ? value : {}
+      } else if (name.startsWith('__at_id__')) {
+        const selfId = name.slice('__at_id__'.length)
+        if (selfId) this._atId[selfId] = value && typeof value === 'object' ? value : {}
+      } else if (name.startsWith('__recall_runs__')) {
+        const selfId = name.slice('__recall_runs__'.length)
+        if (selfId) this._recallRuns[selfId] = Array.isArray(value) ? value : []
+      } else if (name.startsWith('__group_inviters__')) {
+        const selfId = name.slice('__group_inviters__'.length)
+        if (selfId) this._groupInviters[selfId] = value && typeof value === 'object' ? value : {}
+      } else if (value && typeof value === 'object') {
+        this._data[name] = value
+      }
     }
   }
 
@@ -196,6 +202,17 @@ class InviteStore {
     }
   }
 
+  _trackWrite (promise) {
+    const tracked = Promise.resolve(promise)
+      .catch(err => {
+        logger.error('[QQBot-Plugin] inviteStore save error:', err.message)
+        return false
+      })
+      .finally(() => this._pendingWrites.delete(tracked))
+    this._pendingWrites.add(tracked)
+    return tracked
+  }
+
   // ========== invite 数据 ==========
   _ensureInvite (selfId, userOpenid) {
     const key = `${selfId}:${userOpenid}`
@@ -223,11 +240,11 @@ class InviteStore {
       inv.time = time
       inv.groups[groupOpenid] = time
       inv.number = Object.keys(inv.groups).length
-      this._saveInviteData(key)
+        this._trackWrite(this._saveInviteData(key))
     } else {
       inv.time = time
       inv.number = (inv.number || 0) + 1
-      this._saveInviteData(key)
+        this._trackWrite(this._saveInviteData(key))
     }
     if (groupOpenid) {
       this._groupInviters[selfId][groupOpenid] = {
@@ -237,7 +254,7 @@ class InviteStore {
         removed_at: '',
         removed_by: ''
       }
-      this._saveGroupInviters(selfId)
+        this._trackWrite(this._saveGroupInviters(selfId))
     }
     return inv
   }
@@ -249,14 +266,14 @@ class InviteStore {
     let lifecycle = groupOpenid ? this._groupInviters[selfId][groupOpenid] : null
     let lifecycleCreated = false
     if (!lifecycle && groupOpenid) {
-      const inviter = this._findLatestInviter(selfId, groupOpenid)
+       const inviter = this._findLatestInviter(selfId, groupOpenid)
       lifecycle = this._groupInviters[selfId][groupOpenid] = { inviter_openid: inviter?.openid || '', active: true, added_at: inviter?.time || '', removed_at: '', removed_by: '' }
       lifecycleCreated = true
     }
     if (lifecycle?.active === false) return this.getInvite(selfId, userOpenid)
     const addedMs = this._timestampMs(lifecycle?.added_at)
     if (addedMs !== null && (eventMs === null || eventMs < addedMs)) {
-      if (lifecycleCreated) this._saveGroupInviters(selfId)
+       if (lifecycleCreated) this._trackWrite(this._saveGroupInviters(selfId))
       return this.getInvite(selfId, userOpenid)
     }
     const key = `${selfId}:${userOpenid}`
@@ -270,7 +287,7 @@ class InviteStore {
     } else {
       inv.kick = (inv.kick || 0) + 1
     }
-    this._saveInviteData(key)
+    this._trackWrite(this._saveInviteData(key))
     const inviterOpenid = lifecycle?.inviter_openid || ''
     if (groupOpenid && inviterOpenid && inviterOpenid !== userOpenid) {
       const inviterKey = `${selfId}:${inviterOpenid}`
@@ -279,14 +296,14 @@ class InviteStore {
         inviter.otherkicktime = inv.kicktime
         inviter.otherkickGroups[groupOpenid] = inviter.otherkicktime
         inviter.otherkick = Object.keys(inviter.otherkickGroups).length
-        this._saveInviteData(inviterKey)
+         this._trackWrite(this._saveInviteData(inviterKey))
       }
     }
     if (groupOpenid && lifecycle) {
       lifecycle.active = false
       lifecycle.removed_at = inv.kicktime
       lifecycle.removed_by = userOpenid
-      this._saveGroupInviters(selfId)
+       this._trackWrite(this._saveGroupInviters(selfId))
     }
     return inv
   }
@@ -348,21 +365,14 @@ class InviteStore {
   getInviteRankPage (selfId, field = 'number', page = 1, pageSize = 20) {
     const countKey = field === 'kick' ? 'kick' : 'number'
     const timeKey = field === 'kick' ? 'kicktime' : 'time'
-    const total = this.getInviteRankCount(selfId, field)
-    const maxPage = Math.max(1, Math.ceil(total / pageSize))
-    page = Math.max(1, Math.min(maxPage, Number(page) || 1))
-    const start = (page - 1) * pageSize
-    const list = Object.entries(this._data)
-      .filter(([key]) => key.startsWith(`${selfId}:`))
-      .map(([key, value]) => ({
-        openid: key.slice(String(selfId).length + 1),
-        count: this._getInviteCount(value, countKey),
-        time: value?.[timeKey] || ''
-      }))
-      .filter(item => item.count > 0)
-      .sort((a, b) => b.count - a.count || String(b.time).localeCompare(String(a.time)))
-      .slice(start, start + pageSize)
-    return { list, total, page, maxPage, pageSize, start }
+    const entries = Object.entries(this._data).filter(([key]) => key.startsWith(`${selfId}:`))
+    const total = entries.filter(([, value]) => this._getInviteCount(value, countKey) > 0).length
+    const size = Math.max(1, Number(pageSize) || 20)
+    const maxPage = Math.max(1, Math.ceil(total / size))
+    const current = Math.max(1, Math.min(maxPage, Number(page) || 1))
+    const start = (current - 1) * size
+    const list = entries.map(([key, value]) => ({ openid: key.slice(String(selfId).length + 1), count: this._getInviteCount(value, countKey), time: value?.[timeKey] || '' })).filter(item => item.count > 0).sort((a, b) => b.count - a.count || String(b.time).localeCompare(String(a.time))).slice(start, start + size)
+    return { list, total, page: current, maxPage, pageSize: size, start }
   }
 
   // ========== C2C openid 记录 (用于召回) ==========
@@ -383,7 +393,7 @@ class InviteStore {
       existing.friendDeleted = false
       delete existing.friendDeletedTime
     }
-    this._saveC2cData(selfId)
+    this._trackWrite(this._saveC2cData(selfId))
   }
 
   markC2cFriendDeleted (selfId, userOpenid, timestamp = '') {
@@ -402,7 +412,7 @@ class InviteStore {
       existing.friendDeleted = true
       existing.friendDeletedTime = now
     }
-    this._saveC2cData(selfId)
+    this._trackWrite(this._saveC2cData(selfId))
   }
 
   _resolveTime (timestamp) {
@@ -467,7 +477,7 @@ class InviteStore {
     const current = this._atId[selfId][openid]
     if (current === virtualId || (current?.id === virtualId && current?.version === version)) return
     this._atId[selfId][openid] = next
-    this._saveAtIdData(selfId)
+    this._trackWrite(this._saveAtIdData(selfId))
   }
 
   getRecallableList (selfId) {
@@ -633,7 +643,7 @@ class InviteStore {
     if (!Array.isArray(user.wakeupAttempts[period])) user.wakeupAttempts[period] = []
     user.wakeupAttempts[period].push({ time: new Date().toISOString() })
     if (user.wakeupAttempts[period].length > 20) user.wakeupAttempts[period] = user.wakeupAttempts[period].slice(-20)
-    this._saveC2cData(selfId)
+    this._trackWrite(this._saveC2cData(selfId))
   }
 
   markWakeupSent (selfId, userOpenid, period = '', timestamp = '') {
@@ -641,7 +651,7 @@ class InviteStore {
     const user = this._c2c[selfId][userOpenid]
     if (!user.wakeupSent) user.wakeupSent = {}
     user.wakeupSent[period] = this._resolveTime(timestamp)
-    this._saveC2cData(selfId)
+    this._trackWrite(this._saveC2cData(selfId))
   }
 
   markWakeupError (selfId, userOpenid, errorCode, errorMsg = '') {
@@ -650,7 +660,7 @@ class InviteStore {
     if (!user.wakeupErrors) user.wakeupErrors = []
     user.wakeupErrors.push({ code: errorCode, msg: errorMsg, time: new Date().toISOString() })
     if (user.wakeupErrors.length > 10) user.wakeupErrors = user.wakeupErrors.slice(-10)
-    this._saveC2cData(selfId)
+    this._trackWrite(this._saveC2cData(selfId))
   }
 
   markWakeupFailed (selfId, userOpenid, period = '', errorCode = 0, errorMsg = '') {
@@ -662,7 +672,7 @@ class InviteStore {
       msg: errorMsg || '',
       time: new Date().toISOString()
     }
-    this._saveC2cData(selfId)
+    this._trackWrite(this._saveC2cData(selfId))
   }
 
   getUserWakeupPeriod (selfId, userOpenid) {
@@ -748,8 +758,9 @@ class InviteStore {
       this._writeJsonAtomic(this._groupInvitersJsonPath(), this._groupInviters, '_groupInvitersWriteQueue')
       await Promise.allSettled([this._writeQueue, this._c2cWriteQueue, this._atIdWriteQueue, this._recallRunsWriteQueue, this._groupInvitersWriteQueue])
     }
+    while (this._pendingWrites.size) await Promise.allSettled([...this._pendingWrites])
     if (this._db) {
-      try { this._db.close() } catch {}
+      try { await this._db.close() } catch {}
       this._db = null
     }
     this._ready = false
