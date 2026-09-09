@@ -6310,12 +6310,15 @@ const adapter = new class QQBotAdapter {
    * 查询账号 Session 信息（remaining / reset_after）
    */
   async _getSessionInfo (id) {
+    const bot = Bot[id]
+    if (!bot || bot.disabledRuntime) return null
     try {
-      const { data } = await Bot[id].sdk.request.get('/gateway/bot')
+      const { data } = await bot.sdk.request.get('/gateway/bot')
+      if (Bot[id] !== bot || bot.disabledRuntime) return null
       if (!data || !data.session_start_limit) return null
       return data.session_start_limit
     } catch (err) {
-      Bot.makeLog('warn', [`[${id}] 获取 Session 信息失败`, getQQBotSdkErrorSummary(err)], id)
+      if (Bot[id] === bot && !bot.disabledRuntime) Bot.makeLog('debug', [`[${id}] 获取 Session 信息失败`, getQQBotSdkErrorSummary(err)], id)
       return null
     }
   }
@@ -6362,15 +6365,11 @@ const adapter = new class QQBotAdapter {
       clearTimeout(offlineCheckState.reconnectWatchdog[id])
       delete offlineCheckState.reconnectWatchdog[id]
     }
-    // 清理心跳超时计时器
-    if (Bot[id]?.heartbeatTimer) {
-      clearTimeout(Bot[id].heartbeatTimer)
-      Bot[id].heartbeatTimer = null
-    }
   }
 
   disableBotRuntime (id, reason = '') {
     this.stopOfflineCheck(id)
+    offlineCheckState.reconnectSeq[id] = (offlineCheckState.reconnectSeq[id] || 0) + 1
     delete offlineCheckState.retrying[id]
     delete offlineCheckState.retryingAt[id]
     const bot = Bot[id]
@@ -6390,101 +6389,53 @@ const adapter = new class QQBotAdapter {
    * 执行一次掉线检测
    */
   async _doOfflineCheck (id) {
-  // 正在重连或正在等待 reset_after，跳过本次检测
-  if (Bot[id]?.disabledRuntime) return
-  if (offlineCheckState.retrying[id]) {
-    const startedAt = offlineCheckState.retryingAt[id] || 0
-    if (startedAt && Date.now() - startedAt > 120000) {
-      Bot.makeLog('error', [`[${id}] 检测到陈旧重连锁，已释放并继续掉线检测`], id)
-      delete offlineCheckState.retrying[id]
-      delete offlineCheckState.retryingAt[id]
-      if (Bot[id]) Bot[id].isReconnecting = false
-    } else {
-      Bot.makeLog('debug', [`[${id}] 正在重连中，跳过本次掉线检测`], id)
+    const bot = Bot[id]
+    if (!bot || bot.disabledRuntime) return
+    const generation = bot.connectionGeneration
+    const reconnectSeq = offlineCheckState.reconnectSeq[id]
+    const canCheck = () => Bot[id] === bot && !bot.disabledRuntime &&
+      bot.connectionGeneration === generation && offlineCheckState.reconnectSeq[id] === reconnectSeq &&
+      ![0, 1].includes(bot.sdk.ws?.readyState) && !bot.isReconnecting &&
+      !offlineCheckState.retrying[id] && !offlineCheckState.waitingReconnectRetry[id]
+    // OPEN sockets are monitored by the lifecycle ACK deadline; quota is not health.
+    if (!canCheck() || offlineCheckState.waitingSessionReset[id]) return
+    const sessionInfo = await this._getSessionInfo(id)
+    if (!canCheck() || offlineCheckState.waitingSessionReset[id]) return
+    if (!Number.isFinite(sessionInfo?.remaining) || sessionInfo.remaining < 0) {
+      Bot.makeLog('debug', [`[${id}] Session 配额未知，等待下次检测`], id)
       return
     }
-  }
-  if (offlineCheckState.waitingSessionReset[id] || offlineCheckState.waitingReconnectRetry[id]) return
-  if (!Bot[id]) return
-
-  const offlineDetect = getOfflineDetectConfig(id)
-  const sessionInfo = await this._getSessionInfo(id)
-
-  if (!sessionInfo) {
-    Bot.makeLog('warn', [`[${id}] 无法获取 Session 信息，判定网关状态异常`], id)
-    if (offlineDetect.autoReconnect) await this._doReconnect(id)
-    return
-  }
-
-  Bot.makeLog('debug', [`[${id}] Session 检测结果`, sessionInfo], id)
-
-  if (sessionInfo.remaining === 0) {
-    // remaining=0：配额耗尽，主动断开 ws 连接
-    const resetMs = Number(sessionInfo.reset_after) || 0
-    const resetStr = this._formatMs(resetMs)
-
-    Bot.makeLog('warn', [`[${id}] Session remaining=0，主动断开连接，将在 ${resetStr} 后自动重连`], id)
-
-    // 主动 logout，避免 ws 占用但收不到消息
-    try {
-      await Bot[id].logout()
-      Bot.makeLog('info', [`[${id}] 已主动断开连接`], id)
-    } catch (err) {
-      Bot.makeLog('debug', [`[${id}] 主动断开连接失败（忽略）`, err.message], id)
-    }
-
-    // 发送掉线提醒
-    if (offlineDetect.notify) {
-      const notifyMsg = `[${id}] 账号下线：[下线通知]你的帐号当前登录已失效，请${resetStr}后重新登录。\n发送 /Bot上线${id} 重新登录`
-      try {
-        await sendQQBotInternalMasterMsg(notifyMsg)
-      } catch (err) {
-        Bot.makeLog('error', ['发送掉线通知失败', err.message], id)
-      }
-    }
-
-    // 等待 reset_after 到期后直接重连，无需再次检查 remaining
-    if (offlineDetect.autoReconnect && resetMs > 0) {
-      offlineCheckState.waitingSessionReset[id] = setTimeout(async () => {
+    const offlineDetect = getOfflineDetectConfig(id)
+    if (!offlineDetect.autoReconnect) return
+    if (sessionInfo.remaining === 0) {
+      const resetMs = Number(sessionInfo.reset_after)
+      if (!Number.isFinite(resetMs) || resetMs <= 0) return
+      Bot.makeLog('debug', [`[${id}] Session 配额耗尽，将在 ${this._formatMs(resetMs)} 后重试`], id)
+      const timer = setTimeout(async () => {
+        if (offlineCheckState.waitingSessionReset[id] !== timer) return
         delete offlineCheckState.waitingSessionReset[id]
-        await this._doReconnect(id)
+        if (!canCheck() || !getOfflineDetectConfig(id).autoReconnect) return
+        await this._doOfflineCheck(id)
       }, resetMs)
+      offlineCheckState.waitingSessionReset[id] = timer
+      return
     }
+    await this._doReconnect(id)
   }
-  // remaining > 0 说明连接正常，无需处理
-}
 
   /**
    * reset_after 到期后，确认 remaining > 0 再重连
    */
   async _tryReconnectWhenReady (id) {
-    if (offlineCheckState.retrying[id]) return
-    if (!Bot[id]) return
-
-    const offlineDetect = getOfflineDetectConfig(id)
-
-    const sessionInfo = await this._getSessionInfo(id)
-    if (!sessionInfo) {
-      Bot.makeLog('warn', [`[${id}] reset_after 到期后无法获取 Session 信息，放弃本次重连`], id)
-      return
-    }
-
-    if (sessionInfo.remaining <= 0) {
-      // 仍然没有次数，继续等待下一轮检测
-      Bot.makeLog('warn', [`[${id}] reset_after 到期但 remaining 仍为 0，等待下次检测`], id)
-      return
-    }
-
-    // remaining > 0，可以重连
-    Bot.makeLog('info', [`[${id}] Session remaining=${sessionInfo.remaining}，开始重连`], id)
-    await this._doReconnect(id)
+    await this._doOfflineCheck(id)
   }
 
   /**
    * 执行重连
    */
   async _doReconnect (id, retryCount = 0) {
-  if (Bot[id]?.disabledRuntime) return
+  const bot = Bot[id]
+  if (!bot || bot.disabledRuntime) return
   // 如果已经在重连中，跳过（包括重试调用）
   if (offlineCheckState.retrying[id]) {
     Bot.makeLog('warn', [`[${id}] 已在重连中，跳过本次重连 (retryCount=${retryCount})`], id)
@@ -6494,17 +6445,23 @@ const adapter = new class QQBotAdapter {
   offlineCheckState.retryingAt[id] = Date.now()
   const reconnectSeq = (offlineCheckState.reconnectSeq[id] || 0) + 1
   offlineCheckState.reconnectSeq[id] = reconnectSeq
-  Bot[id].isReconnecting = true  // 设置重连标志
+  const ownsAttempt = () => Bot[id] === bot && offlineCheckState.reconnectSeq[id] === reconnectSeq
+  const isCurrentAttempt = () => ownsAttempt() && !bot.disabledRuntime
+  bot.isReconnecting = true  // 设置重连标志
 
   if (offlineCheckState.reconnectWatchdog[id]) clearTimeout(offlineCheckState.reconnectWatchdog[id])
   offlineCheckState.reconnectWatchdog[id] = setTimeout(() => {
-    delete offlineCheckState.reconnectWatchdog[id]
-    if (offlineCheckState.reconnectSeq[id] !== reconnectSeq) return
+    if (!isCurrentAttempt()) return
     if (!offlineCheckState.retrying[id]) return
+    delete offlineCheckState.reconnectWatchdog[id]
     Bot.makeLog('error', [`[${id}] 重连状态超过120秒未释放，已强制解除重连锁，等待下一轮检测/重连`], id)
+    offlineCheckState.reconnectSeq[id] = reconnectSeq + 1
+    bot.connectionGeneration = (bot.connectionGeneration || 0) + 1
+    try { bot.sdk._sessionLifecycle?.stop() } catch {}
+    bot._cancelLogin?.()
     delete offlineCheckState.retrying[id]
     delete offlineCheckState.retryingAt[id]
-    if (Bot[id]) Bot[id].isReconnecting = false
+    bot.isReconnecting = false
   }, 120000)
 
   const offlineDetect = getOfflineDetectConfig(id)
@@ -6522,115 +6479,29 @@ const adapter = new class QQBotAdapter {
   Bot.makeLog('warn', [`[${id}] 开始自动重连... (第 ${retryCount + 1} 次尝试)`], id)
 
   try {
-    const bot = Bot[id]
-    if (!bot) {
-      Bot.makeLog('error', [`[${id}] Bot 实例不存在，无法重连`], id)
-      return
-    }
-    
-    // 清理心跳超时计时器
-    if (bot.heartbeatTimer) {
-      clearTimeout(bot.heartbeatTimer)
-      bot.heartbeatTimer = null
-    }
-
     Bot.makeLog('warn', [`[${id}] 正在断开旧连接...`], id)
     try {
       await bot.logout()
-      if (Bot[id] !== bot || bot.disabledRuntime) return
+      if (!isCurrentAttempt()) return
       Bot.makeLog('warn', [`[${id}] 旧连接已断开`], id)
     } catch (err) {
+      if (!isCurrentAttempt()) return
       Bot.makeLog('warn', [`[${id}] 断开旧连接失败（忽略）`, err.message], id)
     }
 
     // 等待一小段时间确保旧连接完全关闭
-      await new Promise(resolve => setTimeout(resolve, 1000))
-      if (Bot[id] !== bot || bot.disabledRuntime) return
+    await new Promise(resolve => setTimeout(resolve, 1000))
+    if (!isCurrentAttempt()) return
 
     Bot.makeLog('warn', [`[${id}] 正在重新登录...`], id)
-      const loginResult = await bot.login()
-    if (offlineCheckState.reconnectSeq[id] !== reconnectSeq || Bot[id] !== bot || bot.disabledRuntime || loginResult === false) return
+    const loginResult = await bot.login()
+    if (!isCurrentAttempt() || loginResult === false) return
     Bot.makeLog('warn', [`[${id}] 重新登录成功`], id)
-
-    // login 成功后重新拦截 sendWs 和绑定 ws 监听（sessionManager 和 ws 可能被重建）
-    const heartbeatTimeoutMs = Number(getOfflineDetectConfig(id).heartbeatTimeout) || 60000
-    const sessionManager = bot.sdk.sessionManager
-    
-    // 重新绑定 ws message 监听
-    const onWsMessage = (data) => {
-      try {
-        const msg = JSON.parse(data.toString())
-        if (msg.op === 11) { // HEARTBEAT_ACK
-          if (bot.heartbeatTimer) {
-            clearTimeout(bot.heartbeatTimer)
-            bot.heartbeatTimer = null
-          }
-        }
-      } catch {}
-    }
-    if (bot.sdk.ws) {
-      if (bot._heartbeatMessageListener && bot._heartbeatMessageWs && bot._heartbeatMessageWs !== bot.sdk.ws) {
-        try { bot._heartbeatMessageWs.off?.('message', bot._heartbeatMessageListener) } catch {}
-      }
-      if (bot._heartbeatMessageListener) {
-        try { bot.sdk.ws.off?.('message', bot._heartbeatMessageListener) } catch {}
-      }
-      bot.sdk.ws.on('message', onWsMessage)
-      bot._heartbeatMessageListener = onWsMessage
-      bot._heartbeatMessageWs = bot.sdk.ws
-    }
-
-    // 重新拦截 sendWs（总是重新拦截，确保闭包变量正确）
-    if (sessionManager) {
-      const originalSendWs = sessionManager._originalSendWs || sessionManager.sendWs.bind(sessionManager)
-      sessionManager._originalSendWs = originalSendWs
-      sessionManager.sendWs = function (msg) {
-        // 检查 WebSocket 状态，如果不是 OPEN 状态，跳过发送
-        if (!bot.sdk.ws || bot.sdk.ws.readyState !== 1) {
-          Bot.makeLog('debug', [`[${id}] WebSocket 未就绪 (readyState=${bot.sdk.ws?.readyState})，跳过发送`], id)
-          return
-        }
-        if (msg?.op === 1) {
-          if (bot.heartbeatTimer) {
-            clearTimeout(bot.heartbeatTimer)
-          }
-          bot.lastHeartbeatTime = Date.now()  // 记录发送心跳的时间
-          // 如果正在重连中，不设置新的计时器
-          if (bot.isReconnecting) {
-            return originalSendWs(msg)
-          }
-          bot.heartbeatTimer = setTimeout(async () => {
-            bot.heartbeatTimer = null
-            // 检查是否有新的心跳正在发送
-            if (bot.lastHeartbeatTime > Date.now() - heartbeatTimeoutMs) {
-              Bot.makeLog('debug', [`[${id}] 检测到 SDK 仍在发送心跳，跳过掉线判定`], id)
-              return
-            }
-            if (bot.isReconnecting || offlineCheckState.retrying[id]) return
-            bot.reconnectCount = (bot.reconnectCount || 0) + 1
-            Bot.makeLog('warn', [`[${id}] 心跳超时 (${heartbeatTimeoutMs / 1000}s 无ACK)，判定为掉线`], id)
-            if (offlineDetect.notify) {
-              try {
-                await sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效，正在重连(已经${bot.reconnectCount}次)`)
-              } catch (err) {
-                Bot.makeLog('error', ['发送心跳超时通知失败', err.message], id)
-              }
-            }
-            if (offlineDetect.autoReconnect) {
-              await adapter._doReconnect(id)
-            }
-          }, heartbeatTimeoutMs)
-        }
-        return originalSendWs(msg)
-      }
-      sessionManager._heartbeatHooked = true
-    }
 
     // 重连成功，重置计数和状态
     bot.reconnectCount = 0
     delete offlineCheckState.retrying[id]
     delete offlineCheckState.retryingAt[id]
-    if (offlineCheckState.reconnectSeq[id] === reconnectSeq) delete offlineCheckState.reconnectSeq[id]
     if (offlineCheckState.reconnectWatchdog[id]) {
       clearTimeout(offlineCheckState.reconnectWatchdog[id])
       delete offlineCheckState.reconnectWatchdog[id]
@@ -6642,10 +6513,12 @@ const adapter = new class QQBotAdapter {
       try {
         await sendQQBotInternalMasterMsg(`[${id}] 账号重连成功！`)
       } catch (err) {
+        if (!isCurrentAttempt()) return
         Bot.makeLog('error', ['发送重连成功通知失败', err.message], id)
       }
     }
   } catch (err) {
+    if (!isCurrentAttempt()) return
     Bot.makeLog('error', [`[${id}] 自动重连失败 (第 ${retryCount + 1} 次)`, err.message], id)
     
     // 判断是否还有重试次数（Infinity 永远为 true）
@@ -6653,23 +6526,24 @@ const adapter = new class QQBotAdapter {
       // 还有重试次数，延迟后重试
       Bot.makeLog('warn', [`[${id}] 将在 ${retryDelay / 1000}s 后重试...`], id)
       
-      offlineCheckState.waitingReconnectRetry[id] = setTimeout(async () => {
+      const retryGeneration = bot.connectionGeneration
+      const retryTimer = setTimeout(async () => {
+        if (offlineCheckState.waitingReconnectRetry[id] !== retryTimer) return
         delete offlineCheckState.waitingReconnectRetry[id]
-        if (offlineCheckState.reconnectSeq[id] !== reconnectSeq) return
-        delete offlineCheckState.retrying[id]
-        delete offlineCheckState.retryingAt[id]
-        if (Bot[id]) Bot[id].isReconnecting = false
+        if (!isCurrentAttempt() || bot.connectionGeneration !== retryGeneration) return
+        if (offlineCheckState.retrying[id] || bot.isReconnecting || [0, 1].includes(bot.sdk.ws?.readyState) || !getOfflineDetectConfig(id).autoReconnect) return
         await this._doReconnect(id, retryCount + 1)
       }, retryDelay)
+      offlineCheckState.waitingReconnectRetry[id] = retryTimer
       delete offlineCheckState.retrying[id]
       delete offlineCheckState.retryingAt[id]
-      if (Bot[id]) Bot[id].isReconnecting = false
+      bot.isReconnecting = false
       if (offlineCheckState.reconnectWatchdog[id]) {
         clearTimeout(offlineCheckState.reconnectWatchdog[id])
         delete offlineCheckState.reconnectWatchdog[id]
       }
        
-      return  // 不执行 finally，保持 retrying 状态
+      return
     } else {
       // 达到最大重试次数，彻底失败
       Bot.makeLog('error', [`[${id}] 重连失败次数已达上限 (${maxRetries})，停止重试`], id)
@@ -6678,21 +6552,21 @@ const adapter = new class QQBotAdapter {
         try {
           await sendQQBotInternalMasterMsg(`[${id}] 自动重连失败：已达最大重试次数 (${maxRetries === Infinity ? '无限制' : maxRetries})，请手动处理`)
         } catch (e) {
+          if (!isCurrentAttempt()) return
           Bot.makeLog('error', ['发送重连失败通知失败', e.message], id)
         }
       }
     }
   } finally {
     // 只有彻底成功或彻底失败时才清除 retrying 状态
-    if (!offlineCheckState.waitingReconnectRetry[id]) {
+    if (ownsAttempt() && !offlineCheckState.waitingReconnectRetry[id]) {
       delete offlineCheckState.retrying[id]
       delete offlineCheckState.retryingAt[id]
-      if (offlineCheckState.reconnectSeq[id] === reconnectSeq) delete offlineCheckState.reconnectSeq[id]
       if (offlineCheckState.reconnectWatchdog[id]) {
         clearTimeout(offlineCheckState.reconnectWatchdog[id])
         delete offlineCheckState.reconnectWatchdog[id]
       }
-      if (Bot[id]) Bot[id].isReconnecting = false  // 清除重连标志
+      bot.isReconnecting = false  // 清除重连标志
     }
   }
 }
@@ -6711,11 +6585,16 @@ async connect (token) {
   if (existingBot) {
     existingBot.connectionGeneration = (existingBot.connectionGeneration || 0) + 1
     this.stopOfflineCheck(id)
+    offlineCheckState.reconnectSeq[id] = (offlineCheckState.reconnectSeq[id] || 0) + 1
+    delete offlineCheckState.retrying[id]
+    delete offlineCheckState.retryingAt[id]
     existingBot.sdk._sessionLifecycle?.dispose()
     existingBot._cancelLogin?.()
     try { await existingBot.logout() } catch (err) {
+      if (Bot[id] !== existingBot) return { ok: false, reason: '登录已取消' }
       Bot.makeLog('warn', [`[${id}] 替换账号配置时关闭旧连接失败`, err.message], id)
     }
+    if (Bot[id] !== existingBot) return { ok: false, reason: '登录已取消' }
   }
   const opts = {
     ...config.bot,
@@ -6807,6 +6686,7 @@ async connect (token) {
     const bot = Bot[id]
     if (bot && !bot.disabledRuntime) {
       try { await bot.logout() } catch {}
+      if (Bot[id] !== bot || bot.sdk !== sdk) return { status: 200, data: { url: '', shards: 1 } }
       this.disableBotRuntime(id, '接口访问源IP不在白名单')
     }
     return { status: 200, data: { url: '', shards: 1 } }
@@ -7011,23 +6891,29 @@ async connect (token) {
     sdk,
     connectionGeneration: (existingBot?.connectionGeneration || 0) + 1,
     login () {
+      this._cancelLogin?.()
       return new Promise((resolve, reject) => {
-       let settled = false
-       let timer
-       let readyPoll
+        let settled = false
+        let timer
+        let readyPoll
         const sessionManager = this.sdk.sessionManager
-        const loginGeneration = this.connectionGeneration
+        const lifecycle = this.sdk._sessionLifecycle
+        const loginGeneration = this.connectionGeneration = (this.connectionGeneration || 0) + 1
+        const ownsLogin = () => Bot[id] === this && this.sdk === sdk &&
+          this.connectionGeneration === loginGeneration && this._cancelLogin === cancelLogin
         const onReady = () => {
-          if (this.connectionGeneration !== loginGeneration || this.disabledRuntime) {
+          if (!ownsLogin() || this.disabledRuntime || gatewayIpBlocked) {
             finishResolve(false)
             return
           }
-          clearInterval(readyPoll)
-          this.reconnectCount = 0
-          finishResolve()
+          if (lifecycle.readySocket && lifecycle.readySocket === this.sdk.ws && this.sdk.ws?.readyState === 1) finishResolve()
         }
         const onDead = (data) => {
-          clearInterval(readyPoll)
+          if (settled) return
+          if (!ownsLogin() || this.disabledRuntime) {
+            finishResolve(false)
+            return
+          }
           const authError = getQQBotAuthError(data)
           if (authError) {
             Bot.makeLog('error', [`[${id}] ${authError}，中断连接`, data], id)
@@ -7037,7 +6923,6 @@ async connect (token) {
           if (isQQBotReadOnlyError(data)) {
             this.readOnlyMode = true
             Bot.makeLog('error', [`[${id}] 当前机器人为只读模式，只接收消息，不处理任何指令`, data], id)
-            finishResolve()
             return
           }
           finishReject(new Error(data?.msg || 'connection dead'))
@@ -7047,7 +6932,7 @@ async connect (token) {
           if (readyPoll) clearInterval(readyPoll)
           try { sessionManager?.off?.('READY', onReady) } catch {}
           try { sessionManager?.off?.('DEAD', onDead) } catch {}
-          if (this._cancelLogin) this._cancelLogin = null
+          if (this._cancelLogin === cancelLogin) this._cancelLogin = null
         }
         const finishResolve = (value) => {
           if (settled) return
@@ -7058,77 +6943,65 @@ async connect (token) {
         const finishReject = (err) => {
           if (settled) return
           settled = true
+          if (ownsLogin()) {
+            try { lifecycle.stop() } catch {}
+          }
           cleanup()
           reject(err)
         }
-        this._cancelLogin = () => finishResolve(false)
-        if (this.disabledRuntime) {
+        const cancelLogin = () => {
+          if (settled) return
+          if (ownsLogin()) {
+            this.connectionGeneration++
+            try { lifecycle.stop() } catch {}
+          }
+          finishResolve(false)
+        }
+        this._cancelLogin = cancelLogin
+        if (Bot[id] !== this || this.sdk !== sdk || this.disabledRuntime) {
           finishResolve(false)
           return
         }
-        // 清理旧的心跳超时计时器和重连标志
-        if (this.heartbeatTimer) {
-          clearTimeout(this.heartbeatTimer)
-          this.heartbeatTimer = null
-        }
-        this.isReconnecting = false
 
         timer = setTimeout(() => {
-          if (this.disabledRuntime) {
-            finishResolve(false)
-            return
-          }
-          if (this.connectionGeneration !== loginGeneration) {
+          if (!ownsLogin() || this.disabledRuntime || gatewayIpBlocked) {
             finishResolve(false)
             return
           }
           finishReject(new Error('login timeout after 60s'))
         }, 60000)
 
-        readyPoll = setInterval(() => {
-          if (settled) {
-            clearInterval(readyPoll)
-            return
-          }
-          if (this.disabledRuntime || gatewayIpBlocked || this.connectionGeneration !== loginGeneration) {
-            clearInterval(readyPoll)
-            finishResolve(false)
-            return
-          }
-          const sm = this.sdk.sessionManager
-          if (this.sdk.ws?.readyState === 1 && (sm?.sessionRecord?.sessionID || sm?.alive || this.sdk.nickname)) {
-            clearInterval(readyPoll)
-            this.reconnectCount = 0
-            finishResolve()
-          }
-        }, 1000)
+        // RESUMED need not emit READY; only the lifecycle's current socket can succeed.
+        readyPoll = setInterval(onReady, 1000)
         
-        sessionManager.once('READY', onReady)
-        sessionManager.once('DEAD', onDead)
+        sessionManager.on('READY', onReady)
+        sessionManager.on('DEAD', onDead)
         
         // 捕获 start() 内部的异步错误（如 getAccessToken 失败）
-        applyQQBotUserAgentPatch()
-        this.sdk.start().then(() => {
-          if (gatewayIpBlocked || this.disabledRuntime || this.connectionGeneration !== loginGeneration) finishResolve(false)
+        Promise.resolve().then(() => {
+          if (settled || !ownsLogin() || this.disabledRuntime) return
+          applyQQBotUserAgentPatch()
+          return this.sdk.start()
+        }).then(() => {
+          if (settled) return
+          if (gatewayIpBlocked || this.disabledRuntime || !ownsLogin()) finishResolve(false)
         }).catch(err => {
-          clearInterval(readyPoll)
-          if (this.disabledRuntime) {
+          if (settled) return
+          if (!ownsLogin() || this.disabledRuntime) {
             finishResolve(false)
             return
           }
           if (isQQBotIpWhitelistError(err) || gatewayIpBlocked) {
-            finishResolve(false)
+            cancelLogin()
             return
           }
           if (isQQBotReadOnlyError(err)) {
             this.readOnlyMode = true
             Bot.makeLog('error', [`[${id}] 当前机器人为只读模式，只接收消息，不处理任何指令`, err.message], id)
-            finishResolve()
             return
           }
           if (isQQBotCanceledError(err)) {
             Bot.makeLog('error', [`[${id}] 机器人已注销，尝试默认 websocket 地址`, err.message], id)
-            finishResolve()
             return
           }
           Bot.makeLog('error', ['SDK start() 失败', err.message], id)
@@ -7138,31 +7011,26 @@ async connect (token) {
     },
     logout () {
       return new Promise((resolve) => {
-        // 清理心跳超时计时器
-        if (this.heartbeatTimer) {
-          clearTimeout(this.heartbeatTimer)
-          this.heartbeatTimer = null
-        }
-        // 如果 ws 已经关闭或不存在，直接返回
-        if (!this.sdk.ws || this.sdk.ws.readyState !== 1) {
-          try { this.sdk.stop() } catch {}
-          resolve()
-          return
-        }
-        // 设置超时，避免永远等待
-        const timer = setTimeout(() => {
-          resolve()
-        }, 5000)
-        this.sdk.ws.once('close', () => {
+        const socket = this.sdk.ws
+        let timer
+        const finish = () => {
           clearTimeout(timer)
+          socket?.off?.('close', finish)
           resolve()
-        })
+        }
+        if (socket && socket.readyState !== 3) {
+          timer = setTimeout(finish, 5000)
+          socket.once('close', finish)
+        }
+        this._cancelLogin?.()
+        this.connectionGeneration = (this.connectionGeneration || 0) + 1
         try {
+          this.sdk._sessionLifecycle?.stop()
           this.sdk.stop()
         } catch {
-          clearTimeout(timer)
-          resolve()
+          finish()
         }
+        if (!socket || socket.readyState === 3) finish()
       })
     },
 
@@ -7212,14 +7080,18 @@ async connect (token) {
     callback: {}
   }
 
+  const runtime = Bot[id]
   const failConnection = async reason => {
-    const failedBot = Bot[id]
-    try { await failedBot?.logout?.() } catch {}
-    if (Bot[id] === failedBot) delete Bot[id]
+    if (Bot[id] !== runtime) return { ok: false, reason: reason || '登录已取消' }
+    const logoutPromise = runtime.logout()
+    const generation = runtime.connectionGeneration
+    try { await logoutPromise } catch {}
+    if (Bot[id] === runtime && runtime.connectionGeneration === generation) delete Bot[id]
     return { ok: false, reason: reason || '登录失败' }
   }
 
-  await this.cleanGuildCacheFromContactMaps(Bot[id], id)
+  await this.cleanGuildCacheFromContactMaps(runtime, id)
+  if (Bot[id] !== runtime || runtime.disabledRuntime) return { ok: false, reason: '登录已取消' }
 
   sdk.pickFriend = userId => this.pickFriend(id, String(userId || ''))
   sdk.pickGroup = groupId => this.pickGroup(id, String(groupId || ''))
@@ -7235,7 +7107,7 @@ async connect (token) {
   Bot[id].sdk.logger = {}
   for (const i of ['trace', 'debug', 'info', 'mark', 'warn', 'error', 'fatal']) {
     Bot[id].sdk.logger[i] = (...args) => {
-      if (Bot[id]?.disabledRuntime) return
+      if (Bot[id] !== runtime || runtime.disabledRuntime) return
       const fatalWsErrorText = i === 'error'
         ? args.map(arg => getQQBotFatalWsErrorText(arg)).find(text => text && (text === '机器人停止服务(被回收)，请重新提审' || Bot[id]?.readOnlyMode))
         : ''
@@ -7256,10 +7128,40 @@ async connect (token) {
   }
 
   // 接管 SDK 的连接生命周期，避免旧 start()/socket 在停用或替换后继续回调。
-  Bot[id].sdk._sessionLifecycle = installSessionLifecycle(Bot[id].sdk.sessionManager, {
-    isCurrent: () => Bot[id]?.sdk === sdk && !Bot[id]?.disabledRuntime,
+  sdk._sessionLifecycle = installSessionLifecycle(sdk.sessionManager, {
+    isCurrent: () => Bot[id] === runtime && runtime.sdk === sdk && !runtime.disabledRuntime,
+    getHeartbeatTimeout: () => {
+      const timeout = Number(getOfflineDetectConfig(id).heartbeatTimeout)
+      return Number.isFinite(timeout) && timeout > 0 ? timeout : 60000
+    },
+    onReady: socket => {
+      if (Bot[id] !== runtime || runtime.sdk !== sdk || runtime.disabledRuntime || sdk.ws !== socket) return
+      runtime.reconnectCount = 0
+    },
+    onHeartbeatTimeout: async ({ socket, timeoutMs, isStillTimedOut }) => {
+      const generation = runtime.connectionGeneration
+      const canHandle = () => Bot[id] === runtime && runtime.sdk === sdk && !runtime.disabledRuntime &&
+        runtime.connectionGeneration === generation && sdk.ws === socket && isStillTimedOut() &&
+        !runtime.isReconnecting && !offlineCheckState.retrying[id] && !offlineCheckState.waitingReconnectRetry[id]
+      if (!canHandle()) return
+      const offlineDetect = getOfflineDetectConfig(id)
+      if (offlineDetect.autoReconnect) runtime.reconnectCount = (runtime.reconnectCount || 0) + 1
+      Bot.makeLog('warn', [`[${id}] 心跳超时 (${timeoutMs / 1000}s 无ACK)，判定为掉线`], id)
+      if (offlineDetect.notify) {
+        if (!canHandle()) return
+        const action = offlineDetect.autoReconnect ? `，正在重连(已经${runtime.reconnectCount}次)` : '，自动重连已关闭'
+        try {
+          await sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效${action}`)
+        } catch (err) {
+          if (!canHandle()) return
+          Bot.makeLog('error', ['发送心跳超时通知失败', err.message], id)
+        }
+      }
+      if (!canHandle() || !getOfflineDetectConfig(id).autoReconnect) return
+      await adapter._doReconnect(id)
+    },
     onError: async err => {
-      if (Bot[id]?.disabledRuntime || Bot[id]?.sdk !== sdk) return
+      if (Bot[id] !== runtime || runtime.disabledRuntime || runtime.sdk !== sdk) return
       Bot.makeLog('error', [`[${id}] SDK 连接失败`, err?.message || String(err)], id)
     }
   })
@@ -7398,13 +7300,18 @@ async connect (token) {
   // ===== getAccessToken 拦截结束 =====
 
   // 初次登录失败必须返回给设置命令，不能继续伪装成已连接。
+  let initialLoginGeneration
   try {
-    const loginResult = await Bot[id].login()
+    const loginPromise = runtime.login()
+    initialLoginGeneration = runtime.connectionGeneration
+    const loginResult = await loginPromise
+    if (Bot[id] !== runtime || runtime.connectionGeneration !== initialLoginGeneration) return { ok: false, reason: '登录已取消' }
     if (loginResult === false) {
-      return failConnection(Bot[id]?.disabledReason || '登录未完成')
+      return failConnection(runtime.disabledReason || '登录未完成')
     }
   } catch (err) {
-    if (Bot[id]?.disabledRuntime) return failConnection(Bot[id]?.disabledReason || err.message || '登录失败')
+    if (Bot[id] !== runtime || runtime.connectionGeneration !== initialLoginGeneration) return { ok: false, reason: '登录已取消' }
+    if (runtime.disabledRuntime) return failConnection(runtime.disabledReason || err.message || '登录失败')
     Bot.makeLog('error', [`[${id}] 初次登录失败`, err.message], id)
     return failConnection(getQQBotSdkErrorSummary(err))
   }
@@ -7412,159 +7319,15 @@ async connect (token) {
     this.disableBotRuntime(id, '接口访问源IP不在白名单')
     return failConnection('接口访问源IP不在白名单')
   }
-  if (Bot[id]?.disabledRuntime) return failConnection(Bot[id]?.disabledReason || '机器人运行态已停止')
+  if (runtime.disabledRuntime) return failConnection(runtime.disabledReason || '机器人运行态已停止')
   
-  await Bot[id].dau.init()
+  await runtime.dau.init()
+  if (Bot[id] !== runtime || runtime.disabledRuntime || runtime.connectionGeneration !== initialLoginGeneration) return { ok: false, reason: '登录已取消' }
 
   Bot[id].sdk.on('message', event => enqueueQQBotMessage(this, id, event))
   Bot[id].sdk.on('notice', event => this.makeNotice(id, event).catch(err => Bot.makeLog('error', [`[${id}] 通知处理失败`, err.message], id)))
   Bot[id].sdk.on('request', event => this.makeRequest(id, event).catch(err => Bot.makeLog('error', [`[${id}] 加群申请处理失败`, err.message], id)))
   groupInfoStore.resumePending(id).catch(err => Bot.makeLog('warn', [`[${id}] 恢复群资料刷新任务失败`, err.message], id))
-
-  // ===== 心跳超时检测 =====
-  const heartbeatTimeoutMs = Number(getOfflineDetectConfig(id).heartbeatTimeout) || 60000  // 默认60秒
-  Bot[id].heartbeatTimer = null
-  Bot[id].reconnectCount = 0  // 重连次数计数
-  Bot[id].isReconnecting = false  // 是否正在重连中
-  Bot[id].lastHeartbeatTime = 0  // 最后一次发送心跳的时间
-
-  const clearHeartbeatTimer = () => {
-    if (Bot[id].heartbeatTimer) {
-      clearTimeout(Bot[id].heartbeatTimer)
-      Bot[id].heartbeatTimer = null
-    }
-  }
-
-  // 收到ACK时清除计时器
-  const onWsMessage = (data) => {
-    try {
-      const msg = JSON.parse(data.toString())
-      if (msg.op === 11) { // HEARTBEAT_ACK
-        clearHeartbeatTimer()
-      }
-    } catch {}
-  }
-
-  // 绑定 ws message 事件
-  if (Bot[id].sdk.ws) {
-    if (Bot[id]._heartbeatMessageListener && Bot[id]._heartbeatMessageWs && Bot[id]._heartbeatMessageWs !== Bot[id].sdk.ws) {
-      try { Bot[id]._heartbeatMessageWs.off?.('message', Bot[id]._heartbeatMessageListener) } catch {}
-    }
-    if (Bot[id]._heartbeatMessageListener) {
-      try { Bot[id].sdk.ws.off?.('message', Bot[id]._heartbeatMessageListener) } catch {}
-    }
-    Bot[id].sdk.ws.on('message', onWsMessage)
-    Bot[id]._heartbeatMessageListener = onWsMessage
-    Bot[id]._heartbeatMessageWs = Bot[id].sdk.ws
-  }
-
-  // 拦截 sendWs，在发送心跳时启动计时器
-  const sessionManager = Bot[id].sdk.sessionManager
-  const originalSendWs = sessionManager._originalSendWs || sessionManager.sendWs.bind(sessionManager)
-  sessionManager._originalSendWs = originalSendWs
-  sessionManager.sendWs = function (msg) {
-    // 检查 WebSocket 状态，如果不是 OPEN 状态，跳过发送
-    if (!Bot[id].sdk.ws || Bot[id].sdk.ws.readyState !== 1) {
-      Bot.makeLog('debug', [`[${id}] WebSocket 未就绪 (readyState=${Bot[id].sdk.ws?.readyState})，跳过发送`], id)
-      return
-    }
-    if (msg?.op === 1) { // HEARTBEAT
-      clearHeartbeatTimer()
-      Bot[id].lastHeartbeatTime = Date.now()  // 记录发送心跳的时间
-      // 如果正在重连中，不设置新的计时器
-      if (Bot[id].isReconnecting) {
-        return originalSendWs(msg)
-      }
-      Bot[id].heartbeatTimer = setTimeout(async () => {
-        Bot[id].heartbeatTimer = null
-        // 检查是否有新的心跳正在发送（如果 lastHeartbeatTime 更新了，说明 SDK 还在发心跳）
-        if (Bot[id].lastHeartbeatTime > Date.now() - heartbeatTimeoutMs) {
-          Bot.makeLog('debug', [`[${id}] 检测到 SDK 仍在发送心跳，跳过掉线判定`], id)
-          return
-        }
-        if (Bot[id].isReconnecting || offlineCheckState.retrying[id]) return
-        Bot[id].reconnectCount = (Bot[id].reconnectCount || 0) + 1
-        Bot.makeLog('warn', [`[${id}] 心跳超时 (${heartbeatTimeoutMs / 1000}s 无ACK)，判定为掉线`], id)
-        const offlineDetect = getOfflineDetectConfig(id)
-        if (offlineDetect.notify) {
-          try {
-            await sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效，正在重连(已经${Bot[id].reconnectCount}次)`)
-          } catch (err) {
-            Bot.makeLog('error', ['发送心跳超时通知失败', err.message], id)
-          }
-        }
-        if (offlineDetect.autoReconnect) {
-          await adapter._doReconnect(id)
-        }
-      }, heartbeatTimeoutMs)
-    }
-    return originalSendWs(msg)
-  }
-  sessionManager._heartbeatHooked = true
-
-  // SDK 重连成功后重新绑定 ws 监听和 sendWs 拦截
-  sessionManager.on('READY', () => {
-    if (Bot[id]?.sdk?.ws) {
-      if (Bot[id]._heartbeatMessageListener && Bot[id]._heartbeatMessageWs && Bot[id]._heartbeatMessageWs !== Bot[id].sdk.ws) {
-        try { Bot[id]._heartbeatMessageWs.off?.('message', Bot[id]._heartbeatMessageListener) } catch {}
-      }
-      if (Bot[id]._heartbeatMessageListener) {
-        try { Bot[id].sdk.ws.off?.('message', Bot[id]._heartbeatMessageListener) } catch {}
-      }
-      Bot[id].sdk.ws.on('message', onWsMessage)
-      Bot[id]._heartbeatMessageListener = onWsMessage
-      Bot[id]._heartbeatMessageWs = Bot[id].sdk.ws
-    }
-    // 重连成功，重置计数和标志
-    Bot[id].reconnectCount = 0
-    Bot[id].isReconnecting = false
-    // 重新拦截 sendWs（总是重新拦截，确保闭包变量正确）
-    const newSessionManager = Bot[id].sdk.sessionManager
-    if (newSessionManager) {
-      const newOriginalSendWs = newSessionManager._originalSendWs || newSessionManager.sendWs.bind(newSessionManager)
-      newSessionManager._originalSendWs = newOriginalSendWs
-      newSessionManager.sendWs = function (msg) {
-        // 检查 WebSocket 状态，如果不是 OPEN 状态，跳过发送
-        if (!Bot[id].sdk.ws || Bot[id].sdk.ws.readyState !== 1) {
-          Bot.makeLog('debug', [`[${id}] WebSocket 未就绪 (readyState=${Bot[id].sdk.ws?.readyState})，跳过发送`], id)
-          return
-        }
-        if (msg?.op === 1) {
-          clearHeartbeatTimer()
-          Bot[id].lastHeartbeatTime = Date.now()  // 记录发送心跳的时间
-          // 如果正在重连中，不设置新的计时器
-          if (Bot[id].isReconnecting) {
-            return newOriginalSendWs(msg)
-          }
-          Bot[id].heartbeatTimer = setTimeout(async () => {
-            Bot[id].heartbeatTimer = null
-            // 检查是否有新的心跳正在发送
-            if (Bot[id].lastHeartbeatTime > Date.now() - heartbeatTimeoutMs) {
-              Bot.makeLog('debug', [`[${id}] 检测到 SDK 仍在发送心跳，跳过掉线判定`], id)
-              return
-            }
-            if (Bot[id].isReconnecting || offlineCheckState.retrying[id]) return
-            Bot[id].reconnectCount = (Bot[id].reconnectCount || 0) + 1
-            Bot.makeLog('warn', [`[${id}] 心跳超时 (${heartbeatTimeoutMs / 1000}s 无ACK)，判定为掉线`], id)
-            const offlineDetect = getOfflineDetectConfig(id)
-            if (offlineDetect.notify) {
-              try {
-                await sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效，正在重连(已经${Bot[id].reconnectCount}次)`)
-              } catch (err) {
-                Bot.makeLog('error', ['发送心跳超时通知失败', err.message], id)
-              }
-            }
-            if (offlineDetect.autoReconnect) {
-              await adapter._doReconnect(id)
-            }
-          }, heartbeatTimeoutMs)
-        }
-        return newOriginalSendWs(msg)
-      }
-      newSessionManager._heartbeatHooked = true
-    }
-  })
-  // ===== 心跳超时检测结束 =====
 
   // 启动掉线检测
   this.startOfflineCheck(id)
