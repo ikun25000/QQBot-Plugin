@@ -2,7 +2,13 @@ import { OpCode, SessionEvents, WebsocketCloseReason } from 'qq-official-bot/lib
 import { toObject } from 'qq-official-bot/lib/utils.js'
 
 // Install before the first start/listen. isCurrent belongs to the plugin runtime.
-export function installSessionLifecycle (sm, { isCurrent, onError = error => sm.bot.logger.error(error) }) {
+export function installSessionLifecycle (sm, {
+  isCurrent,
+  onError = error => sm.bot.logger.error(error),
+  getHeartbeatTimeout = () => 60000,
+  onHeartbeatTimeout = () => {},
+  onReady = () => {}
+}) {
   let abort = new AbortController()
   let generation = 0
   let disposed = false
@@ -98,15 +104,41 @@ export function installSessionLifecycle (sm, { isCurrent, onError = error => sm.
     const attempt = abort
     const version = generation
     let timer
+    let ackTimer
+    let handshakeTimer
+    let pendingHeartbeat
     let interval
     const state = { socket, token: sm.access_token, url: sm.wsUrl, failed: false, cleanup }
     const belongs = () => attempt === abort && version === generation && isActive() && sm.bot.ws === socket
     const current = () => listening === state && belongs()
     const send = message => {
-      if (current() && !state.failed && socket.readyState === 1) sm.sendWs(message)
+      if (!current() || state.failed || socket.readyState !== 1) return
+      // An outstanding heartbeat keeps its original deadline until ACK/RESUMED.
+      if (message?.op === OpCode.HEARTBEAT && !pendingHeartbeat) {
+        const heartbeat = {}
+        pendingHeartbeat = heartbeat
+        const configured = Number(getHeartbeatTimeout())
+        const timeoutMs = Number.isFinite(configured) && configured > 0 ? configured : 60000
+        const isStillTimedOut = () => current() && !state.failed && socket.readyState === 1 && pendingHeartbeat === heartbeat
+        ackTimer = setTimeout(() => {
+          ackTimer = undefined
+          if (!isStillTimedOut()) return
+          Promise.resolve().then(() => {
+            if (isStillTimedOut()) return onHeartbeatTimeout({ socket, timeoutMs, isStillTimedOut })
+          }).catch(onError)
+        }, timeoutMs)
+      }
+      sm.sendWs(message)
+    }
+    function clearHeartbeat () {
+      clearTimeout(timer)
+      clearTimeout(ackTimer)
+      timer = ackTimer = undefined
+      pendingHeartbeat = undefined
     }
     function cleanup () {
-      clearTimeout(timer)
+      clearHeartbeat()
+      clearTimeout(handshakeTimer)
       socket.off('message', message)
       socket.off('close', close)
       socket.off('error', error)
@@ -117,7 +149,7 @@ export function installSessionLifecycle (sm, { isCurrent, onError = error => sm.
       }
     }
     function close (code) {
-      clearTimeout(timer)
+      clearHeartbeat()
       if (!current()) return
       const eventMsg = sm.sessionRecord
       cleanup()
@@ -126,7 +158,8 @@ export function installSessionLifecycle (sm, { isCurrent, onError = error => sm.
       if (belongs()) sm.emit(SessionEvents.EVENT_WS, { eventType: SessionEvents.DISCONNECT, code, eventMsg })
     }
     function error () {
-      clearTimeout(timer)
+      clearHeartbeat()
+      clearTimeout(handshakeTimer)
       if (!current()) return
       state.failed = true
       readySocket = null
@@ -157,6 +190,8 @@ export function installSessionLifecycle (sm, { isCurrent, onError = error => sm.
         return
       }
       if (t === SessionEvents.READY) {
+        clearHeartbeat()
+        clearTimeout(handshakeTimer)
         const user = d.user || {}
         sm.bot.self_id = user.id
         sm.bot.nickname = user.username
@@ -164,12 +199,19 @@ export function installSessionLifecycle (sm, { isCurrent, onError = error => sm.
         if (d.session_id) sm.sessionRecord.sessionID = d.session_id
         sm.isReconnect = false
         readySocket = socket
+        onReady(socket)
         sm.emit(SessionEvents.READY, { eventType: SessionEvents.READY, msg: d })
         send(sm.heartbeatParam)
         return
       }
       if (op === OpCode.HEARTBEAT_ACK || t === SessionEvents.RESUMED) {
-        readySocket = socket
+        clearHeartbeat()
+        if (t === SessionEvents.RESUMED) {
+          clearTimeout(handshakeTimer)
+          sm.isReconnect = false
+          readySocket = socket
+          onReady(socket)
+        }
         if (!sm.alive) {
           sm.alive = true
           sm.emit(SessionEvents.EVENT_WS, { eventType: SessionEvents.READY })
@@ -189,6 +231,18 @@ export function installSessionLifecycle (sm, { isCurrent, onError = error => sm.
     socket.on('close', close)
     socket.on('error', error)
     socket.on('message', message)
+    // SDK-internal resumes bypass the plugin login timeout as well.
+    handshakeTimer = setTimeout(() => {
+      if (!current() || readySocket === socket) return
+      closeSocket(socket)
+      Promise.resolve().then(() => onError(new Error('WebSocket READY/RESUMED timeout after 60s'))).catch(() => {})
+      if (attempt !== abort || version !== generation || !isActive() || sm.bot.ws) return
+      sm.emit(SessionEvents.EVENT_WS, {
+        eventType: SessionEvents.DISCONNECT,
+        code: sm.sessionRecord.sessionID ? 4009 : 1006,
+        eventMsg: sm.sessionRecord
+      })
+    }, 60000)
   }
   return controller
 }
