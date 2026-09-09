@@ -10,6 +10,8 @@ import crypto from 'node:crypto'
 import axios from 'axios'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFile } from 'node:child_process'
+import { setTimeout as sessionDelay } from 'node:timers/promises'
+import { installSessionLifecycle } from './Model/sessionLifecycle.js'
 import {
   Dau,
   importJS,
@@ -2254,20 +2256,6 @@ function getQQBotFatalWsErrorText (data) {
   if (message.includes('4925')) return '官方 websocket 不可用，请解绑元器'
   if (message.includes('4903')) return '机器人停止服务(被回收)，请重新提审'
   return ''
-}
-
-function clearRuntimeTimers (target, seen = new Set()) {
-  if (!target || typeof target !== 'object' || seen.has(target)) return
-  seen.add(target)
-  for (const [key, value] of Object.entries(target)) {
-    if (/timer|timeout|interval|heartbeat|reconnect/i.test(key)) {
-      if (value) {
-        try { clearTimeout(value) } catch {}
-        try { clearInterval(value) } catch {}
-      }
-      try { target[key] = null } catch {}
-    }
-  }
 }
 
 function migrateLegacyBotConfig () {
@@ -6389,20 +6377,11 @@ const adapter = new class QQBotAdapter {
     if (!bot) return
     if (bot.disabledRuntime) return
     bot.disabledRuntime = true
+    bot.connectionGeneration = (bot.connectionGeneration || 0) + 1
     bot.disabledReason = reason || bot.disabledReason || '机器人运行态已停止'
     bot.isReconnecting = false
-    try { bot.sdk.sessionManager.getAccessToken = async () => ({ access_token: '', expires_in: '0' }) } catch {}
-    try { bot.sdk.sessionManager.getWsUrl = async () => '' } catch {}
-    try { bot.sdk.start = async () => false } catch {}
-    try { bot.sdk.login = async () => false } catch {}
-    try { bot.sdk.request.get = async () => ({ status: 204, data: {} }) } catch {}
-    try { bot.sdk.sessionManager?.removeAllListeners?.() } catch {}
-    try { clearRuntimeTimers(bot.sdk.sessionManager) } catch {}
-    try { clearRuntimeTimers(bot.sdk) } catch {}
-    try { bot.sdk?.ws?.removeAllListeners?.() } catch {}
-    try { bot.sdk?.ws?.terminate?.() } catch {}
-    try { bot.sdk?.ws?.close?.() } catch {}
-    try { bot.sdk?.stop?.() } catch {}
+    bot.sdk._sessionLifecycle?.dispose()
+    bot._cancelLogin?.()
     try { bot.sdk.logger = Object.fromEntries(['trace', 'debug', 'info', 'mark', 'warn', 'error', 'fatal'].map(level => [level, () => {}])) } catch {}
     Bot.makeLog('error', [`[${id}] 已停止该机器人运行态${reason ? `：${reason}` : ''}，配置未删除，重启后会按配置重新尝试连接`], id)
   }
@@ -6558,17 +6537,19 @@ const adapter = new class QQBotAdapter {
     Bot.makeLog('warn', [`[${id}] 正在断开旧连接...`], id)
     try {
       await bot.logout()
+      if (Bot[id] !== bot || bot.disabledRuntime) return
       Bot.makeLog('warn', [`[${id}] 旧连接已断开`], id)
     } catch (err) {
       Bot.makeLog('warn', [`[${id}] 断开旧连接失败（忽略）`, err.message], id)
     }
 
     // 等待一小段时间确保旧连接完全关闭
-    await new Promise(resolve => setTimeout(resolve, 1000))
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      if (Bot[id] !== bot || bot.disabledRuntime) return
 
     Bot.makeLog('warn', [`[${id}] 正在重新登录...`], id)
-      await bot.login()
-    if (offlineCheckState.reconnectSeq[id] !== reconnectSeq) return
+      const loginResult = await bot.login()
+    if (offlineCheckState.reconnectSeq[id] !== reconnectSeq || Bot[id] !== bot || bot.disabledRuntime || loginResult === false) return
     Bot.makeLog('warn', [`[${id}] 重新登录成功`], id)
 
     // login 成功后重新拦截 sendWs 和绑定 ws 监听（sessionManager 和 ws 可能被重建）
@@ -6728,7 +6709,10 @@ async connect (token) {
   ensureUserManageConfig(id)
   const existingBot = Bot[id]
   if (existingBot) {
+    existingBot.connectionGeneration = (existingBot.connectionGeneration || 0) + 1
     this.stopOfflineCheck(id)
+    existingBot.sdk._sessionLifecycle?.dispose()
+    existingBot._cancelLogin?.()
     try { await existingBot.logout() } catch (err) {
       Bot.makeLog('warn', [`[${id}] 替换账号配置时关闭旧连接失败`, err.message], id)
     }
@@ -6887,203 +6871,197 @@ async connect (token) {
     }
   }
 
-  const requestGatewayBotWithRetry = async (...args) => {
+  const requestGatewayBotWithRetry = async (signal, ...args) => {
     args = addUserAgentToRequestArgs(args)
+    args[0] = { ...args[0], signal, timeout: 15000 }
     const retryDelays = [3000, 5000, 8000]
     for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
       try {
-        return await originalRequestGet('/gateway/bot', ...args)
+        checkSessionRequest(signal)
+        const response = await originalRequestGet('/gateway/bot', ...args)
+        checkSessionRequest(signal)
+        return response
       } catch (err) {
+        checkSessionRequest(signal, err)
         if (isQQBotIpWhitelistError(err)) throw err
         if ((!isQQBotRateLimitError(err) && !isQQBotNetworkTimeoutError(err) && !isQQBotGatewayBusyError(err)) || attempt >= retryDelays.length) throw err
         const reason = isQQBotNetworkTimeoutError(err) ? '网络超时' : isQQBotGatewayBusyError(err) ? '系统繁忙' : '频率限制'
         Bot.makeLog('warn', [`[${id}] 获取 websocket 地址${reason}，${Math.round(retryDelays[attempt] / 1000)}秒后重试 (${attempt + 1}/${retryDelays.length})`, err.message], id)
-        await sleep(retryDelays[attempt])
+        await sessionDelay(retryDelays[attempt], undefined, { signal })
       }
     }
   }
 
+  let gatewayRequestPromise = null
+  let gatewayRequestSignal
   const originalRequestGet = sdk.request.get.bind(sdk.request)
+  const isCurrent = () => Bot[id]?.sdk === sdk && !Bot[id]?.disabledRuntime
+  const checkSessionRequest = (signal, err) => {
+    signal?.throwIfAborted()
+    if (!signal || !isCurrent() || sdk._sessionLifecycle.signal !== signal) {
+      throw new DOMException('Session request cancelled', 'AbortError')
+    }
+    if (err?.name === 'AbortError' || err?.code === 'ERR_CANCELED' || axios.isCancel(err)) throw err
+  }
+  const blockGatewayIp = (signal, err) => {
+    checkSessionRequest(signal, err)
+    gatewayIpBlocked = true
+    Bot.makeLog('error', [`[${id}] /gateway/bot 接口访问源IP不在白名单，已拒绝连接该机器人；请到 QQ 开放平台添加当前服务器出口 IP 白名单，配置不会删除，重启后会继续尝试`, err.response?.data || err.message], id)
+    this.disableBotRuntime(id, '接口访问源IP不在白名单')
+    throw new DOMException('Gateway IP blocked', 'AbortError')
+  }
   sdk.request.get = async function (url, ...args) {
-    try {
-      if (url === '/gateway/bot') return await requestGatewayBotWithRetry(...args)
-      return await originalRequestGet(url, ...addUserAgentToRequestArgs(args))
-    } catch (err) {
-      if (url === '/gateway/bot' && isQQBotCanceledError(err)) {
-        return enterDefaultWsMode(err.message)
-      }
-      if (url === '/gateway/bot' && isQQBotIpWhitelistError(err)) {
-        return await enterIpWhitelistBlockedMode(err.response?.data || err.message)
-      }
-      if (url === '/gateway/bot' && isQQBotRateLimitError(err)) {
-        return enterRateLimitedGatewayMode(err.message)
-      }
-      if (url === '/gateway/bot' && isQQBotNetworkTimeoutError(err)) {
-        return enterGatewayNetworkFallbackMode(err.message)
-      }
-      if (url === '/gateway/bot' && isQQBotGatewayBusyError(err)) {
-        return enterGatewayBusyFallbackMode(err.message)
-      }
-      if (url === '/gateway/bot' && isQQBotReadOnlyError(err)) {
-        return enterReadOnlyMode(err.message)
-      }
-      throw err
+    const signal = sdk._sessionLifecycle.signal
+    checkSessionRequest(signal)
+    if (url !== '/gateway/bot') {
+      const response = await originalRequestGet(url, ...addUserAgentToRequestArgs(args))
+      checkSessionRequest(signal)
+      return response
     }
+    if (!gatewayRequestPromise || gatewayRequestSignal !== signal) {
+      const promise = requestGatewayBotWithRetry(signal, ...args).catch(err => {
+        checkSessionRequest(signal, err)
+        if (isQQBotIpWhitelistError(err)) return blockGatewayIp(signal, err)
+        if (isQQBotCanceledError(err)) return enterDefaultWsMode(err.message)
+        if (isQQBotRateLimitError(err)) return enterRateLimitedGatewayMode(err.message)
+        if (isQQBotNetworkTimeoutError(err)) return enterGatewayNetworkFallbackMode(err.message)
+        if (isQQBotGatewayBusyError(err)) return enterGatewayBusyFallbackMode(err.message)
+        if (isQQBotReadOnlyError(err)) return enterReadOnlyMode(err.message)
+        throw err
+      }).finally(() => {
+        if (gatewayRequestPromise === promise) {
+          gatewayRequestPromise = null
+          gatewayRequestSignal = undefined
+        }
+      })
+      gatewayRequestSignal = signal
+      gatewayRequestPromise = promise
+    }
+    const response = await gatewayRequestPromise
+    checkSessionRequest(signal)
+    return response
   }
 
-  sdk.request.interceptors.response.use(res => res, err => {
-    if (isQQBotIpWhitelistError(err)) {
-      return Promise.resolve(enterIpWhitelistBlockedMode(err.response?.data || err.message))
+  // The SDK replaces Axios errors with plain Errors; retain their request owner.
+  for (const handler of sdk.request.interceptors.response.handlers) {
+    if (!handler?.rejected) continue
+    const rejected = handler.rejected
+    handler.rejected = async err => {
+      const requestConfig = err.config
+      if (!requestConfig) throw err
+      checkSessionRequest(requestConfig?._qqbotSessionSignal || requestConfig?.signal, err)
+      try {
+        const response = await rejected(err)
+        checkSessionRequest(requestConfig?._qqbotSessionSignal || requestConfig?.signal)
+        if (response && !response.config) response.config = requestConfig
+        return response
+      } catch (error) {
+        if (!error.config) error.config = requestConfig
+        if (!error.response) error.response = err.response
+        throw error
+      }
     }
-    if (isQQBotReadOnlyError(err.response?.data)) {
-      return Promise.resolve(enterReadOnlyMode(err.response?.data))
-    }
-    return Promise.reject(err)
+  }
+  sdk.request.interceptors.response.use(res => {
+    checkSessionRequest(res.config?._qqbotSessionSignal || res.config?.signal)
+    return res
+  }, err => {
+    const signal = err.config?._qqbotSessionSignal || err.config?.signal
+    if (!signal) throw err
+    checkSessionRequest(signal, err)
+    // Gateway fallback is part of its shared request promise.
+    if (err.config?.url === '/gateway/bot') throw err
+    if (isQQBotIpWhitelistError(err)) return blockGatewayIp(signal, err)
+    if (isQQBotReadOnlyError(err.response?.data)) return enterReadOnlyMode(err.response?.data)
+    throw err
   })
-  const originalGetWsUrl = sdk.sessionManager.getWsUrl.bind(sdk.sessionManager)
-  const originalCheckNeedToRestart = sdk.sessionManager.checkNeedToRestart.bind(sdk.sessionManager)
-  sdk.sessionManager.checkNeedToRestart = async function () {
-    if (gatewayIpBlocked) return false
-    const ret = await originalCheckNeedToRestart()
-    return gatewayIpBlocked ? false : ret
-  }
   sdk.sessionManager.getWsUrl = async function () {
-    try {
-      if (gatewayIpBlocked) return ''
-      return await originalGetWsUrl()
-    } catch (err) {
-      if (isQQBotIpWhitelistError(err)) {
-        await enterIpWhitelistBlockedMode(err.response?.data || err.message)
-        return ''
-      }
-      if (isQQBotCanceledError(err)) {
-        enterDefaultWsMode(err.message)
-        this.wsUrl = getQQBotApiEndpoints().wsUrl
-        this.shards = 1
-        return this.wsUrl
-      }
-      if (isQQBotRateLimitError(err)) {
-        enterRateLimitedGatewayMode(err.message)
-        this.wsUrl = getQQBotApiEndpoints().wsUrl
-        this.shards = 1
-        return this.wsUrl
-      }
-      if (!isQQBotReadOnlyError(err)) throw err
-      enterReadOnlyMode(err.message)
-      this.wsUrl = getQQBotApiEndpoints().wsUrl
-      this.shards = 1
-      return this.wsUrl
-    }
-  }
-   
-  if (config.bus?.[id]) {
-    let keys = Object.keys(config.bus)
-    const { appid } = opts
-    sdk.request.defaults.baseURL = getQQBotRequestBase(id)
-    const { SessionManager } = require('qq-official-bot/lib/sessionManager.js')
-    Object.assign(SessionManager.prototype, {
-      getWsUrl: async function () {
-        return new Promise((resolve) => {
-          const requestBusGateway = async () => {
-            const retryDelays = [3000, 5000, 8000]
-            for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
-              try {
-                return await this.bot.request.get('/gateway/bot', {
-              headers: {
-                Accept: '*/*',
-                'Accept-Encoding': 'utf-8',
-                'Accept-Language': 'zh-CN,zh;q=0.8',
-                Connection: 'keep-alive',
-                'User-Agent': getQQBotUserAgent(id) || 'v1',
-                Authorization: ''
-              }
-            })
-              } catch (err) {
-                if (isQQBotIpWhitelistError(err)) throw err
-                if ((!isQQBotRateLimitError(err) && !isQQBotNetworkTimeoutError(err) && !isQQBotGatewayBusyError(err)) || attempt >= retryDelays.length) throw err
-                const reason = isQQBotNetworkTimeoutError(err) ? '网络超时' : isQQBotGatewayBusyError(err) ? '系统繁忙' : '频率限制'
-                Bot.makeLog('warn', [`[${id}] 获取 websocket 地址${reason}，bus 分支 ${Math.round(retryDelays[attempt] / 1000)}秒后重试 (${attempt + 1}/${retryDelays.length})`, err.message], id)
-                await sleep(retryDelays[attempt])
-              }
-            }
-          }
-
-          requestBusGateway().then((res) => {
-            if (gatewayIpBlocked) {
-              resolve('')
-              return
-            }
-            if (!res.data?.url) throw new Error('获取ws连接信息异常')
-            this.wsUrl = keys.some(i => i == this.bot.config.real_self_id) 
-              ? `wss://${config.bus[id]}/ws?url=${res.data.url}&appid=${appid}` 
-              : res.data.url
-            logger.info(`WebSocket URL 已更新: ${this.wsUrl}`)
-            resolve(this.wsUrl)
-          }).catch((err) => {
-            if (isQQBotIpWhitelistError(err)) {
-              enterIpWhitelistBlockedMode(err.response?.data || err.message).then(() => resolve(''))
-              return
-            }
-            if (isQQBotRateLimitError(err)) {
-              const fallbackWsUrl = getQQBotApiEndpoints().wsUrl
-              Bot[id].gatewayRateLimitedMode = true
-              Bot.makeLog('warn', [`[${id}] 获取 websocket 地址连续触发频率限制，bus 分支使用默认 websocket 地址继续处理消息`, err.message], id)
-              this.wsUrl = keys.some(i => i == this.bot.config.real_self_id)
-                ? `wss://${config.bus[id]}/ws?url=${fallbackWsUrl}&appid=${appid}`
-                : fallbackWsUrl
-              resolve(this.wsUrl)
-              return
-            }
-            if (isQQBotNetworkTimeoutError(err)) {
-              const fallbackWsUrl = getQQBotApiEndpoints().wsUrl
-              Bot[id].gatewayNetworkFallbackMode = true
-              Bot.makeLog('warn', [`[${id}] 获取 websocket 地址网络超时，bus 分支使用默认 websocket 地址继续连接；请检查网络连通性`, err.message], id)
-              this.wsUrl = keys.some(i => i == this.bot.config.real_self_id)
-                ? `wss://${config.bus[id]}/ws?url=${fallbackWsUrl}&appid=${appid}`
-                : fallbackWsUrl
-              resolve(this.wsUrl)
-              return
-            }
-            if (isQQBotGatewayBusyError(err)) {
-              const fallbackWsUrl = getQQBotApiEndpoints().wsUrl
-              Bot[id].gatewayBusyFallbackMode = true
-              Bot.makeLog('warn', [`[${id}] 获取 websocket 地址系统繁忙，bus 分支使用默认 websocket 地址继续连接并等待自动重连恢复`, err.message], id)
-              this.wsUrl = keys.some(i => i == this.bot.config.real_self_id)
-                ? `wss://${config.bus[id]}/ws?url=${fallbackWsUrl}&appid=${appid}`
-                : fallbackWsUrl
-              resolve(this.wsUrl)
-              return
-            }
-            Bot.makeLog('error', [`[${id}] 获取 websocket 地址失败`, err.message], id)
-            resolve('')
-          })
-        })
-      }
+    const signal = sdk._sessionLifecycle.signal
+    checkSessionRequest(signal)
+    if (gatewayIpBlocked) throw new DOMException('Gateway IP blocked', 'AbortError')
+    const res = await sdk.request.get('/gateway/bot', {
+      headers: {
+        Accept: '*/*',
+        'Accept-Encoding': 'utf-8',
+        'Accept-Language': 'zh-CN,zh;q=0.8',
+        Connection: 'keep-alive',
+        'User-Agent': getQQBotUserAgent(id) || 'v1',
+        Authorization: ''
+      },
+      signal,
+      timeout: 15000
     })
+    checkSessionRequest(signal)
+    let wsUrl
+    try { wsUrl = new URL(res.data?.url) } catch { throw new Error('获取ws连接信息异常') }
+    if (!['ws:', 'wss:'].includes(wsUrl.protocol) || !wsUrl.hostname) throw new Error('获取ws连接信息异常')
+    let target = res.data.url
+    if (config.bus?.[id]) {
+      target = `wss://${config.bus[id]}/ws?url=${encodeURIComponent(target)}&appid=${encodeURIComponent(opts.appid)}`
+      const busUrl = new URL(target)
+      if (busUrl.protocol !== 'wss:' || !busUrl.hostname) throw new Error('Invalid bus WebSocket URL')
+    }
+    this.wsUrl = target
+    this.shards = Number(res.data.shards) || 1
+    return this.wsUrl
   }
 
   Bot[id] = {
     adapter: this,
     sdk,
+    connectionGeneration: (existingBot?.connectionGeneration || 0) + 1,
     login () {
       return new Promise((resolve, reject) => {
-        let settled = false
-        let timer
-        let readyPoll
+       let settled = false
+       let timer
+       let readyPoll
+        const sessionManager = this.sdk.sessionManager
+        const loginGeneration = this.connectionGeneration
+        const onReady = () => {
+          if (this.connectionGeneration !== loginGeneration || this.disabledRuntime) {
+            finishResolve(false)
+            return
+          }
+          clearInterval(readyPoll)
+          this.reconnectCount = 0
+          finishResolve()
+        }
+        const onDead = (data) => {
+          clearInterval(readyPoll)
+          const authError = getQQBotAuthError(data)
+          if (authError) {
+            Bot.makeLog('error', [`[${id}] ${authError}，中断连接`, data], id)
+            finishReject(new Error(authError))
+            return
+          }
+          if (isQQBotReadOnlyError(data)) {
+            this.readOnlyMode = true
+            Bot.makeLog('error', [`[${id}] 当前机器人为只读模式，只接收消息，不处理任何指令`, data], id)
+            finishResolve()
+            return
+          }
+          finishReject(new Error(data?.msg || 'connection dead'))
+        }
+        const cleanup = () => {
+          if (timer) clearTimeout(timer)
+          if (readyPoll) clearInterval(readyPoll)
+          try { sessionManager?.off?.('READY', onReady) } catch {}
+          try { sessionManager?.off?.('DEAD', onDead) } catch {}
+          if (this._cancelLogin) this._cancelLogin = null
+        }
         const finishResolve = (value) => {
           if (settled) return
           settled = true
-          if (timer) clearTimeout(timer)
-          if (readyPoll) clearInterval(readyPoll)
+          cleanup()
           resolve(value)
         }
         const finishReject = (err) => {
           if (settled) return
           settled = true
-          if (timer) clearTimeout(timer)
-          if (readyPoll) clearInterval(readyPoll)
+          cleanup()
           reject(err)
         }
+        this._cancelLogin = () => finishResolve(false)
         if (this.disabledRuntime) {
           finishResolve(false)
           return
@@ -7100,6 +7078,10 @@ async connect (token) {
             finishResolve(false)
             return
           }
+          if (this.connectionGeneration !== loginGeneration) {
+            finishResolve(false)
+            return
+          }
           finishReject(new Error('login timeout after 60s'))
         }, 60000)
 
@@ -7108,7 +7090,7 @@ async connect (token) {
             clearInterval(readyPoll)
             return
           }
-          if (this.disabledRuntime || gatewayIpBlocked) {
+          if (this.disabledRuntime || gatewayIpBlocked || this.connectionGeneration !== loginGeneration) {
             clearInterval(readyPoll)
             finishResolve(false)
             return
@@ -7121,32 +7103,13 @@ async connect (token) {
           }
         }, 1000)
         
-        this.sdk.sessionManager.once('READY', () => {
-          clearInterval(readyPoll)
-          this.reconnectCount = 0  // 登录成功，重置重连计数
-          finishResolve()
-        })
-        
-        this.sdk.sessionManager.once('DEAD', (data) => {
-          clearInterval(readyPoll)
-          const authError = getQQBotAuthError(data)
-          if (authError) {
-            Bot.makeLog('error', [`[${id}] ${authError}，中断连接`, data], id)
-            finishReject(new Error(authError))
-            return
-          }
-          if (isQQBotReadOnlyError(data)) {
-            this.readOnlyMode = true
-            Bot.makeLog('error', [`[${id}] 当前机器人为只读模式，只接收消息，不处理任何指令`, data], id)
-            return
-          }
-          finishReject(new Error(data.msg || 'connection dead'))
-        })
+        sessionManager.once('READY', onReady)
+        sessionManager.once('DEAD', onDead)
         
         // 捕获 start() 内部的异步错误（如 getAccessToken 失败）
         applyQQBotUserAgentPatch()
         this.sdk.start().then(() => {
-          if (gatewayIpBlocked || this.disabledRuntime) finishResolve(false)
+          if (gatewayIpBlocked || this.disabledRuntime || this.connectionGeneration !== loginGeneration) finishResolve(false)
         }).catch(err => {
           clearInterval(readyPoll)
           if (this.disabledRuntime) {
@@ -7292,114 +7255,99 @@ async connect (token) {
     }
   }
 
-   // ===== 拦截 sessionManager.start()，防止 SDK 内部重连抛出 unhandled rejection =====
-  const smForStart = Bot[id].sdk.sessionManager
-  const originalSmStart = smForStart.start.bind(smForStart)
-  smForStart.start = async function () {
-    try {
-      return await originalSmStart()
-    } catch (err) {
-      Bot.makeLog('error', [`[${id}] SDK 内部重连失败 (已捕获)`, err.message], id)
-      // 如果是 4009 或 timeout，交给我们自己的重连逻辑
-      if (!Bot[id]?.disabledRuntime && !Bot[id]?.isReconnecting) {
-        const offlineDetect = getOfflineDetectConfig(id)
-        if (offlineDetect.autoReconnect || offlineDetect.enabled) {
-          Bot.makeLog('warn', [`[${id}] 将由插件重连逻辑接管`], id)
-          adapter._doReconnect(id).catch(e => Bot.makeLog('error', [`[${id}] 插件重连也失败`, e.message], id))
-        }
-      }
+  // 接管 SDK 的连接生命周期，避免旧 start()/socket 在停用或替换后继续回调。
+  Bot[id].sdk._sessionLifecycle = installSessionLifecycle(Bot[id].sdk.sessionManager, {
+    isCurrent: () => Bot[id]?.sdk === sdk && !Bot[id]?.disabledRuntime,
+    onError: async err => {
+      if (Bot[id]?.disabledRuntime || Bot[id]?.sdk !== sdk) return
+      Bot.makeLog('error', [`[${id}] SDK 连接失败`, err?.message || String(err)], id)
     }
-  }
+  })
 
   // ===== 拦截 getAccessToken，添加重试机制和 token 过期检查 =====
-  const tokenSessionManager = Bot[id].sdk.sessionManager
-  const originalGetAccessToken = tokenSessionManager.getAccessToken.bind(tokenSessionManager)
-  
-  // 记录 token 过期时间
-  Bot[id].tokenExpireTime = 0
-  
-  tokenSessionManager.getAccessToken = async function () {
-    const retryDelays = [1, 3, 5, 7, 10]  // 第一轮重试延迟（秒）
-    const maxRounds = 5  // 最大轮数（25次重试）
-    const maxDelay = 60  // 最大延迟（秒）
-
-    let totalFailures = 0
-
-    const getTokenWithRetry = async (round = 0) => {
-      const delays = retryDelays.map(d => d + round * 10)  // 每轮增加10s
-
-      for (let i = 0; i < delays.length; i++) {
-        try {
-          const token = await new Promise((resolve, reject) => {
-            const { secret, appid } = this.bot.config
-            axios.post(getQQBotApiEndpoints().tokenUrl, {
-              appId: appid,
-              clientSecret: secret
-            }, { headers: withQQBotUserAgentHeaders(id) }).then(res => {
-              if (res.status === 200 && res.data && typeof res.data === "object" && res.data.access_token) {
-                resolve(res.data)
-              } else {
-                const authError = getQQBotAuthError(res.data)
-                const err = new Error(authError || 'Invalid response')
-                err.response = res
-                reject(err)
+  const tokenRuntime = Bot[id]
+  const tokenSessionManager = sdk.sessionManager
+  let tokenRefreshPromise = null
+  let tokenRefreshSignal
+  let cachedToken
+  tokenRuntime.tokenExpireTime = 0
+  tokenSessionManager.getAccessToken = async function (force = false) {
+    const signal = sdk._sessionLifecycle.signal
+    checkSessionRequest(signal)
+    if (tokenRefreshPromise && tokenRefreshSignal === signal) {
+      const token = await tokenRefreshPromise
+      checkSessionRequest(signal)
+      return token
+    }
+    if (!force && cachedToken && tokenSessionManager.access_token && tokenRuntime.tokenExpireTime > Date.now()) return cachedToken
+    const retryDelays = [1, 3, 5, 7, 10]
+    let failures = 0
+    const promise = Promise.resolve().then(async () => {
+      for (let round = 0; ; round++) {
+        for (let i = 0; i < retryDelays.length; i++) {
+          try {
+            checkSessionRequest(signal)
+            const { secret, appid } = sdk.config
+            const res = await axios.post(getQQBotApiEndpoints().tokenUrl, { appId: appid, clientSecret: secret }, { headers: withQQBotUserAgentHeaders(id), timeout: 15000, signal })
+            checkSessionRequest(signal)
+            if (res.status !== 200 || !res.data?.access_token) throw Object.assign(new Error(getQQBotAuthError(res.data) || 'Invalid response'), { response: res })
+            const expiresIn = Number(res.data.expires_in)
+            if (!Number.isFinite(expiresIn) || expiresIn <= 0) throw new Error('Invalid token expiry')
+            tokenSessionManager.access_token = res.data.access_token
+            tokenRuntime.tokenExpireTime = Date.now() + Math.max(0, expiresIn - 60) * 1000
+            cachedToken = res.data
+            sdk.logger.info(`[TOKEN] access_token 已刷新，过期时间: ${expiresIn}秒`)
+            return res.data
+          } catch (err) {
+            checkSessionRequest(signal, err)
+            const authError = getQQBotAuthError(err.response?.data)
+            if (authError) {
+              sdk.logger.error(`[TOKEN] ${authError}，中断连接`)
+              throw new Error(authError)
+            }
+            failures++
+            sdk.logger.warn(`[TOKEN] 获取 access_token 失败 (${failures}次)`)
+            const delay = Math.min(retryDelays[i] + round * 10, 60)
+            if (failures % 5 === 0 && getOfflineDetectConfig(id).notify) {
+              // Notification delivery must not hold the token request open on shutdown.
+              void sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前token已失效，(已经${failures}次失败)，${Math.min(delay + 2, 60)}s后继续`).catch(() => {})
+            }
+            if (failures >= 25) {
+              sdk.logger.error(`[TOKEN] 获取 access_token 失败已达上限 (${failures}次)，放弃连接`)
+              if (getOfflineDetectConfig(id).notify) {
+                void sendQQBotInternalMasterMsg(`[${id}] 获取token失败已达上限 (${failures}次)，请手动处理`).catch(() => {})
               }
-            }).catch(reject)
-          })
-
-          this.access_token = token.access_token
-          // 记录过期时间（提前60秒刷新，留出缓冲时间）
-          const expiresIn = parseInt(token.expires_in)
-          Bot[id].tokenExpireTime = Date.now() + (expiresIn - 60) * 1000
-          this.bot.logger.info(`[TOKEN] access_token 已刷新，过期时间: ${expiresIn}秒，将在 ${Math.round((expiresIn - 60) / 60)} 分钟后刷新`)
-          return token
-        } catch (err) {
-          const authError = getQQBotAuthError(err.response?.data)
-          if (authError) {
-            this.bot.logger.error(`[TOKEN] ${authError}，中断连接`, err.response?.data)
-            throw new Error(authError)
-          }
-
-          totalFailures++
-          this.bot.logger.warn(`[TOKEN] 获取 access_token 失败 (${totalFailures}次): ${err.message}`)
-
-          // 每5次失败发送通知
-          if (totalFailures % 5 === 0) {
-            const offlineDetect = getOfflineDetectConfig(id)
-            if (offlineDetect.notify) {
-              try {
-                await sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前token已失效，(已经${totalFailures}次失败)，${Math.min(delays[i] + 2, maxDelay)}s后继续`)
-              } catch {}
+              throw new Error(`getAccessToken failed after ${failures} retries`)
             }
+            sdk.logger.warn(`[TOKEN] ${delay}s 后重试...`)
+            await sessionDelay(delay * 1000, undefined, { signal })
           }
-
-          // 检查是否达到最大重试次数
-          if (totalFailures >= maxRounds * retryDelays.length) {
-            this.bot.logger.error(`[TOKEN] 获取 access_token 失败已达上限 (${totalFailures}次)，放弃连接`)
-            if (getOfflineDetectConfig(id).notify) {
-              try {
-                await sendQQBotInternalMasterMsg(`[${id}] 获取token失败已达上限 (${totalFailures}次)，请手动处理`)
-              } catch {}
-            }
-            throw new Error(`getAccessToken failed after ${totalFailures} retries`)
-          }
-
-          // 等待后重试
-          const delay = Math.min(delays[i], maxDelay)
-          this.bot.logger.warn(`[TOKEN] ${delay}s 后重试...`)
-          await new Promise(resolve => setTimeout(resolve, delay * 1000))
         }
       }
-
-      // 当前轮失败，递归进入下一轮
-      return getTokenWithRetry(round + 1)
-    }
-
-    return getTokenWithRetry()
+    }).finally(() => {
+      if (tokenRefreshPromise === promise) {
+        tokenRefreshPromise = null
+        tokenRefreshSignal = undefined
+      }
+    })
+    tokenRefreshSignal = signal
+    tokenRefreshPromise = promise
+    const token = await promise
+    checkSessionRequest(signal)
+    return token
   }
-  
+
   // 添加 axios 请求拦截器，在请求前检查 token 是否过期
-  Bot[id].sdk.request.interceptors.request.use(async (config) => {
+  sdk.request.interceptors.request.use(async (config) => {
+    const signal = sdk._sessionLifecycle.signal
+    checkSessionRequest(signal)
+    config.signal?.throwIfAborted()
+    if (config.signal && config.signal !== signal) {
+      config.signal = AbortSignal.any([config.signal, signal])
+    } else {
+      config.signal = signal
+    }
+    config._qqbotSessionSignal = signal
     const requestUrl = String(config.url || '')
     if (/\/v2\/groups\/(?:\/|$)/.test(requestUrl)) {
       const err = new Error(`已阻止缺少群openid的QQBot请求: ${requestUrl}`)
@@ -7408,37 +7356,43 @@ async connect (token) {
     }
     config.data = stripQQBotMessageReference(requestUrl, config.data, isQQBotInternalSend(), getBotConfigValue(id, 'markdownReference'))
     // 如果 token 即将过期（60秒内），先刷新
-    if (Bot[id].tokenExpireTime && Date.now() > Bot[id].tokenExpireTime) {
-      Bot.makeLog('warn', [`[${id}] Token 即将过期，正在刷新...`], id)
+    if ((tokenRefreshPromise && tokenRefreshSignal === signal) || !tokenSessionManager.access_token || Date.now() >= tokenRuntime.tokenExpireTime) {
       try {
         await tokenSessionManager.getAccessToken()
       } catch (err) {
-        Bot.makeLog('error', [`[${id}] 刷新 Token 失败`, err.message], id)
+        checkSessionRequest(signal, err)
+        Bot.makeLog('error', [`[${id}] 刷新 Token 失败`], id)
+        throw err
       }
     }
+    checkSessionRequest(signal)
+    config.signal.throwIfAborted()
     return config
   })
-  const originalSdkRequest = Bot[id].sdk.request.request.bind(Bot[id].sdk.request)
-  const refreshAccessTokenImmediately = async () => {
-    if (!Bot[id].tokenRefreshPromise) {
-      Bot[id].tokenRefreshPromise = tokenSessionManager.getAccessToken()
-        .finally(() => { Bot[id].tokenRefreshPromise = null })
-    }
-    return Bot[id].tokenRefreshPromise
-  }
-  Bot[id].sdk.request.request = async function (configOrUrl, requestConfig) {
+  const originalSdkRequest = sdk.request.request.bind(sdk.request)
+  const refreshAccessTokenImmediately = () => tokenSessionManager.getAccessToken(true)
+  sdk.request.request = async function (configOrUrl, requestConfig) {
+    const signal = sdk._sessionLifecycle.signal
+    checkSessionRequest(signal)
     try {
-      return await originalSdkRequest(configOrUrl, requestConfig)
+      const response = await originalSdkRequest(configOrUrl, requestConfig)
+      checkSessionRequest(signal)
+      return response
     } catch (err) {
+      checkSessionRequest(signal, err)
       if (!isQQBotTokenExpiredError(err)) throw err
       Bot.makeLog('warn', [`[${id}] API 返回 11244，立即刷新 Token 后重试一次`], id)
       try {
         await refreshAccessTokenImmediately()
+        checkSessionRequest(signal)
       } catch (refreshErr) {
-        Bot.makeLog('error', [`[${id}] 11244 后刷新 Token 失败`, refreshErr.message], id)
+        checkSessionRequest(signal, refreshErr)
+        Bot.makeLog('error', [`[${id}] 11244 后刷新 Token 失败`], id)
         throw err
       }
-      return originalSdkRequest(configOrUrl, requestConfig)
+      const response = await originalSdkRequest(configOrUrl, requestConfig)
+      checkSessionRequest(signal)
+      return response
     }
   }
   // ===== getAccessToken 拦截结束 =====
