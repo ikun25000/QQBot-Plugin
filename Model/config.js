@@ -10,6 +10,13 @@ let { config, configSave } = await makeConfig('QQBot', {
   toQRCode: true,
   toCallback: false,
   toBotUpload: true,
+  markdownImageConvert: false,
+  imageFallback: {
+    provider: 'official',
+    autoCleanup: true,
+    retentionDays: 3,
+    quotaPolicy: 'cleanup'
+  },
   forceSilk: true,
   audioErrorFallback: true,
   audioErrorFallbackPriority: 'file',
