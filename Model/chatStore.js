@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import { join } from 'node:path'
 import { getTime, pluginPath } from './common.js'
+import { isKnownQQBotOpenid } from './messageIdentity.js'
 
 const JSON_DATA_DIR = join(process.cwd(), 'data', 'QQBotChat')
 const LEVEL_DATA_DIR = join(pluginPath, 'db', 'chat')
@@ -380,7 +381,7 @@ class ChatStore {
   }
 
   async setGroupMemberLeft (selfId = '', groupOpenid = '', userOpenid = '', left = false) {
-    if (!selfId || !groupOpenid || !userOpenid) return false
+    if (!selfId || !groupOpenid || !isKnownQQBotOpenid(userOpenid)) return false
     this._maybeCleanup()
     const key = this._makeLeftMemberKey(selfId, groupOpenid, userOpenid)
     if (left) {
@@ -404,7 +405,7 @@ class ChatStore {
   }
 
   async recordUserMessage (selfId = '', userOpenid = '', scope = '', targetOpenid = '', timestamp = '', extra = {}) {
-    if (!selfId || !userOpenid || !['group', 'private'].includes(scope)) return null
+    if (!selfId || !isKnownQQBotOpenid(userOpenid) || !['group', 'private'].includes(scope)) return null
     this._maybeCleanup()
     let date = parseTimestamp(timestamp)
     if (!Number.isNaN(date.getTime()) && date.getTime() > Date.now() + 24 * 60 * 60 * 1000) date = new Date()
@@ -444,7 +445,7 @@ class ChatStore {
   }
 
   async recordGroupRank (selfId = '', groupOpenid = '', userOpenid = '', timestamp = '', extra = {}) {
-    if (!selfId || !groupOpenid || !userOpenid) return false
+    if (!selfId || !groupOpenid || !isKnownQQBotOpenid(userOpenid)) return false
     this._maybeCleanup()
     let date = parseTimestamp(timestamp)
     if (!Number.isNaN(date.getTime()) && date.getTime() > Date.now() + 24 * 60 * 60 * 1000) date = new Date()
