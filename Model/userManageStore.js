@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import { join } from 'node:path'
 import { pluginPath } from './common.js'
+import { isKnownQQBotOpenid } from './messageIdentity.js'
 
 const LEVEL_DATA_DIR = join(pluginPath, 'db', 'userManage')
 const JSON_DATA_DIR = join(process.cwd(), 'data', 'QQBotUserManage')
@@ -713,7 +714,7 @@ class UserManageStore {
   }
 
   recordUser (selfId = '', userOpenid = '', info = {}) {
-    if (!selfId || !userOpenid || String(userOpenid).startsWith('qg_')) return null
+    if (!selfId || !isKnownQQBotOpenid(userOpenid) || String(userOpenid).startsWith('qg_')) return null
     const key = this._key(selfId, userOpenid)
     return this._queueEntityWrite('user', key, () => this._recordUser(selfId, userOpenid, info, key))
   }
@@ -773,7 +774,7 @@ class UserManageStore {
   }
 
   async _recordHistory (selfId = '', targetOpenid = '', msg = {}) {
-    if (!selfId || !targetOpenid || String(targetOpenid).startsWith('qg')) return false
+    if (!selfId || !isKnownQQBotOpenid(targetOpenid) || String(targetOpenid).startsWith('qg')) return false
     await this._ensureLegacyRecentIndex(selfId, (msg.type || 'group') === 'group' ? 'group' : 'user')
     const key = this._historyKey(selfId, targetOpenid, msg.type || 'group')
     const list = await this._loadHistory(key)
@@ -1116,6 +1117,7 @@ class UserManageStore {
   }
 
   async setBlackUser (selfId = '', openid = '', operator = '', enabled = true, reason = '') {
+    if (!selfId || !isKnownQQBotOpenid(openid)) return false
     const key = this._key(selfId, openid)
     if (enabled) this._data.blacklistUsers[key] = { self_id: selfId, openid, operator, reason: safeText(reason || '', 200), time: nowIso() }
     else delete this._data.blacklistUsers[key]
@@ -1131,12 +1133,13 @@ class UserManageStore {
 
   isBlackUser (selfId = '', openid = '') { return !!this._data.blacklistUsers[this._key(selfId, openid)] }
   isBlackGroup (selfId = '', openid = '') { return !!this._data.blacklistGroups[this._key(selfId, openid)] }
-  getBlackUser (selfId = '', openid = '') { return this._data.blacklistUsers[this._key(selfId, openid)] || null }
+  getBlackUser (selfId = '', openid = '') { return isKnownQQBotOpenid(openid) ? this._data.blacklistUsers[this._key(selfId, openid)] || null : null }
   getBlackGroup (selfId = '', openid = '') { return this._data.blacklistGroups[this._key(selfId, openid)] || null }
   listBlackUsers (selfId = '', page = 1, size = 10) { return pageSlice(Object.values(this._data.blacklistUsers).filter(i => i.self_id === selfId), page, size) }
   listBlackGroups (selfId = '', page = 1, size = 10) { return pageSlice(Object.values(this._data.blacklistGroups).filter(i => i.self_id === selfId), page, size) }
 
   async setPendingCancel (selfId = '', openid = '', code = '') {
+    if (!selfId || !isKnownQQBotOpenid(openid)) return null
     const now = Date.now()
     const entries = Object.entries(this._data.pendingCancels)
       .filter(([, item]) => item?.self_id === selfId)
@@ -1174,6 +1177,7 @@ class UserManageStore {
   }
 
   async startCancel (selfId = '', openid = '', days = 7, blockDays = 3650, extra = {}) {
+    if (!selfId || !isKnownQQBotOpenid(openid)) return null
     const key = this._key(selfId, openid)
     const item = { self_id: selfId, openid, requested_at: nowIso(), cancel_at: Date.now() + days * 86400000, block_until: Date.now() + (days + blockDays) * 86400000, days, blockDays, withdrawn: false, forced: extra.forced === true, operator: extra.operator || '', reason: safeText(extra.reason || '', 200) }
     this._data.cancellations[key] = item
@@ -1182,6 +1186,7 @@ class UserManageStore {
   }
 
   getCancel (selfId = '', openid = '') {
+    if (!isKnownQQBotOpenid(openid)) return null
     const item = this._data.cancellations[this._key(selfId, openid)]
     if (!item || item.withdrawn) return null
     return item
@@ -1204,7 +1209,7 @@ class UserManageStore {
   _fullGroupEventKey (selfId, groupOpenid) { return `${selfId}:${groupOpenid}` }
 
   async recordFullBinding (selfId = '', userOpenid = '', groupOpenid = '', info = {}) {
-    if (!selfId || !userOpenid || !groupOpenid) return null
+    if (!selfId || !isKnownQQBotOpenid(userOpenid) || !groupOpenid) return null
     const key = this._fullBindingKey(selfId, userOpenid, groupOpenid)
     const old = this._data.fullBindings[key] || {}
     const item = {
