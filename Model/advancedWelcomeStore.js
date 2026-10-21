@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import { join } from 'node:path'
 import { pluginPath } from './common.js'
+import { isKnownQQBotOpenid } from './messageIdentity.js'
 
 const JSON_DATA_DIR = join(process.cwd(), 'data', 'QQBotAdvancedWelcome')
 const LEVEL_DATA_DIR = join(pluginPath, 'db', 'advancedWelcome')
@@ -729,6 +730,7 @@ class AdvancedWelcomeStore {
   _pendingKey (selfId, groupOpenid, userOpenid) { return `${selfId}:${groupOpenid}:${userOpenid}` }
 
   async setPendingComplaint (selfId = '', groupOpenid = '', userOpenid = '', code = '') {
+    if (!selfId || !groupOpenid || !isKnownQQBotOpenid(userOpenid)) return null
     const deletes = this._removeExpired()
     const key = this._pendingKey(selfId, groupOpenid, userOpenid)
     const item = { self_id: selfId, group_openid: groupOpenid, user_openid: userOpenid, code, expire_at: Date.now() + 60000, created_at: nowIso() }
@@ -779,6 +781,7 @@ class AdvancedWelcomeStore {
   }
 
   async addComplaint (selfId = '', groupOpenid = '', userOpenid = '') {
+    if (!selfId || !groupOpenid || !isKnownQQBotOpenid(userOpenid)) return { added: false, item: null }
     const item = this.getGroup(selfId, groupOpenid, true)
     if (!item.complaints || typeof item.complaints !== 'object') item.complaints = {}
     if (!item.withdrawn_complaints || typeof item.withdrawn_complaints !== 'object') item.withdrawn_complaints = {}
@@ -791,6 +794,7 @@ class AdvancedWelcomeStore {
   }
 
   async withdrawComplaint (selfId = '', groupOpenid = '', userOpenid = '') {
+    if (!selfId || !groupOpenid || !isKnownQQBotOpenid(userOpenid)) return { withdrawn: false, item: null }
     const item = this.getGroup(selfId, groupOpenid, true)
     if (!item.complaints?.[userOpenid]) return { withdrawn: false, item }
     if (!item.withdrawn_complaints || typeof item.withdrawn_complaints !== 'object') item.withdrawn_complaints = {}
