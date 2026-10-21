@@ -1,5 +1,6 @@
 import advancedWelcomeStore from './advancedWelcomeStore.js'
 import groupInfoStore from './groupInfoStore.js'
+import { isKnownQQBotOpenid, UNKNOWN_OPENID } from './messageIdentity.js'
 
 function limitButtonRows (rows) {
   return rows
@@ -81,7 +82,8 @@ function buttonTextWarnings (button) {
 }
 
 function replaceWelcomeVariables (text = '', context = {}) {
-  return String(text || '').replace(/<@openid>/g, `<@${context.memberOpenid || ''}>`)
+  const mention = isKnownQQBotOpenid(context.memberOpenid) ? `<@${context.memberOpenid}>` : UNKNOWN_OPENID
+  return String(text || '').replace(/<@openid>/g, mention)
 }
 
 function getAdvancedWelcomeMenuMsg (config, selfId = '') {
