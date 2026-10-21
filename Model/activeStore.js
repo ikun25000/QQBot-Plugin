@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import { join } from 'node:path'
 import { pluginPath } from './common.js'
+import { isKnownQQBotOpenid } from './messageIdentity.js'
 
 const LEVEL_DATA_DIR = join(pluginPath, 'db', 'active')
 const JSON_DATA_DIR = join(process.cwd(), 'data', 'QQBotActive')
@@ -154,7 +155,7 @@ class ActiveStore {
   }
 
   _record (selfId = '', groupOpenid = '', userOpenid = '', type = 'activeat', detailed = false) {
-    if (!selfId || !groupOpenid || !userOpenid || !['activeat', 'activenoat'].includes(type)) return Promise.resolve(null)
+    if (!selfId || !groupOpenid || !isKnownQQBotOpenid(userOpenid) || !['activeat', 'activenoat'].includes(type)) return Promise.resolve(null)
     const groupKey = this._groupKey(selfId, groupOpenid)
     const previous = this._queues.get(groupKey) || Promise.resolve()
     const pending = previous.catch(() => {}).then(async () => {
@@ -194,7 +195,7 @@ class ActiveStore {
   }
 
   rollback (selfId = '', groupOpenid = '', userOpenid = '', type = 'activenoat', token = 0) {
-    if (!selfId || !groupOpenid || !userOpenid || !['activeat', 'activenoat'].includes(type) || !token) return Promise.resolve(null)
+    if (!selfId || !groupOpenid || !isKnownQQBotOpenid(userOpenid) || !['activeat', 'activenoat'].includes(type) || !token) return Promise.resolve(null)
     const groupKey = this._groupKey(selfId, groupOpenid)
     const previous = this._queues.get(groupKey) || Promise.resolve()
     const pending = previous.catch(() => {}).then(async () => {
