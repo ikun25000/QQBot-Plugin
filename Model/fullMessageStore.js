@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import { join } from 'node:path'
 import { pluginPath } from './common.js'
+import { isKnownQQBotOpenid } from './messageIdentity.js'
 
 const JSON_DATA_DIR = join(process.cwd(), 'data', 'QQBotFullMessage')
 const LEVEL_DATA_DIR = join(pluginPath, 'db', 'fullMessage')
@@ -352,7 +353,7 @@ class FullMessageStore {
   }
 
   async setMemberNickname (selfId = '', memberOpenid = '', nickname = '', extra = {}) {
-    if (!selfId || !memberOpenid || !nickname) return false
+    if (!selfId || !isKnownQQBotOpenid(memberOpenid) || !nickname) return false
     if (!this.meta.memberNicknames || typeof this.meta.memberNicknames !== 'object') this.meta.memberNicknames = {}
     const key = `${selfId}:${memberOpenid}`
     const current = this.meta.memberNicknames[key]
