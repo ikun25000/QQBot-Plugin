@@ -12,6 +12,14 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFile } from 'node:child_process'
 import { setTimeout as sessionDelay } from 'node:timers/promises'
 import { installSessionLifecycle } from './Model/sessionLifecycle.js'
+import { groupProactiveResultStore } from './Model/groupProactiveResultStore.js'
+import { UNKNOWN_OPENID, isKnownQQBotOpenid, getQQBotMessageUserOpenid, displayQQBotOpenid } from './Model/messageIdentity.js'
+import { createReadOnlyRecovery } from './Model/readOnlyRecovery.js'
+import { createQQBotMessageTask, runQQBotMessageStep, assertQQBotMessageTask } from './Model/messageProcessing.js'
+import { MediaImageApi, mediaErrorText } from './Model/mediaImageApi.js'
+import { MediaImageStore } from './Model/mediaImageStore.js'
+import { MediaImageManager, mediaImageSettings } from './Model/mediaImageManager.js'
+import { handleMediaImageCommand, handleImageConvertCommand } from './Model/mediaImageCommands.js'
 import {
   Dau,
   importJS,
@@ -640,19 +648,33 @@ function enqueueQQBotMessage (adapter, id, event) {
   const sep = adapter.sep || ':'
   const source = getQQBotMessageQueueSource(id, event, sep)
   let state = qqbotMessageQueues.get(id)
+  const owner = Bot[id]
+  if (state && (state.owner !== owner || state.generation !== owner?.connectionGeneration)) {
+    clearQQBotMessageQueue(id)
+    state = null
+  }
   if (!state) {
-    state = { active: 0, queue: [], lastWarnAt: 0 }
+    state = { active: 0, queue: [], lastWarnAt: 0, owner, generation: owner?.connectionGeneration, tasks: new Set(), closed: false }
     qqbotMessageQueues.set(id, state)
   }
   const runNext = () => {
+    if (state.closed) return
     while (state.active < QQBOT_MESSAGE_CONCURRENCY && state.queue.length) {
       const next = state.queue.shift()
       state.active++
-      Promise.resolve(adapter.makeMessage(id, next)).catch(err => {
-        Bot.makeLog('error', [`[${id}] 消息处理失败`, err.message || String(err)], id)
+      const task = createQQBotMessageTask({
+        id,
+        isCurrent: () => !state.closed && Bot[id] === owner && !owner?.disabledRuntime && owner?.connectionGeneration === state.generation,
+        onStage: stage => noteQQBotMessagePhase(id, stage, next)
+      })
+      state.tasks.add(task)
+      task.run(() => adapter.makeMessage(id, next)).catch(err => {
+        Bot.makeLog(err?.name === 'AbortError' ? 'debug' : 'error', [`[${id}] 消息处理${err?.name === 'AbortError' ? '取消' : '失败'}`, { stage: task.stage, message: err?.message || String(err) }], id)
       }).finally(() => {
+        state.tasks.delete(task)
         state.active--
-        if (!state.active && !state.queue.length) qqbotMessageQueues.delete(id)
+        if (state.closed) return
+        if (!state.active && !state.queue.length && qqbotMessageQueues.get(id) === state) qqbotMessageQueues.delete(id)
         else runNext()
       })
     }
@@ -706,6 +728,39 @@ function enqueueQQBotMessage (adapter, id, event) {
   state.queue.push(event)
   runNext()
   return true
+}
+
+function clearQQBotMessageQueue (id) {
+  const state = qqbotMessageQueues.get(id)
+  if (!state) return
+  state.closed = true
+  state.queue.length = 0
+  for (const task of state.tasks) task.cancel()
+  if (qqbotMessageQueues.get(id) === state) qqbotMessageQueues.delete(id)
+}
+
+function noteQQBotMessagePhase (id, phase, event = {}) {
+  const runtime = Bot[id]
+  if (!runtime) return
+  runtime.messageHealth ||= { counts: {}, last: {} }
+  const health = runtime.messageHealth
+  health.counts[phase] = (health.counts[phase] || 0) + 1
+  health.last[phase] = Date.now()
+  const state = qqbotMessageQueues.get(id)
+  health.active = state?.active || 0
+  health.queued = state?.queue.length || 0
+  Bot.makeLog('debug', [`[${id}] 消息处理阶段`, { phase, message_id: event.id || event.message_id || '', type: event.message_type || event._qqbotRawEvent || '', active: health.active, queued: health.queued }], id)
+}
+
+async function recordQQBotMessageDau (data, type) {
+  const runtime = Bot[data.self_id]
+  if (!runtime || runtime.dauReady === false) return
+  try {
+    await runQQBotMessageStep(data.self_id, type === 'send_msg' ? 'dau-send' : 'dau-receive', () => runtime.dau.setDau(type, data), { optional: true })
+  } catch (error) {
+    // Accounting cannot turn an already successful send into a send failure.
+    if (type !== 'send_msg' || error?.name !== 'AbortError') throw error
+  }
 }
 
 function stripAttachmentPlaceholders (text) {
@@ -798,8 +853,16 @@ function stripBotNameMentionText (text, botNames = []) {
 function stripSelfMentionTags (text, mentions = []) {
   if (typeof text !== 'string' || !text.includes('<@') || !Array.isArray(mentions)) return text
   const selfMentionIds = mentions
-    .filter(mention => mention?.bot === true && mention?.is_you === true && mention?.id)
-    .map(mention => escapeRegExp(mention.id))
+    .filter(mention => mention?.bot === true && mention?.is_you === true)
+    .map(mention => [mention.id, mention.member_openid].find(isKnownQQBotOpenid))
+    .filter(Boolean).map(escapeRegExp)
+  // A single explicitly identified self mention has no positional ambiguity.
+  // Recover text stripping only; never infer the author or persist a self OpenID.
+  const tags = [...text.matchAll(/<@([^>]+)>/g)]
+  if (!selfMentionIds.length && mentions.length === 1 && mentions[0]?.bot === true &&
+      mentions[0]?.is_you === true && tags.length === 1 && tags[0][1] !== 'all' && isKnownQQBotOpenid(tags[0][1])) {
+    selfMentionIds.push(escapeRegExp(tags[0][1]))
+  }
   if (!selfMentionIds.length) return text
 
   const mentionTag = '<@[^>]+>'
@@ -1132,6 +1195,7 @@ function avoidChinaMobileNumber (value = '') {
 }
 
 function makeVirtualAtId (selfId = '', openid = '') {
+  if (!isKnownQQBotOpenid(openid)) return ''
   if (!/^[A-Za-z0-9_-]+$/.test(String(openid || ''))) return ''
   const cached = inviteStore.getAtVirtualId(selfId, openid)
   if (cached?.id && cached.version === VIRTUAL_AT_ID_VERSION && !hasChinaMobileNumber(cached.id)) return cached.id
@@ -1233,6 +1297,8 @@ function makeQQBotJsonCodeBlock (value) {
   return `${fence}json\n${json}\n${fence}`
 }
 
+const groupProactiveActiveRuns = new Map()
+
 function ensureGroupProactiveConfig (selfId = '') {
   if (!config.groupProactive || typeof config.groupProactive !== 'object' || Array.isArray(config.groupProactive)) config.groupProactive = { bots: {} }
   if (!config.groupProactive.bots || typeof config.groupProactive.bots !== 'object' || Array.isArray(config.groupProactive.bots)) config.groupProactive.bots = {}
@@ -1242,8 +1308,6 @@ function ensureGroupProactiveConfig (selfId = '') {
   if (typeof settings.markdown !== 'string') settings.markdown = ''
   if (typeof settings.buttonEnabled !== 'boolean') settings.buttonEnabled = false
   if (!settings.button || typeof settings.button !== 'object') settings.button = null
-  if (!Array.isArray(settings.results)) settings.results = []
-  settings.results = settings.results.slice(0, 100)
   return settings
 }
 
@@ -1584,12 +1648,65 @@ async function uploadToTencentCosFallback (buffer, selfId = '') {
     timeout: 30000
   })
   if (uploadRes.status !== 200) throw new Error(`腾讯COS上传返回状态码: ${uploadRes.status}`)
-  Bot.makeLog?.('warn', ['默认图床为本地地址，已使用腾讯COS图床兜底', url], selfId)
+  Bot.makeLog?.('info', ['已使用腾讯云 CI 图床', url], selfId)
   return url
 }
 
 function shouldUseCosFallback (url = '') {
   return !Handler.has('QQBot.makeMarkdownImage') && (!url || isLocalhostUrl(url) || (isConfiguredServerLocalhost() && isLocalhostUrl(url)))
+}
+
+function getQQBotMediaSettings (selfId) {
+  return mediaImageSettings(config.bots?.[selfId]?.imageFallback || config.imageFallback)
+}
+
+function getQQBotMediaContext (selfId) {
+  const runtime = Bot[selfId], sdk = runtime?.sdk
+  const appid = String(sdk?.config?.appid || runtime?.info?.appid || '')
+  if (!sdk || !/^\d+$/.test(appid) || runtime.disabledRuntime) throw new Error('当前机器人暂无可用的素材接口身份')
+  const validate = () => {
+    if (Bot[selfId] !== runtime || runtime.sdk !== sdk || runtime.disabledRuntime || String(sdk.config?.appid || runtime.info?.appid) !== appid) throw new Error('素材请求所属账号已失效')
+  }
+  return {
+    selfId, appid, validate,
+    api: new MediaImageApi({
+      transport: options => axios.request(options), validate,
+      getToken: async () => {
+        validate()
+        if (sdk.sessionManager?.access_token && runtime.tokenExpireTime > Date.now()) return sdk.sessionManager.access_token
+        const result = await sdk.sessionManager.getAccessToken()
+        validate()
+        const token = result?.access_token || sdk.sessionManager.access_token
+        if (!token) throw new Error('官方素材请求缺少访问凭据')
+        return token
+      }
+    })
+  }
+}
+
+const qqbotMediaStore = new MediaImageStore()
+const qqbotMediaManager = new MediaImageManager({
+  store: qqbotMediaStore, context: getQQBotMediaContext, settings: getQQBotMediaSettings,
+  customLoaded: () => Handler.has('QQBot.makeMarkdownImage'), ciUpload: uploadToTencentCosFallback,
+  pinned: appid => {
+    // Search saved settings for this app's accounts and global templates; not message history.
+    const ids = (config.token || []).map(value => String(value).split(':')).filter(parts => parts[1] === appid).map(parts => parts[0])
+    const saved = Object.fromEntries(Object.entries(config).filter(([key]) => !['token', 'bots'].includes(key)))
+    saved.bots = Object.fromEntries(ids.map(id => [id, config.bots?.[id]]))
+    return JSON.stringify(saved)
+  },
+  log: (level, id, message) => Bot.makeLog(level, [`[${id}] ${message}`], id)
+})
+const qqbotMediaConfirmations = new Map()
+
+async function getQQBotCustomImageBedStatus () {
+  if (!Handler.has('QQBot.makeMarkdownImage')) return '未加载'
+  try {
+    const { default: loader } = await import('../../lib/plugins/loader.js')
+    const names = (loader.priority || []).filter(item => item.plugin?.handler?.some?.(h => h.key === 'QQBot.makeMarkdownImage')).map(item => item.key).filter(Boolean)
+    if (names.length) return `已加载：${[...new Set(names)].join('、')}`
+  } catch {}
+  return '已加载（QQBot.makeMarkdownImage，来源名称不可用）'
 }
 
 function getButtonJsonHelpMsg (selfId, scope = '') {
@@ -1627,6 +1744,8 @@ const PER_BOT_CONFIG_KEYS = [
   'toQRCode',
   'toCallback',
   'toBotUpload',
+  'markdownImageConvert',
+  'imageFallback',
   'forceSilk',
   'audioErrorFallback',
   'audioErrorFallbackPriority',
@@ -1652,7 +1771,7 @@ function ensureBotConfig (selfId = '') {
 
   for (const cfgKey of PER_BOT_CONFIG_KEYS) {
     if (typeof botConfig[cfgKey] === 'undefined' && typeof config[cfgKey] !== 'undefined') {
-      if (cfgKey === 'offlineDetect') botConfig[cfgKey] = { ...(config[cfgKey] || {}) }
+      if (cfgKey === 'offlineDetect' || cfgKey === 'imageFallback') botConfig[cfgKey] = { ...(config[cfgKey] || {}) }
       else botConfig[cfgKey] = config[cfgKey]
     }
   }
@@ -1899,9 +2018,9 @@ function normalizeQQBotMemberRole (role = '', isBot = false) {
 }
 
 function makeSafeQQBotMember (data = {}, raw = {}) {
-  const role = normalizeQQBotMemberRole(raw.member_role || raw.role || data.member?.role, raw.bot === true)
   const nickname = raw.username || raw.nickname || raw.card || data.member?.nickname || data.sender?.nickname || data.sender?.card || ''
   const userId = raw.id || raw.member_openid || raw.user_id || data.user_id || ''
+  const role = normalizeQQBotMemberRole(isKnownQQBotOpenid(userId) ? raw.member_role || raw.role || data.member?.role : '', raw.bot === true)
   return {
     user_id: userId,
     self_id: data.self_id || '',
@@ -2224,7 +2343,7 @@ async function getQQBotMeByCredentials (appid, secret, selfId = '') {
 
 function normalizeQQBotOpenid (value = '') {
   const text = String(value || '')
-  if (!text) return ''
+  if (!isKnownQQBotOpenid(text)) return ''
   const prefixed = text.match(/^\d{10}.(.+)$/)
   return prefixed?.[1] || text
 }
@@ -2305,7 +2424,11 @@ function patchGroupMessageCreateEvent () {
       QQBotClass.prototype.dispatchEvent = function (event, wsRes) {
         if (wsRes?.d && typeof event === 'string') {
           const selfId = this.config?.real_self_id || this.self_id || wsRes.d.self_id || ''
-          if (shouldDropQQBotRawEvent(selfId, event, wsRes.d)) return
+          if (event === 'C2C_MESSAGE_CREATE' || event === 'GROUP_MESSAGE_CREATE' || event === 'GROUP_AT_MESSAGE_CREATE') noteQQBotMessagePhase(selfId, 'raw', wsRes.d)
+          if (shouldDropQQBotRawEvent(selfId, event, wsRes.d)) {
+            noteQQBotMessagePhase(selfId, 'protection-dropped', wsRes.d)
+            return
+          }
           qqbotOriginalEventMap.set(wsRes.d, {
             op: wsRes.op,
             s: wsRes.s,
@@ -2344,13 +2467,13 @@ function patchGroupMessageCreateEvent () {
           if (!String(attachment?.content_type || '').startsWith('image/') || !attachment.url) continue
           payload.message.push({ type: 'image', url: attachment.url, content: attachment.content || '[图片]', width: attachment.width, height: attachment.height, size: attachment.size, name: attachment.filename || '' })
         }
-        payload.user_id = payload.author?.id
+        payload.user_id = getQQBotMessageUserOpenid(payload)
         payload.message_id = getQQBotActualMessageId(payload)
         payload.raw_message = text
         payload.reply_id = getReplyMessageIdFromPayload(payload)
         payload.getReply = async () => payload.reply_id ? { message_id: payload.reply_id } : null
         payload.sender = {
-          user_id: payload.author?.id,
+          user_id: payload.user_id,
           nickname: payload.author?.username,
           card: payload.author?.username,
           user_name: payload.author?.username,
@@ -2503,7 +2626,7 @@ function patchGroupMessageCreateEvent () {
         const rawGroupId = payload.group_openid || payload.group_id || ''
         const groupId = rawGroupId || '未知群聊'
         const groupLogTarget = formatQQBotGroupLogTarget(selfId, rawGroupId, payload.group_name || payload.group?.name || '')
-        const memberOpenid = payload.member_openid || payload.user_id || ''
+        const memberOpenid = [payload.member_openid, payload.user_id].find(isKnownQQBotOpenid) || ''
         const memberName = getMemberNicknameFromStore(selfId, memberOpenid) || memberOpenid
         const timestamp = payload._rawTimestamp || payload.timestamp || payload.time || ''
         const timeNum = Number(timestamp)
@@ -2640,7 +2763,8 @@ const offlineCheckState = {
   waitingSessionReset: {}, // 官方 reset_after 等待 id => timeoutId
   waitingReconnectRetry: {}, // 重连失败后的延迟重试 id => timeoutId
   reconnectSeq: {},
-  reconnectWatchdog: {}
+  reconnectWatchdog: {},
+  reconnectNotice: {} // 当前异常重连事务的下线通知状态
 }
 
 const CLAW_DEFAULT_CFG = {
@@ -2956,11 +3080,7 @@ const adapter = new class QQBotAdapter {
     }
 
     if (shouldUseCosFallback(image.url)) {
-      try {
-        image.url = await uploadToTencentCosFallback(buffer, selfId)
-      } catch (err) {
-        Bot.makeLog('error', ['腾讯COS图床兜底失败', err.message], selfId)
-      }
+      image.url = await qqbotMediaManager.fallback(buffer, selfId)
     }
 
     return image
@@ -2981,52 +3101,57 @@ const adapter = new class QQBotAdapter {
 
   async makeBotImage (file, selfId = '') {
     if (Handler.has('QQBot.makeMarkdownImage')) return false
-    if (getBotConfigValue(selfId, 'toBotUpload')) {
-      for (const i of Bot.uin) {
-        if (!Bot[i].uploadImage) continue
-        if (Bot[i].adapter?.name !== 'QQBot') continue
-        try {
-          const image = await Bot[i].uploadImage(file, { skipHandler: true })
-          if (image.url) return image
-        } catch (err) {
-          Bot.makeLog('error', ['Bot', i, '图片上传错误', file, err])
-        }
-      }
+    // Built-in uploads use the sending account: official references cannot be borrowed.
+    if (getBotConfigValue(selfId, 'toBotUpload') && Bot[selfId]?.adapter?.name === 'QQBot' && Bot[selfId].uploadImage) {
+      return Bot[selfId].uploadImage(file, { skipHandler: true })
     }
   }
 
   async makeMarkdownImage (data, file, summary = '图片') {
-    const buffer = await Bot.Buffer(file)
-    const image = await this.makeBotImage(buffer, data.self_id) || { url: '' }
-    if (!image.url) {
+    const selfId = data.self_id
+    const customLoaded = Handler.has('QQBot.makeMarkdownImage')
+    // A public image URL can be used by Markdown directly. Only skip the built-in
+    // re-upload; a custom image-bed handler still owns the conversion when loaded.
+    const directNetwork = !customLoaded && typeof file === 'string' &&
+      /^https?:\/\//i.test(file) && !shouldUseCosFallback(file) &&
+      !getBotConfigValue(selfId, 'markdownImageConvert')
+    let buffer, image
+    if (directNetwork) {
+      image = { url: file }
       try {
-        image.url = await Bot.fileToUrl(file)
+        buffer = await Bot.Buffer(file)
       } catch (err) {
-        Bot.makeLog('debug', ['默认图床转换失败', err.message], data.self_id)
+        Bot.makeLog('warn', ['网络图片尺寸读取失败，直接使用原始链接', err.message], selfId)
+      }
+    } else {
+      buffer = await Bot.Buffer(file)
+      image = await this.makeBotImage(buffer, selfId) || { url: '' }
+      if (!image.url) {
+        try {
+          image.url = await Bot.fileToUrl(file)
+        } catch (err) {
+          Bot.makeLog('debug', ['默认图床转换失败', err.message], selfId)
+        }
       }
     }
 
-    if (!image.width || !image.height) {
+    if (buffer && (!image.width || !image.height)) {
       try {
         const size = imageSize(buffer)
         image.width = size.width
         image.height = size.height
       } catch (err) {
-        Bot.makeLog('error', ['图片分辨率检测错误', file, err], data.self_id)
+        Bot.makeLog('error', ['图片分辨率检测错误', file, err], selfId)
       }
     }
 
-    if (shouldUseCosFallback(image.url)) {
-      try {
-        image.url = await uploadToTencentCosFallback(buffer, data.self_id)
-      } catch (err) {
-        Bot.makeLog('error', ['腾讯COS图床兜底失败', err.message], data.self_id)
-      }
+    if (!directNetwork && shouldUseCosFallback(image.url)) {
+      image.url = await qqbotMediaManager.fallback(buffer, selfId)
     }
 
-    image.width = Math.floor(image.width * config.markdownImgScale)
-    image.height = Math.floor(image.height * config.markdownImgScale)
-    if (Handler.has('QQBot.makeMarkdownImage')) {
+    image.width = Math.floor((image.width || 0) * config.markdownImgScale)
+    image.height = Math.floor((image.height || 0) * config.markdownImgScale)
+    if (!directNetwork && customLoaded) {
       const res = await Handler.call(
         'QQBot.makeMarkdownImage',
         data,
@@ -4374,6 +4499,10 @@ const adapter = new class QQBotAdapter {
   }
 
   async sendMsg (data, send, msg) {
+    return qqbotMediaManager.withSend(data.self_id, () => this.sendMsgWithMedia(data, send, msg))
+  }
+
+  async sendMsgWithMedia (data, send, msg) {
     // 拦截 segment.callfl 召回消息
     const msgArr = Array.isArray(msg) ? msg : [msg]
     for (const item of msgArr) {
@@ -4410,8 +4539,14 @@ const adapter = new class QQBotAdapter {
       for (const i of msgs) {
         try {
           Bot.makeLog('debug', ['发送消息', i], data.self_id)
+          await qqbotMediaManager.protectPayload(data.self_id, i)
           const ret = await send(i)
           Bot.makeLog('debug', ['发送消息返回', ret], data.self_id)
+
+          // A local accounting failure cannot turn an accepted message into a send failure.
+          try { await qqbotMediaManager.sent(data.self_id, i) } catch (error) {
+            Bot.makeLog('warn', ['官方素材使用记录更新失败', mediaErrorText(error)], data.self_id)
+          }
 
           rets.data.push(ret)
           if (ret.id) rets.message_id.push(ret.id)
@@ -4457,7 +4592,7 @@ const adapter = new class QQBotAdapter {
             const refKey = getQQBotRefMapKey(data.self_id, data.group_id ? 'group' : 'user', data.group_id ? getRawQQBotGroupId(data, data.self_id, this.sep) : String(data.user_id || '').replace(`${data.self_id}${this.sep}`, ''), ret.ext_info.ref_idx)
             setQQBotTimedMapValue('__qqbotRefMsgIdMap', refKey, ret.id, 24 * 60 * 60 * 1000, 10000)
           }
-          await Bot[data.self_id].dau.setDau('send_msg', data)
+          await recordQQBotMessageDau(data, 'send_msg')
         } catch (err) {
           logger.error(data.self_id, '发送消息错误', i, err)
           rets.error.push(err)
@@ -4691,7 +4826,7 @@ const adapter = new class QQBotAdapter {
           if (ret.id && ret.ext_info?.ref_idx) {
             setQQBotTimedMapValue('__qqbotRefMsgIdMap', ret.ext_info.ref_idx, ret.id, 24 * 60 * 60 * 1000, 10000)
           }
-          await Bot[data.self_id].dau.setDau('send_msg', data)
+          await recordQQBotMessageDau(data, 'send_msg')
         } catch (err) {
           logger.error(data.self_id, '发送消息错误', i, err)
           rets.error.push(err)
@@ -4896,50 +5031,53 @@ const adapter = new class QQBotAdapter {
 
   async makeFriendMessage (data, event) {
     const messageMeta = getQQBotEventMessageMeta(event)
+    const optional = (stage, work) => runQQBotMessageStep(data.self_id, stage, work, { optional: true })
+    const rawUserOpenid = getQQBotMessageUserOpenid(event)
     data.sender = {
-      user_id: `${data.self_id}${this.sep}${event.sender.user_id}`
+      user_id: rawUserOpenid ? `${data.self_id}${this.sep}${rawUserOpenid}` : ''
     }
-    Bot.makeLog('info', `好友消息：[${data.user_id}] ${data.raw_message}`, data.self_id)
+    Bot.makeLog('info', `好友消息：[${data.user_id || UNKNOWN_OPENID}] ${data.raw_message}`, data.self_id)
     data.reply = msg => this.sendFriendMsg({
-      ...data, user_id: event.sender.user_id
+      ...data, user_id: rawUserOpenid
     }, msg, { id: data.message_id })
     await this.setFriendMap(data)
     // 记录 C2C openid 用于召回
-    const rawUserOpenid = event.sender?.user_id || event.author?.user_openid || event.author?.member_openid || ''
     if (rawUserOpenid) {
       inviteStore.recordC2cUser(data.self_id, rawUserOpenid, event.event_id || '', event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '')
-      await userManageStore.recordUser(data.self_id, rawUserOpenid, { nickname: event.sender?.nickname || event.author?.username || '' })
+      await optional('user-record', () => userManageStore.recordUser(data.self_id, rawUserOpenid, { nickname: event.sender?.nickname || event.author?.username || '' }))
       const historyAliases = messageMeta.aliases.filter(Boolean).filter(id => id !== data.message_id)
-      data.seq = await userManageStore.recordHistory(data.self_id, rawUserOpenid, { type: 'user', message_id: data.message_id || event.id || '', aliases: historyAliases, user_openid: rawUserOpenid, nickname: event.sender?.nickname || event.author?.username || '', bot: false, raw_message: data.raw_message, raw: event, time: messageMeta.time })
+      data.seq = await optional('private-history', () => userManageStore.recordHistory(data.self_id, rawUserOpenid, { type: 'user', message_id: data.message_id || event.id || '', aliases: historyAliases, user_openid: rawUserOpenid, nickname: event.sender?.nickname || event.author?.username || '', bot: false, raw_message: data.raw_message, raw: event, time: messageMeta.time }))
       if (data.raw) data.raw.seq = data.seq
     }
     // 注入 raw.invite
     if (rawUserOpenid) {
       data.raw.invite = this._makeInviteRaw(data.self_id, rawUserOpenid)
-      const chatStats = await chatStore.recordUserMessage(data.self_id, rawUserOpenid, 'private', '', event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '')
+      const chatStats = await optional('private-chat', () => chatStore.recordUserMessage(data.self_id, rawUserOpenid, 'private', '', event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || ''))
       if (chatStats) data.raw.chat = chatStats
     }
     if (data.message_id && rawUserOpenid) {
-      await advancedWelcomeStore.recordMessageIndex({ message_id: data.message_id, self_id: data.self_id, target_id: rawUserOpenid, type: 'user', author_openid: rawUserOpenid, bot: false, aliases: messageMeta.aliases.filter(id => id !== data.message_id) })
+      await optional('message-index', () => advancedWelcomeStore.recordMessageIndex({ message_id: data.message_id, self_id: data.self_id, target_id: rawUserOpenid, type: 'user', author_openid: rawUserOpenid, bot: false, aliases: messageMeta.aliases.filter(id => id !== data.message_id) }))
     }
   }
 
   async makeGroupMessage (data, event) {
     const messageMeta = getQQBotEventMessageMeta(event)
+    const optional = (stage, work) => runQQBotMessageStep(data.self_id, stage, work, { optional: true })
+    const rawUserOpenid = getQQBotMessageUserOpenid(event)
     data.sender = {
-      user_id: `${data.self_id}${this.sep}${event.sender.user_id}`
+      user_id: rawUserOpenid ? `${data.self_id}${this.sep}${rawUserOpenid}` : ''
     }
     data.group_id = `${data.self_id}${this.sep}${event.group_id}`
     if (event.group_openid) data.group_openid = event.group_openid
-    const authorRole = event.author?.member_role || (event.author?.bot ? 'bot' : '')
+    const authorRole = rawUserOpenid ? event.author?.member_role || (event.author?.bot ? 'bot' : '') : ''
     if (authorRole) {
       data.sender.role = authorRole
       data.sender.member_role = authorRole
       data.sender.permission = authorRole
     }
-    if (getBotConfigValue(data.self_id, 'toQQUin') && Handler.has('ws.tool.findUserId')) {
+    if (rawUserOpenid && getBotConfigValue(data.self_id, 'toQQUin') && Handler.has('ws.tool.findUserId')) {
       const cachedUserId = qqbotExternalUserIdCache.get(String(data.user_id))
-      const user_id = cachedUserId ? { custom: cachedUserId } : await Handler.call('ws.tool.findUserId', { user_id: data.user_id })
+      const user_id = cachedUserId ? { custom: cachedUserId } : await optional('external-user-id', () => Handler.call('ws.tool.findUserId', { user_id: data.user_id }))
       if (user_id?.custom) {
         cacheQQBotExternalUserId(data.user_id, user_id.custom)
         cacheQQBotUserId(user_id.custom, data.user_id)
@@ -4953,14 +5091,13 @@ const adapter = new class QQBotAdapter {
     const _authorName = _author.username || '未知用户'
     const _authorTag = getQQBotMemberRoleTag(_author.member_role, _author.bot)
     const _msgType = event._qqbotFullMessageCreate ? '群全量消息' : '群@机器消息'
-    Bot.makeLog(logStat, `${_msgType}: [${_authorName}${_authorTag}]：[${formatQQBotGroupLogTarget(data.self_id, data.group_openid || data.group_id, event.group_name || event.raw?.group_name)}, ${data.user_id}] ${data.raw_message}`, data.self_id)
+    Bot.makeLog(logStat, `${_msgType}: [${_authorName}${_authorTag}]：[${formatQQBotGroupLogTarget(data.self_id, data.group_openid || data.group_id, event.group_name || event.raw?.group_name)}, ${data.user_id || UNKNOWN_OPENID}] ${data.raw_message}`, data.self_id)
 
     data.reply = msg => this.sendGroupMsg({
       ...data, group_id: event.group_id
     }, msg, { id: data.message_id })
     await this.setGroupMap(data)
 
-    const rawUserOpenid = event.author?.id || event.author?.member_openid || event.sender?.user_id || ''
     if (rawUserOpenid) {
       data.raw.invite = this._makeInviteRaw(data.self_id, rawUserOpenid)
     }
@@ -4969,22 +5106,24 @@ const adapter = new class QQBotAdapter {
       if (event.author?.bot !== true && event._qqbotFullMessageCreate === true && !hasQQBotActivityAtEvidence(data.self_id, event)) await sleep(250)
       const activeType = hasQQBotActivityAtEvidence(data.self_id, event) ? 'activeat' : 'activenoat'
       if (event.author?.bot === true) {
-        data.raw.active = await activeStore.get(data.self_id, data.group_openid)
+        data.raw.active = await optional('active-read', () => activeStore.get(data.self_id, data.group_openid))
       } else if (activeType === 'activeat') {
         const noAtPending = getQQBotActivityNoAtRecord(data.self_id, event)
-        const noAtRecord = noAtPending ? await noAtPending : null
-        data.raw.active = await activeStore.record(data.self_id, data.group_openid, rawUserOpenid, 'activeat')
-        if (noAtRecord?.addedType && noAtRecord.token) data.raw.active = await activeStore.rollback(data.self_id, data.group_openid, rawUserOpenid, 'activenoat', noAtRecord.token)
+        const noAtRecord = noAtPending ? await optional('active-pending', () => noAtPending) : null
+        data.raw.active = await optional('active-record', () => activeStore.record(data.self_id, data.group_openid, rawUserOpenid, 'activeat'))
+        if (noAtRecord?.addedType && noAtRecord.token) data.raw.active = await optional('active-rollback', () => activeStore.rollback(data.self_id, data.group_openid, rawUserOpenid, 'activenoat', noAtRecord.token))
       } else {
         const existing = getQQBotActivityNoAtRecord(data.self_id, event)
         if (existing) {
-          await existing
-          data.raw.active = await activeStore.get(data.self_id, data.group_openid)
+          await optional('active-pending', () => existing)
+          data.raw.active = await optional('active-read', () => activeStore.get(data.self_id, data.group_openid))
         } else {
-          const pending = activeStore.recordDetailed(data.self_id, data.group_openid, rawUserOpenid, 'activenoat')
-          rememberQQBotActivityNoAtRecord(data.self_id, event, pending)
-          const record = await pending
-          data.raw.active = record.stats
+          const record = await optional('active-record', () => {
+            const pending = activeStore.recordDetailed(data.self_id, data.group_openid, rawUserOpenid, 'activenoat')
+            rememberQQBotActivityNoAtRecord(data.self_id, event, pending)
+            return pending
+          })
+          if (record) data.raw.active = record.stats
         }
       }
     }
@@ -4992,7 +5131,7 @@ const adapter = new class QQBotAdapter {
     if (rawUserOpenid && data.group_openid) {
       const historyAliases = messageMeta.aliases.filter(Boolean).filter(id => id !== data.message_id)
       const cachedInfo = groupInfoStore.peekInfo(data.self_id, data.group_openid)
-      await Promise.all([
+      await optional('user-group-record', () => Promise.all([
         userManageStore.recordUser(data.self_id, rawUserOpenid, { nickname: event.author?.username || event.sender?.nickname || '', group_openid: data.group_openid }),
         userManageStore.recordGroup(data.self_id, data.group_openid, {
         name: cachedInfo?.group_name || event.group_name || event.raw?.group_name || '',
@@ -5002,35 +5141,35 @@ const adapter = new class QQBotAdapter {
         group_member_num: cachedInfo?.group_member_num || 0
         }),
         groupInfoStore.ensureGroup(data.self_id, data.group_openid)
-      ])
+      ]))
       groupInfoStore.recordTrigger(data.self_id, data.group_openid, event._qqbotFullMessageCreate === true ? 'full' : 'at')
-      data.seq = await userManageStore.recordHistory(data.self_id, data.group_openid, { message_id: data.message_id || event.id || '', aliases: historyAliases, user_openid: rawUserOpenid, nickname: event.author?.username || event.sender?.nickname || '', bot: event.author?.bot === true, raw_message: data.raw_message, raw: event, time: messageMeta.time })
+      data.seq = await optional('group-history', () => userManageStore.recordHistory(data.self_id, data.group_openid, { message_id: data.message_id || event.id || '', aliases: historyAliases, user_openid: rawUserOpenid, nickname: event.author?.username || event.sender?.nickname || '', bot: event.author?.bot === true, raw_message: data.raw_message, raw: event, time: messageMeta.time }))
       if (data.raw) data.raw.seq = data.seq
       if (ensureAdvancedWelcomeConfig(config, data.self_id).enabled) {
-        await advancedWelcomeStore.recordSpeech(data.self_id, data.group_openid, data.message_id || event.id || '', event._qqbotFullMessageCreate === true)
+        await optional('welcome-speech', () => advancedWelcomeStore.recordSpeech(data.self_id, data.group_openid, data.message_id || event.id || '', event._qqbotFullMessageCreate === true))
       }
       if (!event._qqbotFullMessageCreate) {
-        await chatStore.recordGroupRank(data.self_id, data.group_openid, rawUserOpenid, event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '', {
+        await optional('group-rank', () => chatStore.recordGroupRank(data.self_id, data.group_openid, rawUserOpenid, event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '', {
           nickname: event.author?.username || event.sender?.nickname || '',
           bot: event.author?.bot === true
-        })
+        }))
       }
     }
 
     if (event._qqbotFullMessageCreate && rawUserOpenid && data.group_openid) {
-      const chatStats = await chatStore.recordUserMessage(data.self_id, rawUserOpenid, 'group', data.group_openid, event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '', {
+      const chatStats = await optional('group-chat', () => chatStore.recordUserMessage(data.self_id, rawUserOpenid, 'group', data.group_openid, event._rawTimestamp || event.raw?._rawTimestamp || event.timestamp || event.time || '', {
         nickname: event.author?.username || event.sender?.nickname || '',
         bot: event.author?.bot === true
-      })
+      }))
       if (chatStats) data.raw.chat = chatStats
     }
 
     const authorNickname = event.author?.username || event.sender?.nickname || event.sender?.card || ''
     if (authorNickname && rawUserOpenid) {
-      await recordMemberNickname(data.self_id, rawUserOpenid, authorNickname, {
+      await optional('member-nickname', () => recordMemberNickname(data.self_id, rawUserOpenid, authorNickname, {
         role: authorRole,
         group_openid: event.group_openid || event.raw?.group_openid || ''
-      })
+      }))
     }
 
     if (event.author) {
@@ -5044,19 +5183,19 @@ const adapter = new class QQBotAdapter {
 
     if (data.message_id && data.group_openid) {
       const aliases = messageMeta.aliases.filter(Boolean).filter(id => id !== data.message_id)
-      await advancedWelcomeStore.recordMessageIndex({
+      await optional('message-index', () => advancedWelcomeStore.recordMessageIndex({
         message_id: data.message_id,
         self_id: data.self_id,
         target_id: data.group_openid,
         type: 'group',
-        author_openid: rawUserOpenid || '',
+        author_openid: displayQQBotOpenid(rawUserOpenid),
         member_role: authorRole,
         bot: event.author?.bot === true,
          content_fingerprint: messageMeta.contentFingerprint,
          time: new Date(messageMeta.time).toISOString(),
         seq: data.seq || 0,
         aliases
-      })
+      }))
     }
 
     const fullMessage = ensureFullMessageConfig(config, data.self_id)
@@ -5077,8 +5216,8 @@ const adapter = new class QQBotAdapter {
     }
 
     if (event._qqbotFullMessageCreate) {
-      await userManageStore.recordFullGroupEvent(data.self_id, data.group_openid || event.group_openid || event.raw?.group_openid || event.group_id || '')
-      await recordFullMessageGroup(config, data, event)
+      await optional('full-group-event', () => userManageStore.recordFullGroupEvent(data.self_id, data.group_openid || event.group_openid || event.raw?.group_openid || event.group_id || ''))
+      await optional('full-group-record', () => recordFullMessageGroup(config, data, event))
     }
 
     if (event._qqbotFullMessageCreate) {
@@ -5088,12 +5227,15 @@ const adapter = new class QQBotAdapter {
       if (mentionState.shouldNotifyAll) {
         Bot.makeLog('info', `[${data.self_id}] 全量消息@全体通知：[${formatQQBotGroupLogTarget(data.self_id, data.group_openid || data.group_id)}, ${data.user_id}] ${data.raw_message}`, data.self_id)
         try {
-          await sendQQBotInternalMasterMsg(getFullMessageAllNotifyMsg(data))
+          await optional('all-mention-notice', () => sendQQBotInternalMasterMsg(getFullMessageAllNotifyMsg(data)))
         } catch (err) {
           Bot.makeLog('error', ['全量消息@全体通知发送失败', err.message], data.self_id)
         }
       }
-      if (!mentionState.shouldDispatch) return false
+      if (!mentionState.shouldDispatch) {
+        noteQQBotMessagePhase(data.self_id, 'full-filtered', event)
+        return false
+      }
       data.atBot = true
     }
   }
@@ -5133,7 +5275,7 @@ const adapter = new class QQBotAdapter {
     }
     if (getBotConfigValue(data.self_id, 'toQQUin') && Handler.has('ws.tool.findUserId')) {
       const cachedUserId = qqbotExternalUserIdCache.get(String(data.user_id))
-      const user_id = cachedUserId ? { custom: cachedUserId } : await Handler.call('ws.tool.findUserId', { user_id: data.user_id })
+      const user_id = cachedUserId ? { custom: cachedUserId } : await runQQBotMessageStep(data.self_id, 'external-user-id', () => Handler.call('ws.tool.findUserId', { user_id: data.user_id }), { optional: true })
       if (user_id?.custom) {
         cacheQQBotExternalUserId(data.user_id, user_id.custom)
         cacheQQBotUserId(user_id.custom, data.user_id)
@@ -5152,14 +5294,14 @@ const adapter = new class QQBotAdapter {
   }
 
   async setFriendMap (data) {
-    if (!data.user_id) return
+    if (!isKnownQQBotOpenid(data.user_id)) return
     if (!String(data.user_id).startsWith('qg_')) {
       const currentFriend = data.bot.fl?.get?.(data.user_id)
       const nextFriend = {
         ...(currentFriend || {}),
         ...data.sender
       }
-      if (!sameQQBotMapValue(currentFriend, nextFriend)) await data.bot.fl.set(data.user_id, nextFriend)
+      if (!sameQQBotMapValue(currentFriend, nextFriend)) await runQQBotMessageStep(data.self_id, 'friend-map', () => data.bot.fl.set(data.user_id, nextFriend), { optional: true })
     }
     data.friend = data.bot.pickFriend(data.user_id)
     this.wrapRecallResultReporter(data, data.friend)
@@ -5178,17 +5320,19 @@ const adapter = new class QQBotAdapter {
         ...(cached?.info || {}),
         bot_state: cached?.bot_state || null
        }
-       if (!sameQQBotMapValue(currentGroup, nextGroup)) await data.bot.gl.set(data.group_id, nextGroup)
+       if (!sameQQBotMapValue(currentGroup, nextGroup)) await runQQBotMessageStep(data.self_id, 'group-map', () => data.bot.gl.set(data.group_id, nextGroup), { optional: true })
     }
     let gml = data.bot.gml.get(data.group_id)
     if (!gml) {
       gml = new Map()
-      await data.bot.gml.set(data.group_id, gml)
+      await runQQBotMessageStep(data.self_id, 'member-map', () => data.bot.gml.set(data.group_id, gml), { optional: true })
     }
-    const currentMember = gml.get(data.user_id)
-    const nextMember = { ...currentMember, ...data.sender }
-    const memberChanged = !currentMember || currentMember.user_id !== nextMember.user_id || currentMember.nickname !== nextMember.nickname || currentMember.card !== nextMember.card || currentMember.role !== nextMember.role || currentMember.member_role !== nextMember.member_role || currentMember.permission !== nextMember.permission
-    if (memberChanged) await gml.set(data.user_id, nextMember)
+    if (isKnownQQBotOpenid(data.user_id)) {
+      const currentMember = gml.get(data.user_id)
+      const nextMember = { ...currentMember, ...data.sender }
+      const memberChanged = !currentMember || currentMember.user_id !== nextMember.user_id || currentMember.nickname !== nextMember.nickname || currentMember.card !== nextMember.card || currentMember.role !== nextMember.role || currentMember.member_role !== nextMember.member_role || currentMember.permission !== nextMember.permission
+      if (memberChanged) await runQQBotMessageStep(data.self_id, 'member-entry', () => gml.set(data.user_id, nextMember), { optional: true })
+    }
     data.group = data.bot.pickGroup(data.group_id)
     const groupOpenid = getRawQQBotGroupId(data, data.self_id, this.sep)
      const cache = groupInfoStore.peekGroup(data.self_id, groupOpenid)
@@ -5326,13 +5470,20 @@ const adapter = new class QQBotAdapter {
   }
 
   async makeMessage (id, event) {
-    if (Bot[id]?.readOnlyMode) return
+    assertQQBotMessageTask()
+    noteQQBotMessagePhase(id, 'entered', event)
+    if (Bot[id]?.readOnlyMode) {
+      Bot[id]._readOnlyRecovery?.skipMessage()
+      noteQQBotMessagePhase(id, 'readonly-skipped', event)
+      return
+    }
     if (this.isMessageAuditEvent(event)) {
       this.makeMessageAuditNotice(id, event)
       return
     }
 
-    const selfOpenid = await learnQQBotSelfOpenid(id, event)
+    const optional = (stage, work) => runQQBotMessageStep(id, stage, work, { optional: true })
+    const selfOpenid = await optional('self-openid', () => learnQQBotSelfOpenid(id, event))
     const botNames = [event.bot?.nickname, event.bot?._qqbotNickname]
     const normalizedMessage = this.normalizeSdkMessage(event.message, event._mentions || event.mentions).map(seg => {
       if (seg?.type === 'text') return { ...seg, text: normalizeQQBotContentByConfig(seg.text, id, botNames, event._mentions || event.mentions) }
@@ -5355,6 +5506,8 @@ const adapter = new class QQBotAdapter {
 
     if (data.raw) {
       exposeQQBotSelfOpenid(data.raw, id, selfOpenid)
+      const userOpenid = getQQBotMessageUserOpenid(event)
+      data.raw.qqbot_identity = { user_openid: displayQQBotOpenid(userOpenid), known: Boolean(userOpenid) }
       data.raw._qqbotFullMessageCreate = event._qqbotFullMessageCreate === true
       data.raw._qqbotFullMessageRecorded = isFullMessageGroupRecorded(id, event.group_openid || event.raw?.group_openid || '')
     }
@@ -5478,18 +5631,18 @@ const adapter = new class QQBotAdapter {
       data.group.getChatHistory = (seq = data.seq || 0, count = 20) => userManageStore.getHistory(data.self_id, data.group_openid, seq, count)
       if (data.source && data.reply_id) {
         const refIds = [data.reply_id, getQQBotReplyRefId(event), event.reply_id, event.ref_msg_idx, event.raw?.reply_id, event.raw?.ref_msg_idx]
-        const byId = await userManageStore.findHistoryByAnyId(data.self_id, data.group_openid, refIds)
-        const byContent = byId ? null : await userManageStore.findRecentHistoryByContent(data.self_id, data.group_openid, getQQBotQuotedContentFingerprint(event), getQQBotQuotedAuthorBot(event))
+        const byId = await optional('quote-history', () => userManageStore.findHistoryByAnyId(data.self_id, data.group_openid, refIds))
+        const byContent = byId ? null : await optional('quote-content', () => userManageStore.findRecentHistoryByContent(data.self_id, data.group_openid, getQQBotQuotedContentFingerprint(event), getQQBotQuotedAuthorBot(event)))
         data.source.seq = byId?.seq || byContent?.seq || 0
       }
     } else if (data.message_type === 'private' && data.sub_type === 'friend') {
       const privateOpenid = normalizeQQBotOpenid(event.sender?.user_id || event.author?.user_openid || event.author?.member_openid || data.user_id || '')
-      data.friend.getChatHistory = (seq = data.seq || 0, count = 20) => userManageStore.getHistory(data.self_id, privateOpenid, seq, count, 'user')
+      if (data.friend) data.friend.getChatHistory = (seq = data.seq || 0, count = 20) => userManageStore.getHistory(data.self_id, privateOpenid, seq, count, 'user')
       data.friendgetChatHistory = (seq = data.seq || 0, count = 20) => userManageStore.getHistory(data.self_id, privateOpenid, seq, count, 'user')
       if (data.source && data.reply_id && privateOpenid) {
         const refIds = [data.reply_id, getQQBotReplyRefId(event), event.reply_id, event.ref_msg_idx, event.raw?.reply_id, event.raw?.ref_msg_idx]
-        const byId = await userManageStore.findHistoryByAnyId(data.self_id, privateOpenid, refIds, 'user')
-        const byContent = byId ? null : await userManageStore.findRecentHistoryByContent(data.self_id, privateOpenid, getQQBotQuotedContentFingerprint(event), getQQBotQuotedAuthorBot(event), 'user')
+        const byId = await optional('quote-history', () => userManageStore.findHistoryByAnyId(data.self_id, privateOpenid, refIds, 'user'))
+        const byContent = byId ? null : await optional('quote-content', () => userManageStore.findRecentHistoryByContent(data.self_id, privateOpenid, getQQBotQuotedContentFingerprint(event), getQQBotQuotedAuthorBot(event), 'user'))
         data.source.seq = byId?.seq || byContent?.seq || 0
       }
     }
@@ -5518,7 +5671,7 @@ const adapter = new class QQBotAdapter {
     if (data.raw) data.raw.iscancelled = !!activeCancelState
     const isGuildLikeMessage = data.message_type === 'direct' || data.message_type === 'guild' || String(data.group_id || '').startsWith('qg_') || String(data.user_id || '').startsWith('qg_')
     const isInternalQQBotCommand = isInternalQQBotCommandEvent(data)
-    if (await blockDisabledQQBotUsageScope(data, isInternalQQBotCommand)) return
+    if (await runQQBotMessageStep(id, 'usage-scope', () => blockDisabledQQBotUsageScope(data, isInternalQQBotCommand))) return
     const blackUserState = userManageStore.getBlackUser(data.self_id, eventUserOpenid)
     const blackGroupState = eventGroupOpenid ? userManageStore.getBlackGroup(data.self_id, eventGroupOpenid) : null
     if (!isInternalQQBotCommand && !isGuildLikeMessage && (blackUserState || blackGroupState)) {
@@ -5543,18 +5696,20 @@ const adapter = new class QQBotAdapter {
 
     if (data.message_type === 'group' && /^(?:#)?(?:天|周|月)发言榜$/i.test(String(data.raw_message || '').trim())) {
       const target = resolveChatGroupOpenid()
-      if (target) chatRankCache = { target, value: await getChatRank(target) }
+      if (target) chatRankCache = { target, value: await optional('rank-query', () => getChatRank(target)) }
     } else if (data.message_type === 'group' && /^(?:#)?(?:他|她|它)的发言$/i.test(String(data.raw_message || '').trim())) {
       const mention = (event._mentions || event.mentions || []).find(item => item?.is_you !== true)
       const user = mention?.id || mention?.member_openid || mention?.user_openid || ''
       const target = resolveChatGroupOpenid()
       if (user && target) {
-        otherChatCache.set(`${user}:${target}`, await getOtherChat(user, target))
+        otherChatCache.set(`${user}:${target}`, await optional('chat-query', () => getOtherChat(user, target)))
       }
     }
 
     data.bot.stat.recv_msg_cnt++
-    await Bot[data.self_id].dau.setDau('receive_msg', data)
+    await recordQQBotMessageDau(data, 'receive_msg')
+    assertQQBotMessageTask()
+    noteQQBotMessagePhase(id, 'framework-dispatched', event)
     Bot.em(`${data.post_type}.${data.message_type}.${data.sub_type}`, data)
   }
 
@@ -5576,6 +5731,7 @@ const adapter = new class QQBotAdapter {
       ? event.notice_id
       : `INTERACTION_CREATE:${event.notice_id}`
 
+    const operatorOpenid = normalizeQQBotOpenid(event.operator_id || '')
     const data = {
       raw: event,
       bot: Bot[id],
@@ -5585,7 +5741,7 @@ const adapter = new class QQBotAdapter {
       message_type: event.notice_type,
       sub_type: 'callback',
       get user_id () { return this.sender.user_id },
-      sender: { user_id: `${id}${this.sep}${event.operator_id}` },
+      sender: { user_id: operatorOpenid ? `${id}${this.sep}${operatorOpenid}` : '' },
       message: [],
       raw_message: ''
     }
@@ -6183,7 +6339,7 @@ const adapter = new class QQBotAdapter {
           '',
           `>用户: ${escapeQQBotMarkdownText(event.username || raw.username || memberOpenid)}`,
           `>机器人: ${escapeQQBotMarkdownText(botName)}`,
-          `>openid: ${escapeQQBotMarkdownText(memberOpenid)}`,
+          `>openid: ${escapeQQBotMarkdownText(displayQQBotOpenid(memberOpenid))}`,
           `>验证: ${escapeQQBotMarkdownText(verifyText)}`,
           `>风险: ${escapeQQBotMarkdownText(raw.risk_tips || '-')}`,
           `>申请ID: ${escapeQQBotMarkdownText(requestId)}`,
@@ -6368,10 +6524,12 @@ const adapter = new class QQBotAdapter {
   }
 
   disableBotRuntime (id, reason = '') {
+    clearQQBotMessageQueue(id)
     this.stopOfflineCheck(id)
     offlineCheckState.reconnectSeq[id] = (offlineCheckState.reconnectSeq[id] || 0) + 1
     delete offlineCheckState.retrying[id]
     delete offlineCheckState.retryingAt[id]
+    delete offlineCheckState.reconnectNotice[id]
     const bot = Bot[id]
     if (!bot) return
     if (bot.disabledRuntime) return
@@ -6420,7 +6578,7 @@ const adapter = new class QQBotAdapter {
       offlineCheckState.waitingSessionReset[id] = timer
       return
     }
-    await this._doReconnect(id)
+    await this._doReconnect(id, 0, { reason: 'socket-closed' })
   }
 
   /**
@@ -6433,143 +6591,180 @@ const adapter = new class QQBotAdapter {
   /**
    * 执行重连
    */
-  async _doReconnect (id, retryCount = 0) {
-  const bot = Bot[id]
-  if (!bot || bot.disabledRuntime) return
-  // 如果已经在重连中，跳过（包括重试调用）
-  if (offlineCheckState.retrying[id]) {
-    Bot.makeLog('warn', [`[${id}] 已在重连中，跳过本次重连 (retryCount=${retryCount})`], id)
-    return
-  }
-  offlineCheckState.retrying[id] = true
-  offlineCheckState.retryingAt[id] = Date.now()
-  const reconnectSeq = (offlineCheckState.reconnectSeq[id] || 0) + 1
-  offlineCheckState.reconnectSeq[id] = reconnectSeq
-  const ownsAttempt = () => Bot[id] === bot && offlineCheckState.reconnectSeq[id] === reconnectSeq
-  const isCurrentAttempt = () => ownsAttempt() && !bot.disabledRuntime
-  bot.isReconnecting = true  // 设置重连标志
-
-  if (offlineCheckState.reconnectWatchdog[id]) clearTimeout(offlineCheckState.reconnectWatchdog[id])
-  offlineCheckState.reconnectWatchdog[id] = setTimeout(() => {
-    if (!isCurrentAttempt()) return
-    if (!offlineCheckState.retrying[id]) return
-    delete offlineCheckState.reconnectWatchdog[id]
-    Bot.makeLog('error', [`[${id}] 重连状态超过120秒未释放，已强制解除重连锁，等待下一轮检测/重连`], id)
-    offlineCheckState.reconnectSeq[id] = reconnectSeq + 1
-    bot.connectionGeneration = (bot.connectionGeneration || 0) + 1
-    try { bot.sdk._sessionLifecycle?.stop() } catch {}
-    bot._cancelLogin?.()
-    delete offlineCheckState.retrying[id]
-    delete offlineCheckState.retryingAt[id]
-    bot.isReconnecting = false
-  }, 120000)
-
-  const offlineDetect = getOfflineDetectConfig(id)
-  // 临时固定为10，忽略配置中的 maxRetry（调试完成后删除这行，恢复下面的注释）
-  const maxRetries = 10
-  // const configMaxRetry = config.bot?.maxRetry
-  // let maxRetries = 10
-  // if (configMaxRetry === '.inf' || configMaxRetry === Infinity) {
-  //   maxRetries = Infinity
-  // } else if (typeof configMaxRetry === 'number' && !isNaN(configMaxRetry)) {
-  //   maxRetries = configMaxRetry
-  // }
-  const retryDelay = Math.min(30000, 5000 * (retryCount + 1))  // 5s, 10s, 15s... 最大30s
-
-  Bot.makeLog('warn', [`[${id}] 开始自动重连... (第 ${retryCount + 1} 次尝试)`], id)
-
-  try {
-    Bot.makeLog('warn', [`[${id}] 正在断开旧连接...`], id)
-    try {
-      await bot.logout()
-      if (!isCurrentAttempt()) return
-      Bot.makeLog('warn', [`[${id}] 旧连接已断开`], id)
-    } catch (err) {
-      if (!isCurrentAttempt()) return
-      Bot.makeLog('warn', [`[${id}] 断开旧连接失败（忽略）`, err.message], id)
+  async _doReconnect (id, retryCount = 0, options = {}) {
+    const bot = Bot[id]
+    if (!bot || bot.disabledRuntime) return
+    // 如果已经在重连中，跳过（包括重试调用）
+    if (offlineCheckState.retrying[id]) {
+      Bot.makeLog('warn', [`[${id}] 已在重连中，跳过本次重连 (retryCount=${retryCount})`], id)
+      return
     }
 
-    // 等待一小段时间确保旧连接完全关闭
-    await new Promise(resolve => setTimeout(resolve, 1000))
-    if (!isCurrentAttempt()) return
+    const offlineDetect = getOfflineDetectConfig(id)
+    if (!offlineDetect.autoReconnect) return
+    const existingNotice = offlineCheckState.reconnectNotice[id]
+    const reconnectNotice = existingNotice || {
+      attempted: false,
+      notified: false,
+      reason: options.reason || 'socket-closed',
+      startedAt: Date.now()
+    }
+    offlineCheckState.reconnectNotice[id] = reconnectNotice
+    const canProceed = typeof options.canProceed === 'function' ? options.canProceed : () => true
 
-    Bot.makeLog('warn', [`[${id}] 正在重新登录...`], id)
-    const loginResult = await bot.login()
-    if (!isCurrentAttempt() || loginResult === false) return
-    Bot.makeLog('warn', [`[${id}] 重新登录成功`], id)
+    offlineCheckState.retrying[id] = true
+    offlineCheckState.retryingAt[id] = Date.now()
+    const reconnectSeq = (offlineCheckState.reconnectSeq[id] || 0) + 1
+    offlineCheckState.reconnectSeq[id] = reconnectSeq
+    const ownsAttempt = () => Bot[id] === bot && offlineCheckState.reconnectSeq[id] === reconnectSeq
+    const isCurrentAttempt = () => ownsAttempt() && !bot.disabledRuntime
+    bot.isReconnecting = true  // 设置重连标志
 
-    // 重连成功，重置计数和状态
-    bot.reconnectCount = 0
-    delete offlineCheckState.retrying[id]
-    delete offlineCheckState.retryingAt[id]
-    if (offlineCheckState.reconnectWatchdog[id]) {
-      clearTimeout(offlineCheckState.reconnectWatchdog[id])
+    if (offlineCheckState.reconnectWatchdog[id]) clearTimeout(offlineCheckState.reconnectWatchdog[id])
+    offlineCheckState.reconnectWatchdog[id] = setTimeout(() => {
+      if (!isCurrentAttempt()) return
+      if (!offlineCheckState.retrying[id]) return
       delete offlineCheckState.reconnectWatchdog[id]
-    }
-    bot.isReconnecting = false
-    Bot.makeLog('warn', [`[${id}] 自动重连成功`], id)
-
-    if (offlineDetect.notify) {
-      try {
-        await sendQQBotInternalMasterMsg(`[${id}] 账号重连成功！`)
-      } catch (err) {
-        if (!isCurrentAttempt()) return
-        Bot.makeLog('error', ['发送重连成功通知失败', err.message], id)
-      }
-    }
-  } catch (err) {
-    if (!isCurrentAttempt()) return
-    Bot.makeLog('error', [`[${id}] 自动重连失败 (第 ${retryCount + 1} 次)`, err.message], id)
-    
-    // 判断是否还有重试次数（Infinity 永远为 true）
-    if (retryCount + 1 < maxRetries) {
-      // 还有重试次数，延迟后重试
-      Bot.makeLog('warn', [`[${id}] 将在 ${retryDelay / 1000}s 后重试...`], id)
-      
-      const retryGeneration = bot.connectionGeneration
-      const retryTimer = setTimeout(async () => {
-        if (offlineCheckState.waitingReconnectRetry[id] !== retryTimer) return
-        delete offlineCheckState.waitingReconnectRetry[id]
-        if (!isCurrentAttempt() || bot.connectionGeneration !== retryGeneration) return
-        if (offlineCheckState.retrying[id] || bot.isReconnecting || [0, 1].includes(bot.sdk.ws?.readyState) || !getOfflineDetectConfig(id).autoReconnect) return
-        await this._doReconnect(id, retryCount + 1)
-      }, retryDelay)
-      offlineCheckState.waitingReconnectRetry[id] = retryTimer
+      Bot.makeLog('error', [`[${id}] 重连状态超过120秒未释放，已强制解除重连锁，等待下一轮检测/重连`], id)
+      offlineCheckState.reconnectSeq[id] = reconnectSeq + 1
+      bot.connectionGeneration = (bot.connectionGeneration || 0) + 1
+      try { bot.sdk._sessionLifecycle?.stop() } catch {}
+      bot._cancelLogin?.()
       delete offlineCheckState.retrying[id]
       delete offlineCheckState.retryingAt[id]
+      delete offlineCheckState.reconnectNotice[id]
       bot.isReconnecting = false
-      if (offlineCheckState.reconnectWatchdog[id]) {
-        clearTimeout(offlineCheckState.reconnectWatchdog[id])
-        delete offlineCheckState.reconnectWatchdog[id]
-      }
-       
-      return
-    } else {
-      // 达到最大重试次数，彻底失败
-      Bot.makeLog('error', [`[${id}] 重连失败次数已达上限 (${maxRetries})，停止重试`], id)
-      
-      if (offlineDetect.notify) {
-        try {
-          await sendQQBotInternalMasterMsg(`[${id}] 自动重连失败：已达最大重试次数 (${maxRetries === Infinity ? '无限制' : maxRetries})，请手动处理`)
-        } catch (e) {
-          if (!isCurrentAttempt()) return
-          Bot.makeLog('error', ['发送重连失败通知失败', e.message], id)
+    }, 120000)
+
+    // 临时固定为10，忽略配置中的 maxRetry（调试完成后删除这行，恢复下面的注释）
+    const maxRetries = 10
+    // const configMaxRetry = config.bot?.maxRetry
+    // let maxRetries = 10
+    // if (configMaxRetry === '.inf' || configMaxRetry === Infinity) {
+    //   maxRetries = Infinity
+    // } else if (typeof configMaxRetry === 'number' && !isNaN(configMaxRetry)) {
+    //   maxRetries = configMaxRetry
+    // }
+    const retryDelay = Math.min(30000, 5000 * (retryCount + 1))  // 5s, 10s, 15s... 最大30s
+
+    Bot.makeLog('warn', [`[${id}] 开始自动重连... (第 ${retryCount + 1} 次尝试)`], id)
+
+    try {
+      if (!reconnectNotice.attempted) {
+        reconnectNotice.attempted = true
+        bot.reconnectCount = (bot.reconnectCount || 0) + 1
+        if (offlineDetect.notify) {
+          const action = `，正在重连(已经${bot.reconnectCount}次)`
+          const offlineMessage = reconnectNotice.reason === 'heartbeat'
+            ? `[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效${action}`
+            : `[${id}] 账号下线：[下线通知]你的帐号当前连接已断开${action}`
+          try {
+            if (!canProceed()) return
+            await sendQQBotInternalMasterMsg(offlineMessage)
+            reconnectNotice.notified = true
+          } catch (err) {
+            if (!isCurrentAttempt()) return
+            Bot.makeLog('error', ['发送下线通知失败', err.message], id)
+          }
         }
       }
-    }
-  } finally {
-    // 只有彻底成功或彻底失败时才清除 retrying 状态
-    if (ownsAttempt() && !offlineCheckState.waitingReconnectRetry[id]) {
+      if (!canProceed()) return
+
+      Bot.makeLog('warn', [`[${id}] 正在断开旧连接...`], id)
+      try {
+        await bot.logout()
+        if (!isCurrentAttempt()) return
+        Bot.makeLog('warn', [`[${id}] 旧连接已断开`], id)
+      } catch (err) {
+        if (!isCurrentAttempt()) return
+        Bot.makeLog('warn', [`[${id}] 断开旧连接失败（忽略）`, err.message], id)
+      }
+
+      // 等待一小段时间确保旧连接完全关闭
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      if (!isCurrentAttempt()) return
+
+      Bot.makeLog('warn', [`[${id}] 正在重新登录...`], id)
+      const loginResult = await bot.login()
+      if (!isCurrentAttempt() || loginResult === false) return
+      Bot.makeLog('warn', [`[${id}] 重新登录成功`], id)
+
+      // 重连成功，重置计数和状态
+      bot.reconnectCount = 0
       delete offlineCheckState.retrying[id]
       delete offlineCheckState.retryingAt[id]
       if (offlineCheckState.reconnectWatchdog[id]) {
         clearTimeout(offlineCheckState.reconnectWatchdog[id])
         delete offlineCheckState.reconnectWatchdog[id]
       }
-      bot.isReconnecting = false  // 清除重连标志
+      bot.isReconnecting = false
+      Bot.makeLog('warn', [`[${id}] 自动重连成功`], id)
+
+      // 只有异常重连已经发送过下线通知，才发送对应的成功通知。
+      const shouldNotifySuccess = offlineDetect.notify && reconnectNotice.notified
+      delete offlineCheckState.reconnectNotice[id]
+      if (shouldNotifySuccess) {
+        try {
+          await sendQQBotInternalMasterMsg(`[${id}] 账号重连成功！`)
+        } catch (err) {
+          if (!isCurrentAttempt()) return
+          Bot.makeLog('error', ['发送重连成功通知失败', err.message], id)
+        }
+      }
+    } catch (err) {
+      if (!isCurrentAttempt()) return
+      Bot.makeLog('error', [`[${id}] 自动重连失败 (第 ${retryCount + 1} 次)`, err.message], id)
+      
+      // 判断是否还有重试次数（Infinity 永远为 true）
+      if (retryCount + 1 < maxRetries) {
+        // 还有重试次数，延迟后重试
+        Bot.makeLog('warn', [`[${id}] 将在 ${retryDelay / 1000}s 后重试...`], id)
+        
+        const retryGeneration = bot.connectionGeneration
+        const retryTimer = setTimeout(async () => {
+          if (offlineCheckState.waitingReconnectRetry[id] !== retryTimer) return
+          delete offlineCheckState.waitingReconnectRetry[id]
+          if (!isCurrentAttempt() || bot.connectionGeneration !== retryGeneration) return
+          if (offlineCheckState.retrying[id] || bot.isReconnecting || [0, 1].includes(bot.sdk.ws?.readyState) || !getOfflineDetectConfig(id).autoReconnect) return
+          await this._doReconnect(id, retryCount + 1)
+        }, retryDelay)
+        offlineCheckState.waitingReconnectRetry[id] = retryTimer
+        delete offlineCheckState.retrying[id]
+        delete offlineCheckState.retryingAt[id]
+        bot.isReconnecting = false
+        if (offlineCheckState.reconnectWatchdog[id]) {
+          clearTimeout(offlineCheckState.reconnectWatchdog[id])
+          delete offlineCheckState.reconnectWatchdog[id]
+        }
+        
+        return
+      } else {
+        // 达到最大重试次数，彻底失败
+        Bot.makeLog('error', [`[${id}] 重连失败次数已达上限 (${maxRetries})，停止重试`], id)
+        
+        if (offlineDetect.notify) {
+          try {
+            await sendQQBotInternalMasterMsg(`[${id}] 自动重连失败：已达最大重试次数 (${maxRetries === Infinity ? '无限制' : maxRetries})，请手动处理`)
+          } catch (e) {
+            if (!isCurrentAttempt()) return
+            Bot.makeLog('error', ['发送重连失败通知失败', e.message], id)
+          }
+        }
+      }
+    } finally {
+      // 只有彻底成功或彻底失败时才清除 retrying 状态和异常通知事务。
+      if (ownsAttempt() && !offlineCheckState.waitingReconnectRetry[id]) {
+        delete offlineCheckState.retrying[id]
+        delete offlineCheckState.retryingAt[id]
+        if (offlineCheckState.reconnectWatchdog[id]) {
+          clearTimeout(offlineCheckState.reconnectWatchdog[id])
+          delete offlineCheckState.reconnectWatchdog[id]
+        }
+        delete offlineCheckState.reconnectNotice[id]
+        bot.isReconnecting = false  // 清除重连标志
+      }
     }
   }
-}
 
   // ========== 掉线检测结束 ==========
 
@@ -6583,11 +6778,13 @@ async connect (token) {
   ensureUserManageConfig(id)
   const existingBot = Bot[id]
   if (existingBot) {
+    clearQQBotMessageQueue(id)
     existingBot.connectionGeneration = (existingBot.connectionGeneration || 0) + 1
     this.stopOfflineCheck(id)
     offlineCheckState.reconnectSeq[id] = (offlineCheckState.reconnectSeq[id] || 0) + 1
     delete offlineCheckState.retrying[id]
     delete offlineCheckState.retryingAt[id]
+    delete offlineCheckState.reconnectNotice[id]
     existingBot.sdk._sessionLifecycle?.dispose()
     existingBot._cancelLogin?.()
     try { await existingBot.logout() } catch (err) {
@@ -6680,6 +6877,7 @@ async connect (token) {
   }
   applyQQBotUserAgentPatch()
   let gatewayIpBlocked = false
+  let readOnlyRecovery
   const enterIpWhitelistBlockedMode = async (detail) => {
     gatewayIpBlocked = true
     Bot.makeLog('error', [`[${id}] /gateway/bot 接口访问源IP不在白名单，已拒绝连接该机器人；请到 QQ 开放平台添加当前服务器出口 IP 白名单，配置不会删除，重启后会继续尝试`, detail], id)
@@ -6692,8 +6890,7 @@ async connect (token) {
     return { status: 200, data: { url: '', shards: 1 } }
   }
   const enterReadOnlyMode = (detail) => {
-    if (Bot[id]) Bot[id].readOnlyMode = true
-    Bot.makeLog('error', [`[${id}] 当前机器人为只读模式，只接收消息，不处理任何指令`, detail], id)
+    readOnlyRecovery?.enter(detail, 'gateway')
     return {
       status: 200,
       data: {
@@ -6852,7 +7049,9 @@ async connect (token) {
     // Gateway fallback is part of its shared request promise.
     if (err.config?.url === '/gateway/bot') throw err
     if (isQQBotIpWhitelistError(err)) return blockGatewayIp(signal, err)
-    if (isQQBotReadOnlyError(err.response?.data)) return enterReadOnlyMode(err.response?.data)
+    if (isQQBotReadOnlyError(err.response?.data || err)) {
+      readOnlyRecovery?.businessError(err.config?.url, err.response?.data || err.message)
+    }
     throw err
   })
   sdk.sessionManager.getWsUrl = async function () {
@@ -6891,6 +7090,7 @@ async connect (token) {
     sdk,
     connectionGeneration: (existingBot?.connectionGeneration || 0) + 1,
     login () {
+      clearQQBotMessageQueue(id)
       this._cancelLogin?.()
       return new Promise((resolve, reject) => {
         let settled = false
@@ -6921,8 +7121,7 @@ async connect (token) {
             return
           }
           if (isQQBotReadOnlyError(data)) {
-            this.readOnlyMode = true
-            Bot.makeLog('error', [`[${id}] 当前机器人为只读模式，只接收消息，不处理任何指令`, data], id)
+            readOnlyRecovery?.enter(data, 'session')
             return
           }
           finishReject(new Error(data?.msg || 'connection dead'))
@@ -6996,8 +7195,7 @@ async connect (token) {
             return
           }
           if (isQQBotReadOnlyError(err)) {
-            this.readOnlyMode = true
-            Bot.makeLog('error', [`[${id}] 当前机器人为只读模式，只接收消息，不处理任何指令`, err.message], id)
+            readOnlyRecovery?.enter(err.message, 'start')
             return
           }
           if (isQQBotCanceledError(err)) {
@@ -7010,6 +7208,7 @@ async connect (token) {
       })
     },
     logout () {
+      clearQQBotMessageQueue(id)
       return new Promise((resolve) => {
         const socket = this.sdk.ws
         let timer
@@ -7081,6 +7280,15 @@ async connect (token) {
   }
 
   const runtime = Bot[id]
+  readOnlyRecovery = createReadOnlyRecovery(runtime, {
+    isCurrent: () => Bot[id] === runtime && runtime.sdk === sdk && !runtime.disabledRuntime,
+    probe: signal => originalRequestGet('/gateway/bot', {
+      timeout: 5000,
+      signal: AbortSignal.any([signal, sdk._sessionLifecycle.signal])
+    }),
+    log: (level, message, detail) => Bot.makeLog(level, [`[${id}] ${message}`, ...(detail ? [detail] : [])], id)
+  })
+  runtime._readOnlyRecovery = readOnlyRecovery
   const failConnection = async reason => {
     if (Bot[id] !== runtime) return { ok: false, reason: reason || '登录已取消' }
     const logoutPromise = runtime.logout()
@@ -7137,6 +7345,7 @@ async connect (token) {
     onReady: socket => {
       if (Bot[id] !== runtime || runtime.sdk !== sdk || runtime.disabledRuntime || sdk.ws !== socket) return
       runtime.reconnectCount = 0
+      void readOnlyRecovery?.recover('READY/RESUMED')
     },
     onHeartbeatTimeout: async ({ socket, timeoutMs, isStillTimedOut }) => {
       const generation = runtime.connectionGeneration
@@ -7145,20 +7354,23 @@ async connect (token) {
         !runtime.isReconnecting && !offlineCheckState.retrying[id] && !offlineCheckState.waitingReconnectRetry[id]
       if (!canHandle()) return
       const offlineDetect = getOfflineDetectConfig(id)
-      if (offlineDetect.autoReconnect) runtime.reconnectCount = (runtime.reconnectCount || 0) + 1
       Bot.makeLog('warn', [`[${id}] 心跳超时 (${timeoutMs / 1000}s 无ACK)，判定为掉线`], id)
-      if (offlineDetect.notify) {
+      if (!offlineDetect.autoReconnect) {
+        if (!offlineDetect.notify) return
         if (!canHandle()) return
-        const action = offlineDetect.autoReconnect ? `，正在重连(已经${runtime.reconnectCount}次)` : '，自动重连已关闭'
         try {
-          await sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效${action}`)
+          await sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效，自动重连已关闭`)
         } catch (err) {
           if (!canHandle()) return
           Bot.makeLog('error', ['发送心跳超时通知失败', err.message], id)
         }
+        return
       }
-      if (!canHandle() || !getOfflineDetectConfig(id).autoReconnect) return
-      await adapter._doReconnect(id)
+      // 只把连接身份和当前心跳超时作为继续条件；_doReconnect 会自行设置重连锁。
+      const canProceed = () => Bot[id] === runtime && runtime.sdk === sdk && !runtime.disabledRuntime &&
+        runtime.connectionGeneration === generation && sdk.ws === socket && isStillTimedOut()
+      if (!canProceed()) return
+      await adapter._doReconnect(id, 0, { reason: 'heartbeat', canProceed })
     },
     onError: async err => {
       if (Bot[id] !== runtime || runtime.disabledRuntime || runtime.sdk !== sdk) return
@@ -7299,6 +7511,22 @@ async connect (token) {
   }
   // ===== getAccessToken 拦截结束 =====
 
+  // Bind once, before login/DAU readiness; a stalled statistics initializer must
+  // not leave a live SDK without application message listeners.
+  runtime.dauReady = false
+  await runQQBotMessageStep(id, 'dau-init', async () => {
+    await runtime.dau.init()
+    if (Bot[id] === runtime && !runtime.disabledRuntime) runtime.dauReady = true
+  }, { optional: true, timeoutMs: 5000 })
+  if (Bot[id] !== runtime || runtime.disabledRuntime) return { ok: false, reason: '登录已取消' }
+  sdk.on('message', event => {
+    if (Bot[id] !== runtime || runtime.disabledRuntime) return
+    noteQQBotMessagePhase(id, 'parsed', event)
+    enqueueQQBotMessage(this, id, event)
+  })
+  sdk.on('notice', event => this.makeNotice(id, event).catch(err => Bot.makeLog('error', [`[${id}] 通知处理失败`, err.message], id)))
+  sdk.on('request', event => this.makeRequest(id, event).catch(err => Bot.makeLog('error', [`[${id}] 加群申请处理失败`, err.message], id)))
+
   // 初次登录失败必须返回给设置命令，不能继续伪装成已连接。
   let initialLoginGeneration
   try {
@@ -7321,12 +7549,8 @@ async connect (token) {
   }
   if (runtime.disabledRuntime) return failConnection(runtime.disabledReason || '机器人运行态已停止')
   
-  await runtime.dau.init()
   if (Bot[id] !== runtime || runtime.disabledRuntime || runtime.connectionGeneration !== initialLoginGeneration) return { ok: false, reason: '登录已取消' }
 
-  Bot[id].sdk.on('message', event => enqueueQQBotMessage(this, id, event))
-  Bot[id].sdk.on('notice', event => this.makeNotice(id, event).catch(err => Bot.makeLog('error', [`[${id}] 通知处理失败`, err.message], id)))
-  Bot[id].sdk.on('request', event => this.makeRequest(id, event).catch(err => Bot.makeLog('error', [`[${id}] 加群申请处理失败`, err.message], id)))
   groupInfoStore.resumePending(id).catch(err => Bot.makeLog('warn', [`[${id}] 恢复群资料刷新任务失败`, err.message], id))
 
   // 启动掉线检测
@@ -7355,14 +7579,6 @@ const cleanedSuffixConfig = removeLegacySuffixConfig()
 const migratedAccountConfig = migrateLegacyAccountConfig()
 const migratedMessageProtectionConfig = migrateLegacyMessageProtectionConfig()
 
-if (migratedAccountConfig) {
-  try {
-    await configSave()
-  } catch (err) {
-    Bot.makeLog?.('error', ['QQBot账号配置迁移保存失败', err.message], 'QQBot-Plugin')
-  }
-}
-
 const timedStoreInit = async (name, init) => {
   const startedAt = Date.now()
   try {
@@ -7373,8 +7589,9 @@ const timedStoreInit = async (name, init) => {
 }
 
 const qqbotStoreInitializers = [
+  ['groupProactiveResults', () => timedStoreInit('groupProactiveResults', () => groupProactiveResultStore.migrate(config, configSave))],
   ['fullMessage', () => timedStoreInit('fullMessage', () => initFullMessageStore(config)).then(cleanedConfig => {
-    if (cleanedConfig || cleanedBotConfig || cleanedSuffixConfig || migratedMessageProtectionConfig) return configSave()
+    if (cleanedConfig || cleanedBotConfig || cleanedSuffixConfig || migratedMessageProtectionConfig || migratedAccountConfig) return configSave()
   })],
   ['invite', () => timedStoreInit('invite', () => initInviteStore(config))],
   ['chat', () => timedStoreInit('chat', () => chatStore.init())],
@@ -7504,13 +7721,23 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
-          reg: /^#q+bot群聊主动(?:菜单|配置(?:\s+[\s\S]+)?|预览|发送(?:\s+\d+)?|结果(?:\s+\d+)?|查看可主动群(?:\s+\d+)?)$/i,
+          reg: /^#q+bot群聊主动(?:菜单|配置(?:\s+[\s\S]+)?|预览|发送(?:\s+\d+)?(?:\s+确认)?|结果删除(?:\s+全部(?:\s+确认)?)?|结果(?:\s+\d+)?|查看可主动群(?:\s+\d+)?)$/i,
           fnc: 'groupProactiveCommand',
           permission: config.permission
         },
         {
           reg: /^#q+bot其他菜单$/i,
           fnc: 'otherMenu',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot素材管理(?:菜单|状态|查看(?:\s+\d+)?|详情\s+\S+|删除\s+\S+(?:\s+确认)?|(?:清理|清空)(?:\s+确认)?|切换\s+(?:官方素材管理|腾讯云CI)|自动清理\s+(?:开启|关闭)|保留时间\s+\d+(?:天|小时)|满额策略(?:\s+(?:CI优先|清理最早5张))?)$/i,
+          fnc: 'mediaImageCommand',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot(?:网络)?图片转换(?:\s+(?:开启|关闭))?$/i,
+          fnc: 'imageConvertSetting',
           permission: config.permission
         },
         {
@@ -7986,6 +8213,7 @@ export class QQBotAdapter extends plugin {
   async refConfig () {
     if (!this.guardOfficialBot()) return true
     await refConfig()
+    await groupProactiveResultStore.migrate(config, configSave)
     if (migrateLegacyAccountConfig()) await configSave()
     ensureFullMessageConfig(config, this.e.self_id)
     this.reply('QQBot配置已安全刷新', true)
@@ -8470,7 +8698,9 @@ export class QQBotAdapter extends plugin {
       '',
       `>接口：${getQQBotApiMode() === 'new' ? '新接口' : '老接口'}`,
       '',
-      '><qqbot-cmd-input text="#QQBot接口切换菜单" show="接口切换菜单"/>'
+      '><qqbot-cmd-input text="#QQBot接口切换菜单" show="接口切换菜单"/>',
+      '',
+      '><qqbot-cmd-input text="#qqbot素材管理菜单" show="素材管理菜单"/>'
     ].join('\n')
     return this.reply([
       msg,
@@ -8479,10 +8709,36 @@ export class QQBotAdapter extends plugin {
           { text: `${botConfig.toImg ? '关闭' : '开启'}转图片`, callback: `#QQBot设置转图片${botConfig.toImg ? '关闭' : '开启'}` },
           { text: '消息后缀', callback: '#QQBot消息后缀菜单' }
         ],
-        [{ text: '接口切换', callback: '#QQBot接口切换菜单' }],
+        [{ text: '接口切换', callback: '#QQBot接口切换菜单' }, { text: '素材管理', callback: '#qqbot素材管理菜单' }],
         [{ text: '返回', callback: '#QQBot帮助' }]
       )
     ], true)
+  }
+
+  async mediaImageCommand () {
+    if (!this.guardOfficialBot()) return true
+    return handleMediaImageCommand({
+      event: this.e, reply: (...args) => this.reply(...args), buttons: (...rows) => segment.button(...rows),
+      manager: qqbotMediaManager, getSettings: getQQBotMediaSettings,
+      getImageConvert: selfId => getBotConfigValue(selfId, 'markdownImageConvert'),
+      customStatus: getQQBotCustomImageBedStatus, confirmations: qqbotMediaConfirmations,
+      saveSettings: async (selfId, settings) => {
+        qqbotMediaManager.writable()
+        setBotConfigValue(selfId, 'imageFallback', settings)
+        await configSave()
+      }
+    })
+  }
+
+  async imageConvertSetting () {
+    if (!this.guardOfficialBot()) return true
+    return handleImageConvertCommand({
+      event: this.e, reply: (...args) => this.reply(...args), buttons: (...rows) => segment.button(...rows),
+      getValue: selfId => getBotConfigValue(selfId, 'markdownImageConvert'),
+      setValue: (selfId, value) => setBotConfigValue(selfId, 'markdownImageConvert', value),
+      save: configSave,
+      customLoaded: () => Handler.has('QQBot.makeMarkdownImage')
+    })
   }
 
   async apiSwitch () {
@@ -9864,12 +10120,170 @@ export class QQBotAdapter extends plugin {
     }
   }
 
+  async _runGroupProactiveTask (selfId, targets, run) {
+    let fatalError
+    const bot = Bot[selfId]
+    const unavailable = error => {
+      const data = error?.response?.data || error || {}
+      const message = String(data.message || data.msg || error?.message || '')
+      const code = Number(data.code || data.err_code || /code\((\d+)\)/i.exec(message)?.[1] || 0)
+      return code === 11293 || /机器人非群成员|机器人不在群|not group member|群已注销|群不存在|请求的资源不存在\s*[（(]用户\s*\/\s*群已注销[）)]/i.test(message)
+    }
+    Bot.makeLog('mark', [`[${selfId}] 群聊主动发送开始，共 ${run.total} 个群`], selfId)
+    try {
+      for (const [index, group] of targets.entries()) {
+        if (Bot[selfId] !== bot || bot?.disabledRuntime) throw new Error('机器人运行态已变更，任务中断')
+        const item = run.results[index]
+        const target = formatQQBotGroupLogTarget(selfId, group.openid, item.group_name)
+        const progress = `${index + 1}/${run.total}`
+        run.current_index = index
+        run.updated_at = new Date().toISOString()
+        const payload = {
+          msg_type: 0,
+          content: run.markdown,
+          msg_seq: Math.floor(Math.random() * 1000000) + 1
+        }
+        if (run.markdownMode === 'raw') {
+          payload.msg_type = 2
+          payload.markdown = { content: run.markdown }
+          delete payload.content
+          if (run.buttonEnabled && run.button) payload.keyboard = { content: run.button, bot_appid: Number(bot?.info?.appid || 0) }
+        }
+        let result
+        let sent = false
+        let lastError
+        if (groupInfoStore.getBotState(selfId, group.openid)?.allow_proactive_msg !== true) {
+          item.error = '主动消息权限已关闭，跳过发送'
+          item.recheck = 'disabled'
+        } else {
+          item.attempts = 1
+          try {
+            const response = await bot.sdk.request.post(`/v2/groups/${group.openid}/messages`, payload, { timeout: 15000 })
+            result = response.data
+            sent = true
+          } catch (err) {
+            lastError = err
+            item.error = err.response?.data?.message || err.message || '发送失败'
+            Bot.makeLog('warn', [`[${selfId}] 群聊主动消息首次发送失败，复核群状态`, { progress, group: target, reason: item.error }], selfId)
+            let checked
+            try {
+              checked = await groupInfoStore.recheckProactiveState(selfId, group.openid, () => bot.sdk.request.get(`/v2/groups/${group.openid}/bot_state`, { timeout: 15000 }))
+            } catch (refreshError) {
+              checked = { ok: false, error: refreshError }
+            }
+            if (checked?.ok && checked.state?.allow_proactive_msg === true) {
+              item.recheck = 'allowed'
+              if (Bot[selfId] === bot && !bot.disabledRuntime) {
+                item.attempts = 2
+                Bot.makeLog('info', [`[${selfId}] 群聊主动权限仍开启，重发一次`, { progress, group: target }], selfId)
+                try {
+                  const response = await bot.sdk.request.post(`/v2/groups/${group.openid}/messages`, payload, { timeout: 15000 })
+                  result = response.data
+                  sent = true
+                  item.error = ''
+                } catch (retryError) {
+                  lastError = retryError
+                  item.error = retryError.response?.data?.message || retryError.message || '重发失败'
+                  if (unavailable(retryError)) {
+                    try {
+                      await groupInfoStore.markProactiveUnavailable(selfId, group.openid, item.error)
+                      item.recheck = 'removed'
+                      Bot.makeLog('warn', [`[${selfId}] 重发确认群成员资格失效，已从可主动列表移除`, { progress, group: target }], selfId)
+                    } catch (saveError) {
+                      Bot.makeLog('error', [`[${selfId}] 更新失效群缓存失败`, { progress, group: target, reason: saveError.message }], selfId)
+                    }
+                  }
+                }
+              }
+            } else if (checked?.ok) {
+              item.recheck = 'disabled'
+              Bot.makeLog('warn', [`[${selfId}] 群聊主动权限已关闭，已从可主动列表移除`, { progress, group: target }], selfId)
+            } else {
+              item.recheck = 'unknown'
+              if (unavailable(checked?.error)) {
+                try {
+                  await groupInfoStore.markProactiveUnavailable(selfId, group.openid, checked?.error?.message || item.error)
+                  item.recheck = 'removed'
+                  Bot.makeLog('warn', [`[${selfId}] 群聊成员资格已失效，已从可主动列表移除`, { progress, group: target }], selfId)
+                } catch (saveError) {
+                  Bot.makeLog('error', [`[${selfId}] 更新失效群缓存失败`, { progress, group: target, reason: saveError.message }], selfId)
+                }
+              } else {
+                Bot.makeLog('warn', [`[${selfId}] 群状态复核失败，保留旧缓存且不重发`, { progress, group: target, reason: checked?.error?.message || '状态未知' }], selfId)
+              }
+            }
+          }
+        }
+        if (sent) {
+          item.status = 'success'
+          item.ok = true
+          item.message_id = result?.id || ''
+          run.success_count++
+          Bot.makeLog('info', [`[${selfId}] 群聊主动消息发送成功`, { progress, group: target, attempts: item.attempts, id: item.message_id }], selfId)
+        } else {
+          item.status = 'failed'
+          item.ok = false
+          run.failed_count++
+          Bot.makeLog('warn', [`[${selfId}] 群聊主动消息发送失败`, { progress, group: target, attempts: item.attempts || 0, reason: item.error, code: lastError?.response?.data?.code || lastError?.response?.data?.err_code || '' }], selfId)
+        }
+        run.completed = run.success_count + run.failed_count
+        run.pending_count = Math.max(0, run.total - run.completed)
+        run.updated_at = new Date().toISOString()
+        if (item.status === 'success') {
+          try {
+            await recordQQBotLocalMessageResponse({ self_id: selfId, target_id: group.openid, type: 'group', author_openid: selfId, content_fingerprint: getQQBotMessageContentFingerprint(payload) }, result)
+          } catch (err) {
+            Bot.makeLog('warn', ['群聊主动消息已发送，本地记录失败', err.message], selfId)
+          }
+        }
+        if (index + 1 < targets.length) await sleep(2000)
+      }
+    } catch (err) {
+      fatalError = err
+      run.error = err.message || String(err)
+      run.pending_count = run.results.filter(item => item.status === 'pending').length
+      run.completed = run.total - run.pending_count
+      Bot.makeLog('error', [`[${selfId}] 群聊主动发送中断`, { progress: `${run.completed}/${run.total}`, reason: run.error }], selfId)
+    }
+
+    run.status = fatalError ? 'failed' : 'completed'
+    run.finished_at = new Date().toISOString()
+    run.updated_at = run.finished_at
+    const storedRun = {
+      run_id: run.run_id,
+      started_at: run.started_at,
+      finished_at: run.finished_at,
+      status: run.status,
+      total: run.total,
+      success_count: run.success_count,
+      failed_count: run.failed_count,
+      pending_count: run.pending_count,
+      error: run.error || '',
+      results: run.results.map(item => ({ ...item }))
+    }
+    run.storedRun = storedRun
+    try {
+      await groupProactiveResultStore.addRun(selfId, storedRun)
+      run.persisted = true
+      Bot.makeLog('mark', [`[${selfId}] 群聊主动发送${fatalError ? '异常结束' : '完成'}`, { total: run.total, success: run.success_count, failed: run.failed_count, pending: run.pending_count }], selfId)
+    } catch (err) {
+      run.status = 'save_failed'
+      run.error = `发送结果保存失败: ${err.message || err}`
+      Bot.makeLog('error', [`[${selfId}] 群聊主动发送结果保存失败`, { total: run.total, success: run.success_count, failed: run.failed_count, pending: run.pending_count, reason: run.error }], selfId)
+      throw err
+    }
+    return run
+  }
+
   async groupProactiveCommand () {
     if (!this.guardOfficialBot()) return true
+    await qqbotStoresReady
+    if (qqbotStoreInitError) return this.reply(`QQBot存储初始化失败：${qqbotStoreInitError.message}`, true)
     const selfId = this.e.self_id
     const msg = String(this.e.msg || '')
     const settings = ensureGroupProactiveConfig(selfId)
-    const groups = await getAllQQBotGroups(selfId)
+    // 结果查询和清空直接读取任务状态，不等待群列表加载。
+    const groups = /^#q+bot群聊主动结果/i.test(msg) ? [] : await getAllQQBotGroups(selfId)
     const allowedGroups = groups.filter(group => groupInfoStore.getBotState(selfId, group.openid)?.allow_proactive_msg === true)
     const menu = () => this.reply([
       [
@@ -9894,7 +10308,7 @@ export class QQBotAdapter extends plugin {
         [{ text: '主动配置', callback: '#QQBot群聊主动配置' }, { text: '主动预览', callback: '#QQBot群聊主动预览' }],
         [{ text: '可主动群', callback: '#QQBot群聊主动查看可主动群 1' }, { text: '发送群聊', callback: `#QQBot群聊主动发送 ${allowedGroups.length}` }],
         [{ text: '发送结果', callback: '#QQBot群聊主动结果 1' }, { text: '刷新状态', callback: '#QQBot刷新所有群' }],
-        [{ text: '返回', callback: '#QQBot普通设置' }]
+        [{ text: '清空结果', callback: '#QQBot群聊主动结果删除 全部' }, { text: '返回', callback: '#QQBot普通设置' }]
       )
     ], true)
 
@@ -9937,7 +10351,8 @@ export class QQBotAdapter extends plugin {
 
     const configMatch = /^#q+bot群聊主动配置\s+([\s\S]+)$/i.exec(msg)
     if (configMatch) {
-      const args = configMatch[1].trim()
+      const rawArgs = getRawCommandArgs(this.e, /^#q+bot群聊主动配置\s+([\s\S]+)$/i)
+      const args = (rawArgs || configMatch[1]).trim()
       let match = /^markdown\s+([\s\S]+)$/i.exec(args)
       if (match) {
         const content = match[1].trim()
@@ -9985,51 +10400,149 @@ export class QQBotAdapter extends plugin {
 
     if (/^#q+bot群聊主动预览$/i.test(msg)) {
       if (!settings.markdown) return this.reply('未设置群聊主动消息内容，无法预览', true)
-      const buttons = settings.buttonEnabled && settings.button ? [{ type: 'raw', data: { type: 'keyboard', content: settings.button } }] : []
-      return this.reply([settings.markdown, ...buttons, segment.button([{ text: '返回', callback: '#QQBot群聊主动菜单' }])], true)
+      if (settings.buttonEnabled && settings.button) {
+        return this.reply([settings.markdown, { type: 'raw', data: { type: 'keyboard', content: settings.button } }], true)
+      }
+      return this.reply([settings.markdown, segment.button([{ text: '返回(实际不显示)', callback: '#QQBot群聊主动菜单' }])], true)
     }
 
-    const sendMatch = /^#q+bot群聊主动发送(?:\s+(\d+))?$/i.exec(msg)
+    const sendMatch = /^#q+bot群聊主动发送(?:\s+(\d+))?(?:\s+(确认))?$/i.exec(msg)
     if (sendMatch) {
       if (!settings.markdown) return this.reply('未设置群聊主动消息内容，无法发送', true)
-      const requested = Math.max(1, Number(sendMatch[1]) || allowedGroups.length)
+      const activeRun = groupProactiveActiveRuns.get(selfId)
+      if (activeRun) return this.reply([`当前已有群聊主动发送任务：${activeRun.completed}/${activeRun.total}，成功${activeRun.success_count}，失败${activeRun.failed_count}，待发送${activeRun.pending_count}`, segment.button([{ text: '查看实时进度', callback: '#QQBot群聊主动结果 1' }])], true)
+      const requested = sendMatch[1] === undefined ? allowedGroups.length : Number(sendMatch[1])
+      if (!Number.isSafeInteger(requested) || requested <= 0) return this.reply('发送数量必须为正整数，且当前需要有可主动发送的群。', true)
       const targets = allowedGroups.slice(0, requested)
       if (!targets.length) return this.reply('暂无允许主动消息的群，请先刷新群状态', true)
-      const startedAt = new Date().toISOString()
-      const results = []
-      for (const [index, group] of targets.entries()) {
-        const payload = { msg_type: 0, content: settings.markdown, msg_seq: Math.floor(Math.random() * 1000000) + 1 }
-        if (config.markdown?.[selfId] === 'raw') {
-          payload.msg_type = 2
-          payload.markdown = { content: settings.markdown }
-          delete payload.content
-          if (settings.buttonEnabled && settings.button) payload.keyboard = { content: settings.button, bot_appid: Number(Bot[selfId]?.info?.appid || 0) }
-        }
-        try {
-          const { data: result } = await Bot[selfId].sdk.request.post(`/v2/groups/${group.openid}/messages`, payload)
-          await recordQQBotLocalMessageResponse({ self_id: selfId, target_id: group.openid, type: 'group', author_openid: selfId, content_fingerprint: getQQBotMessageContentFingerprint(payload) }, result)
-          results.push({ group_openid: group.openid, group_name: getQQBotGroupDisplayName(selfId, group.openid), ok: true, message_id: result?.id || '' })
-        } catch (err) {
-          results.push({ group_openid: group.openid, group_name: getQQBotGroupDisplayName(selfId, group.openid), ok: false, error: err.response?.data?.message || err.message || '发送失败' })
-        }
-        if (index + 1 < targets.length) await sleep(2000)
+      if (sendMatch[2] !== '确认') {
+        return this.reply([
+          [
+            `#[${selfId}] 确认群聊主动发送`,
+            '',
+            `>本次目标群: ${targets.length} 个`,
+            '',
+            '>消息内容: 已配置',
+            `>按钮: ${settings.buttonEnabled && settings.button ? (config.markdown?.[selfId] === 'raw' ? '开启' : '当前发送模式不支持按钮') : '关闭或未配置'}`,
+            '>当前任务: 空闲',
+            '',
+            '>发送开始后将按顺序向目标群发送，过程中可使用“群聊主动结果 1”查看进度。',
+            '',
+            '>请确认是否开始发送。',
+            `确认命令: #QQBot群聊主动发送 ${targets.length} 确认`
+          ].join('\n'),
+          segment.button([{ text: '确认发送', callback: `#QQBot群聊主动发送 ${targets.length} 确认` }, { text: '返回菜单', callback: '#QQBot群聊主动菜单' }])
+        ], true)
       }
-      const run = { started_at: startedAt, finished_at: new Date().toISOString(), total: targets.length, success_count: results.filter(item => item.ok).length, failed_count: results.filter(item => !item.ok).length, results }
-      settings.results.unshift(run)
-      settings.results = settings.results.slice(0, 100)
-      await configSave()
-      const text = `群聊主动发送完成，共${run.total}个群，成功${run.success_count}个，失败${run.failed_count}个`
-      try { return await this.reply([text, segment.button([{ text: '发送结果', callback: '#QQBot群聊主动结果 1' }, { text: '主动菜单', callback: '#QQBot群聊主动菜单' }])], true) } catch { return sendQQBotInternalMasterMsg(text) }
+
+      const run = {
+        run_id: randomUUID(),
+        started_at: new Date().toISOString(),
+        status: 'running',
+        total: targets.length,
+        completed: 0,
+        success_count: 0,
+        failed_count: 0,
+        pending_count: targets.length,
+        current_index: -1,
+        markdown: settings.markdown,
+        markdownMode: config.markdown?.[selfId],
+        buttonEnabled: settings.buttonEnabled === true,
+        button: settings.button ? JSON.parse(JSON.stringify(settings.button)) : null,
+        results: targets.map(group => ({
+          group_openid: group.openid,
+          group_name: getQQBotGroupDisplayName(selfId, group.openid),
+          status: 'pending',
+          message_id: '',
+          error: ''
+        }))
+      }
+      groupProactiveActiveRuns.set(selfId, run)
+      const reply = this.reply.bind(this)
+      void this._runGroupProactiveTask(selfId, targets, run)
+        .finally(() => {
+          if (run.persisted && groupProactiveActiveRuns.get(selfId) === run) groupProactiveActiveRuns.delete(selfId)
+        })
+        .then(async completedRun => {
+          const text = `群聊主动发送${completedRun.status === 'failed' ? '异常结束' : '完成'}，共${completedRun.total}个群，成功${completedRun.success_count}个，失败${completedRun.failed_count}个${completedRun.pending_count ? `，待发送${completedRun.pending_count}个` : ''}${completedRun.error ? `\n原因: ${completedRun.error}` : ''}`
+          try {
+            await reply([text, segment.button([{ text: '发送结果', callback: '#QQBot群聊主动结果 1' }, { text: '主动菜单', callback: '#QQBot群聊主动菜单' }])], true)
+          } catch {
+            await sendQQBotInternalMasterMsg(text)
+          }
+        })
+        .catch(async err => {
+          const text = `[${selfId}] 群聊主动发送任务异常：${run.error || err.message || err}`
+          try { await reply([text, segment.button([{ text: '查看结果', callback: '#QQBot群聊主动结果 1' }, { text: '主动菜单', callback: '#QQBot群聊主动菜单' }])], true) } catch { await sendQQBotInternalMasterMsg(text) }
+        })
+        .catch(err => { Bot.makeLog('error', ['群聊主动任务通知失败', err.message || String(err)], selfId) })
+      return this.reply([`群聊主动发送已开始，共${run.total}个群。发送中可使用“#QQBot群聊主动结果 1”查看成功、失败和待发送进度。`, segment.button([{ text: '查看实时进度', callback: '#QQBot群聊主动结果 1' }, { text: '主动菜单', callback: '#QQBot群聊主动菜单' }])], true)
+    }
+
+    const deleteResultMatch = /^#q+bot群聊主动结果删除(?:\s+(全部)(?:\s+(确认))?)?$/i.exec(msg)
+    if (deleteResultMatch) {
+      const confirmed = deleteResultMatch[2] === '确认'
+      if (!deleteResultMatch[1] || !confirmed) {
+        const total = await groupProactiveResultStore.countRuns(selfId)
+        return this.reply([
+          [
+            `#[${selfId}] 清空群聊主动发送结果`,
+            '',
+            `>将清空 ${total} 条已完成发送结果。`,
+            '',
+            groupProactiveActiveRuns.has(selfId) ? '>当前发送中的任务不会被中断，但完成后会生成新的结果。' : '>当前没有发送中的任务。',
+            '',
+            '>清空后不可恢复，请确认。',
+            '确认命令: #QQBot群聊主动结果删除 全部 确认'
+          ].join('\n'),
+          segment.button([{ text: '确认清空', callback: '#QQBot群聊主动结果删除 全部 确认' }, { text: '返回结果', callback: '#QQBot群聊主动结果 1' }])
+        ], true)
+      }
+      const count = await groupProactiveResultStore.clearRuns(selfId)
+      return this.reply([`群聊主动发送结果已清空，共删除 ${count} 条。`, segment.button([{ text: '主动结果', callback: '#QQBot群聊主动结果 1' }, { text: '主动菜单', callback: '#QQBot群聊主动菜单' }])], true)
     }
 
     const resultMatch = /^#q+bot群聊主动结果(?:\s+(\d+))?$/i.exec(msg)
     if (resultMatch) {
       const pageSize = 10
-      const pageCount = Math.max(1, Math.ceil(settings.results.length / pageSize))
-      const page = Math.min(pageCount, Math.max(1, Number(resultMatch[1]) || 1))
-      const list = settings.results.slice((page - 1) * pageSize, page * pageSize)
-      const body = list.length ? list.map((run, index) => `${(page - 1) * pageSize + index + 1}. ${run.finished_at || '-'}\n成功/失败: ${run.success_count || 0}/${run.failed_count || 0}`).join('\n\n') : '暂无发送结果'
-      return this.reply([`#[${selfId}] 群聊主动结果 ${page}/${pageCount}\n\n${body}`, segment.button(...this._pageButtonRows('#QQBot群聊主动结果', { page, pageCount }), [{ text: '主动菜单', callback: '#QQBot群聊主动菜单' }])], true)
+      const unsaved = groupProactiveActiveRuns.get(selfId)
+      if (unsaved?.status === 'save_failed' && unsaved.storedRun) {
+        try {
+          await groupProactiveResultStore.addRun(selfId, unsaved.storedRun)
+          unsaved.persisted = true
+          if (groupProactiveActiveRuns.get(selfId) === unsaved) groupProactiveActiveRuns.delete(selfId)
+        } catch (err) {
+          Bot.makeLog('warn', ['群聊主动结果重试保存失败', err.message || String(err)], selfId)
+        }
+      }
+      const { list, page, pageCount } = await groupProactiveResultStore.listRuns(selfId, Number(resultMatch[1]) || 1, pageSize)
+      const active = groupProactiveActiveRuns.get(selfId)
+      const sections = []
+      if (active && page === 1) {
+        const recent = active.results.filter(item => item.status !== 'pending').slice(-20)
+        const recentBody = recent.length
+          ? recent.map(item => `${item.status === 'success' ? '成功' : '失败'} ${item.group_name || item.group_openid}${item.error ? `: ${item.error}` : ''}`).join('\n')
+          : '暂无已完成群'
+        sections.push([
+          active.status === 'running' ? '当前发送中' : active.status === 'save_failed' ? '发送已结束，结果保存失败' : '发送已结束，正在保存结果',
+          `进度: ${active.completed}/${active.total} (${Math.floor(active.completed / active.total * 100)}%)`,
+          `成功/失败/待发送: ${active.success_count}/${active.failed_count}/${active.pending_count}`,
+          ...(active.status === 'running' && active.pending_count ? [`待发送（含等待响应）: ${active.results.filter(item => item.status === 'pending').slice(0, 5).map(item => item.group_name || item.group_openid).join('、')}${active.pending_count > 5 ? '…' : ''}`] : []),
+          '',
+          '最近状态:',
+          recentBody
+        ].join('\n'))
+      }
+      if (list.length) {
+        sections.push(list.map((run, index) => `${(page - 1) * pageSize + index + 1}. ${run.finished_at || '-'}\n状态: ${run.status === 'failed' ? '异常结束' : '已完成'}\n成功/失败/待发送: ${run.success_count || 0}/${run.failed_count || 0}/${run.pending_count || 0}${run.error ? `\n原因: ${run.error}` : ''}`).join('\n\n'))
+      }
+      if (!sections.length) sections.push('暂无发送结果')
+      const rows = [
+        ...this._pageButtonRows('#QQBot群聊主动结果', { page, pageCount }),
+        ...(active && page === 1 ? [[{ text: '刷新进度', callback: '#QQBot群聊主动结果 1' }]] : []),
+        [{ text: '清空结果', callback: '#QQBot群聊主动结果删除 全部' }, { text: '主动菜单', callback: '#QQBot群聊主动菜单' }]
+      ].slice(0, 5)
+      return this.reply([`#[${selfId}] 群聊主动结果 ${page}/${pageCount}\n\n${sections.join('\n\n')}`, segment.button(...rows)], true)
     }
 
     return menu()
@@ -11217,7 +11730,7 @@ export class QQBotAdapter extends plugin {
       return
     }
     const bot = Bot[this.e.self_id]
-    const memberOpenid = normalizeQQBotOpenid(this.e.user_id || this.e.raw?.author?.id || this.e.raw?.sender?.user_id || 'openid')
+    const memberOpenid = normalizeQQBotOpenid(this.e.user_id || this.e.raw?.author?.id || this.e.raw?.sender?.user_id || '')
     const markdown = replaceWelcomeVariables(aw.markdown, { memberOpenid })
     const payload = {
       msg_type: 2,
