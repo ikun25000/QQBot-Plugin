@@ -221,6 +221,33 @@ class GroupInfoStore {
     return this._runRefresh(`${keyOf(selfId, groupOpenid)}:bot_state`, () => this._refreshBotState(selfId, groupOpenid, request))
   }
 
+  async recheckProactiveState (selfId, groupOpenid, request) {
+    const bot = globalThis.Bot?.[selfId]
+    try {
+      const response = await this._request(selfId, groupOpenid, 'bot_state', () => request ? request() : bot.sdk.request.get(`/v2/groups/${groupOpenid}/bot_state`), { retries: 0 })
+      const data = response?.data || response
+      if (typeof data?.allow_proactive_msg !== 'boolean') throw new Error('bot_state 响应缺少主动消息权限')
+      const state = normalizeState(data)
+      const roleError = state.member_role && !['owner', 'admin'].includes(state.member_role) ? { message: '不是管理员', at: now() } : null
+      const cached = await this._update(selfId, groupOpenid, { bot_state: { ...state, fetched_at: now(), error: roleError } })
+      return { ok: true, state: cached.bot_state }
+    } catch (err) {
+      const error = errorInfo(err)
+      await this._update(selfId, groupOpenid, current => ({ bot_state: { ...(current.bot_state || {}), error } }))
+      return { ok: false, error }
+    }
+  }
+
+  markProactiveUnavailable (selfId, groupOpenid, reason) {
+    return this._update(selfId, groupOpenid, current => ({
+      bot_state: {
+        ...(current.bot_state || {}),
+        allow_proactive_msg: false,
+        error: { ...(current.bot_state?.error || {}), message: String(reason || '机器人非群成员'), at: now() }
+      }
+    }))
+  }
+
   async refreshGroup (selfId, groupOpenid, options = {}) {
     const tasks = []
     if (options.info !== false) tasks.push(this.refreshInfo(selfId, groupOpenid, options.infoRequest))
