@@ -17,6 +17,7 @@ TRSS-Yunzai QQBot 插件
 
 **功能优化**
 
+- WebSocket 统一限速重连，网络异常优先恢复 Session；修复静默失联与 4903 误判回收。连接前检查 Session 配额，为 0 时暂停连接，重置后自动复核；配额未知时不盲连。
 - 修复重连成功误判、白名单拒连反复重试
 - 适配 ref_idx 撤回与 callfl，避免撤回失败
 - 好友删除后自动标记为不可召回，避免无效发送
@@ -28,6 +29,8 @@ TRSS-Yunzai QQBot 插件
 
 | 功能 | 说明 |
 |------|------|
+| WS连接次数 | `#QQBotWS连接次数 [机器人QQ]`：查询可创建 Session 次数、重置时间、重试状态和最后 ACK/事件时间；可通过其他在线机器人查询离线账号，不消耗 WS 连接次数 |
+| WS配置 | `#QQBot其他菜单` → `#QQBotws配置`，管理当前机器人的通知、Session保存、掉线恢复和正式/沙箱环境 |
 | 虚拟 at_id | 纯数字 ID，去掉 self_id 前缀与手机号形态 |
 | 全量忽略@全体 | 可关闭“仅回复@机器人”，忽略 @全体 的指令 |
 | 群事件开关 | `#QQBot普通设置 群事件 开启/关闭`，默认关闭 |
@@ -52,6 +55,14 @@ TRSS-Yunzai QQBot 插件
 - 群活跃累计集合默认存入 `QQBot-Plugin/db/active`；LevelDB 不可用时回退 `data/QQBotActive/active.json`。
 - QQBot 配置有效版本保存在 `data/QQBotConfigBackup/`，包括最近有效版本、最近含账号版本和最多 30 个去重历史版本。
 - 按机器人 `self_id` 分离配置与数据，多个 Bot 之间互不影响。
+- WS设置、通知绑定/去重状态、自动学习的self_openid保存于独立 `QQBot-Plugin/db/wsConfig` Level数据库。旧的分机器人掉线配置、self_openid在成功写入Level后才从后续YAML序列化中排除；迁移失败不会删除YAML源数据。首次迁移会继承旧 `offlineDetect.notify`：旧提醒开启会同步开启新的通知总开关和掉线通知，旧提醒关闭保持关闭；零次数/大量消耗仍关闭。已完成迁移后不再用旧字段覆盖新设置。
+- 配置按字段继承：现有新配置优先，其次旧的分机器人配置、旧全局配置，最后才是默认值；`false`、0、空字符串不视为缺失。已有Level记录补入缺失字段、self_openid和迁移标记后也必须成功落盘，才能清理YAML源字段。已经被旧版清理且没有可靠源数据的设置不猜测恢复；可从旧备份核对后手动设置。
+- 普通功能使用 `bots.default` 作为缺省模板，运行中新增账号会立即获得完整默认值，不需要重启；数组和嵌套配置按账号独立复制。旧全局掉线提醒只迁给当时已有账号，不通过新建模板自动开启未来账号的WS通知。旧 `userAgent` 字符串/布尔值迁入实际使用的 `userManage.bots.<QQ>.ua/uaEnabled`，已有新UA开关及内容优先。旧龙虾 `claw.online/code/json` 会先迁给所有本地账号再清理，全量消息额外的机器人限制次数/时间和忽略@选项也参与迁移。全局 `sandbox` 是明确例外，始终不导入。
+- 可选Session存储位于 `QQBot-Plugin/db/wsSession`，默认关闭且不会打开该数据库。开启后保存session_id、已完成处理的连续seq、SDK机器人身份、订阅/凭据签名和更新时间，不复制AppSecret或AccessToken；按机器人、AppID、正式/沙箱环境隔离。READY立即保存，seq每2秒合并并同步落盘，写失败保留最新快照，按5/10/20/40/60秒退避重试。旧版缺少安全进度语义的快照会被清除，升级后首次使用Identify，不盲目Resume。
+- 接收游标与处理游标分离：消息在插件队列中等待或处理中时不推进持久化进度，后续事件/RESUMED也不能跨过未完成事件；解析、处理失败会保留较早进度，成功补发可继续推进。确认边界是本插件处理完成并交付框架，不代表其他框架插件的异步业务已经完成；不能保证端到端恰好一次。断电、SIGKILL、网络补发仍可能产生重复，业务需幂等。
+- 有序退出（包括框架直接调用 `process.exit(0)` 的重启）会尝试刷盘，最多等待1.5秒；非零故障退出、第二次退出请求和SIGKILL不延迟。单账号WS配置损坏只隔离该账号，其他可加载配置的账号继续连接；如果共享数据库整体不可读，无法确认环境的账号仍安全拒绝连接，不猜测正式/沙箱设置。
+- 基础WS自动重连默认开启，可用 `#QQBot账号掉线自动重连关闭` 关闭；定时掉线检测是额外兜底。相同AppID的连接及Identify至少间隔5秒，失败退避5/10/20/40/60秒；旧的有限 `bot.maxRetry` 在首次迁移时复制为每个机器人的独立设置，之后不随全局配置变化。
+- 重连次数优先使用Level已有值，然后是旧分机器人 `offlineDetect.maxRetry`、旧全局掉线设置及 `bot.maxRetry`；不会用全局次数覆盖机器人自己的值。
 - 记录用户、群、群成员关系、拉黑、注销、最近发言、绑定全量缓存、全量事件检测状态。
 - 频道数据不参与用户管理拉黑、查询和群/好友缓存污染写入。
 
@@ -67,10 +78,41 @@ TRSS-Yunzai QQBot 插件
 - 插件加载 `config/QQBot.yaml` 前安装定向安全 Hook，不修改 `框架lib`，其他配置和数据文件仍走框架原逻辑。
 - 保存时先校验非空 YAML 对象，再写同目录临时文件、同步文件、原子重命名并同步目录，降低断电留下空文件或半截 YAML 的风险。
 - 有效版本按 SHA-256 去重，保留 `latest-good.yaml`、`latest-credential.yaml` 和最多 30 个历史版本；每 6 小时重新校验一次。
+- 相同内容不重复写YAML或最新备份，内部已校验的原子替换不会再次触发完整备份。普通设置150毫秒合并保存；凭据修改立即进入串行原子写入并等待实际落盘，仍保留凭据删除授权和丢失恢复检查。心跳、配额采样、Session与WS通知不写YAML。
 - 空文件、损坏 YAML 或全部机器人凭据丢失时，会保存 `broken-*.yaml` 并恢复最近含账号的有效版本。仅部分凭据丢失时不修改用户配置文件，而是通过仍可用的机器人向主人发送一次仅含缺失 AppID 的提醒，绝不发送 AppSecret；使用账号删除命令明确删除账号时不会触发恢复或提醒。
 - 本地原子写入和备份不能替代持久卷、磁盘快照或异机备份；整盘损坏、多进程并发覆盖仍需部署侧解决。
 
 ### 菜单入口
+
+#### WS配置（所有设置仅针对触发命令的机器人）
+
+```text
+#QQBot其他菜单
+#QQBotws配置
+#QQBotWS连接次数
+#QQBotWS连接次数 机器人QQ号
+#QQBotWS全部连接次数 [页码]
+#QQBotSession保存 开启/关闭
+#QQBotWS通知配置
+#QQBotWS通知 开启/关闭
+#QQBotWS零次数通知 开启/关闭
+#QQBotWS大量消耗通知 开启/关闭
+#QQBotWS掉线通知 开启/关闭
+#QQBotWS通知方式 本号
+#QQBotWS通知方式 sendmastermsg
+#QQBotWS掉线配置
+#QQBot开启正式环境
+#QQBot开启沙箱环境
+```
+
+- 不输入QQ默认查询当前机器人。全部查询从本地凭据列表枚举，包括未运行、离线或启动失败的账号，每页8个、REST查询最多并发2个；短时缓存15秒，未知不显示为0，不会为了查询创建WS连接。指定QQ查询和全部查询也可通过其他在线适配器执行，设置命令仍只能操作触发命令的QQBot。
+- 心跳超时、普通网络断线始终优先Resume，与是否保存到磁盘无关。Session保存关闭时进程重启使用Identify；开启时重启尝试Resume，失效后删除记录并限速回退Identify。关闭保存会清除该AppID的正式及沙箱Session，但不强制断开当前连接。配额为0时新建连接（包括Resume）仍等待重置并复核。
+- 服务端要求重连（OpCode 7）属于正常协议恢复：保留状态及限速，短时恢复只记日志，不发送下线或恢复通知。恢复中出现真实连接错误、关闭自动重连、达到重试上限，或60秒仍未恢复（包括配额等待），才按掉线通知开关告警；成功发送过下线通知后，恢复时才配对通知。零次数和大量消耗提醒不受此静默规则影响。
+- 单条网关事件的同步解析异常或异步处理失败不再主动断开WS、触发重复Resume；心跳接收进度可继续前进，但Session处理进度停在首条失败事件之前，不会吞掉异常并当作成功。后续网关重放成功可以解除进度阻塞；永久失败仍需修复对应解析/处理问题。日志包含事件类型、seq和异常堆栈，不包含完整网关消息，敏感凭据脱敏；同一机器人、同类事件及错误每分钟最多打印一次，并在后续打印时汇总抑制次数。
+- 通知总开关及零次数、大量消耗、掉线独立开关默认全部关闭。大量消耗阈值为滚动5分钟至少10次，优先看官方配额下降，本地Identify次数作补充，不将两者重复相加；Resume不计入本地Identify次数，重置不计为消耗。超过5分钟的采样间隔无法判断窗口内消耗，不据此误报。提醒有去重和5分钟冷却。
+- 通知开启且零次数/大量消耗开关开启时才增加每分钟一次REST采样。零次数提醒不会主动断开仍健康的在线连接。
+- “本号”通知只在此机器人的真实C2C私聊绑定当前用户的官方openid，不使用框架的“机器人QQ:openid”或外部映射QQ；旧的常见带前缀绑定发送前会兼容去除前缀。群聊、频道及频道私信直接拒绝设置。该方式可能受官方主动消息权限/时效限制，不回退其他通知方式；`sendmastermsg`使用现有 `Bot.sendMasterMsg`。零次数/大量消耗提醒只有发送成功后才记成功去重/冷却，失败按30/60/120/240/300秒退避重试，条件消失或关闭开关后停止；超时仍可能存在晚到发送，不能保证通知严格不重复。通知失败或超时不阻塞WS恢复。旧命令 `#QQBot账号掉线提醒开启/关闭` 保留兼容；开启时同步打开通知总开关，关闭时只关闭掉线提醒。
+- 沙箱默认关闭（正式环境），忽略全局 `bot.sandbox`。环境命令不接受QQ参数，只保存当前机器人的下次启动环境，并提示重启生效，当前进程的API和网关不会中途混用。沙箱使用已有的 `sandbox.api.sgroup.qq.com` 接口及网关，即使全局选择新接口也不会误连正式域名。
 
 ```text
 #QQBot用户管理菜单
@@ -644,6 +686,52 @@ const image = await Bot.uploadImage("https://example.com/a.png")
 ```js
 const image = await Bot[3889000008].uploadImage("https://example.com/a.png")
 ```
+
+### segment.image 用法
+
+`segment.image(file, name?)` 是框架提供的标准图片消息段，不要求公网图片。`file` 可以是网络 URL、本地路径、`file://`、`base64://` 或 Buffer；发送时会按当前 Markdown/普通图片模式自动处理，不需要先调用 `Bot.uploadImage`。
+
+```js
+import fs from 'node:fs'
+
+// 1. 网络图片
+await this.reply(segment.image('https://example.com/a.png'))
+
+// 2. 本地绝对路径（推荐）
+await this.reply(segment.image('/root/qqbot/data/images/a.png'))
+
+// 3. 本地相对路径：相对于机器人进程工作目录
+await this.reply(segment.image('./data/images/a.png'))
+
+// 4. file:// 本地文件
+await this.reply(segment.image('file:///root/qqbot/data/images/a.png'))
+
+// 5. Buffer
+const buffer = fs.readFileSync('/root/qqbot/data/images/a.png')
+await this.reply(segment.image(buffer))
+
+// 6. base64://，不要省略协议头
+await this.reply(segment.image(`base64://${buffer.toString('base64')}`))
+
+// 7. 图文：普通字符串作为文本，图片作为 image segment
+await this.reply(['图片说明', segment.image(buffer)])
+```
+
+说明：示例中的 `this.reply` 按插件运行环境也可换成 `this.e.reply` 或 `e.reply`，`segment.image` 的用法不变。
+
+- 本地路径必须是机器人进程可读的文件；相对路径以机器人进程工作目录为基准，跨目录调用建议使用绝对路径。本地文件不需要先转成公网 URL。
+- 截图、二维码、Canvas 等内存图片可直接传 Buffer，不需要先保存到磁盘或上传到图床。
+- 公网 URL 必须可访问：原生 Markdown 直写时由 QQ 侧拉取，普通图片模式或开启 `markdownImageConvert` 时由机器人进程下载。不要把 `localhost` 或内网地址当作公网图片使用，这类图片请用本地路径、Buffer 或 base64。
+- 原生 Markdown 下公网 URL 默认直接写入；开启 `markdownImageConvert` 时转存，加载自定义图床时交给自定义 Handler 处理。
+- 未开启原生 Markdown 时，图片按普通消息发送，由 `qq-official-bot` 上传；本地路径、`file://`、`base64://` 和 Buffer 均可直接使用。
+- 原生 Markdown 的图片说明读取 segment 的 `summary` 字段；`segment.image(file, name)` 的第二个参数 `name` 不是图片说明。需要自定义说明时使用对象写法：
+
+```js
+await this.reply({ ...segment.image(buffer), summary: '图片说明' })
+```
+
+- 原生 Markdown 的内置官方素材上传单图上限为 10MiB；超限时按现有兜底逻辑转腾讯云 CI，CI 不可用时会报错。关闭 Markdown 后仍受 QQ 官方图片接口限制。
+- 加载自定义图床时，Markdown 图片交给自定义 Handler 处理；本地路径、Buffer 和 `base64://` 仍可直接传入，不要求先有公网 URL。
 
 >优化多机器人配置、消息统计、原生 Markdown 与模板按钮，并修复回调按钮的消息 ID 权限校验。
 
