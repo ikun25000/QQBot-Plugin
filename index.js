@@ -12,6 +12,17 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFile } from 'node:child_process'
 import { setTimeout as sessionDelay } from 'node:timers/promises'
 import { installSessionLifecycle } from './Model/sessionLifecycle.js'
+import { createSessionQuota } from './Model/sessionQuota.js'
+import { wsStore } from './Model/wsStore.js'
+import { createWsSession, restoreWsIdentity } from './Model/wsSession.js'
+import { createWsNotifications } from './Model/wsNotifications.js'
+import { wsEndpoints } from './Model/wsEnvironment.js'
+import { handleWsCommand } from './Model/wsCommands.js'
+import { createWsQuotaReader } from './Model/wsQuotaReader.js'
+import { collectGatewayWork, trackGatewayWork, dispatchSdkEvent } from './Model/gatewayDelivery.js'
+import { initializeWsAccounts } from './Model/wsStartup.js'
+import { installWsShutdown } from './Model/wsShutdown.js'
+import { fillMissing, configuredBotIds, botOptionDefaults, legacyWsAccountConfig, migrateLegacyUserAgent, migrateLegacyClawConfig } from './Model/configMigration.js'
 import { groupProactiveResultStore } from './Model/groupProactiveResultStore.js'
 import { UNKNOWN_OPENID, isKnownQQBotOpenid, getQQBotMessageUserOpenid, displayQQBotOpenid } from './Model/messageIdentity.js'
 import { createReadOnlyRecovery } from './Model/readOnlyRecovery.js'
@@ -419,17 +430,12 @@ function migrateLegacyMessageProtectionConfig () {
   for (const selfId of selfIds) {
     const before = JSON.stringify(config.messageProtection?.bots?.[selfId] || null)
     const legacy = config.bots?.[selfId]?.messageProtection
-    if (Object.keys(rootValues).length) {
+    if (Object.keys(rootValues).length || legacy && typeof legacy === 'object' && !Array.isArray(legacy)) {
       if (!config.messageProtection.bots || typeof config.messageProtection.bots !== 'object' || Array.isArray(config.messageProtection.bots)) config.messageProtection.bots = {}
       if (!config.messageProtection.bots[selfId] || typeof config.messageProtection.bots[selfId] !== 'object' || Array.isArray(config.messageProtection.bots[selfId])) config.messageProtection.bots[selfId] = {}
-      for (const [key, value] of Object.entries(rootValues)) {
-        if (typeof config.messageProtection.bots[selfId][key] === 'undefined') config.messageProtection.bots[selfId][key] = Array.isArray(value) ? [...value] : value
-      }
-    }
-    if (legacy && typeof legacy === 'object' && !Array.isArray(legacy)) {
-      for (const [key, value] of Object.entries(legacy)) {
-        if (Object.prototype.hasOwnProperty.call(MESSAGE_PROTECTION_DEFAULTS, key) && typeof config.messageProtection.bots[selfId][key] === 'undefined') config.messageProtection.bots[selfId][key] = Array.isArray(value) ? [...value] : value
-      }
+      const perBot = legacy && typeof legacy === 'object'
+        ? Object.fromEntries(Object.entries(legacy).filter(([key]) => Object.prototype.hasOwnProperty.call(MESSAGE_PROTECTION_DEFAULTS, key))) : {}
+      fillMissing(config.messageProtection.bots[selfId], perBot, rootValues)
     }
     ensureMessageProtectionConfig(selfId)
     if (before !== JSON.stringify(config.messageProtection.bots[selfId])) changed = true
@@ -643,7 +649,7 @@ function findQQBotQueueDropIndex (id, queue, sep, preferredSource = '', mode = '
   return selected.index
 }
 
-function enqueueQQBotMessage (adapter, id, event) {
+function enqueueQQBotMessage (adapter, id, event, complete = () => {}) {
   rememberQQBotActivityAtEvidence(id, event)
   const sep = adapter.sep || ':'
   const source = getQQBotMessageQueueSource(id, event, sep)
@@ -654,8 +660,13 @@ function enqueueQQBotMessage (adapter, id, event) {
     state = null
   }
   if (!state) {
-    state = { active: 0, queue: [], lastWarnAt: 0, owner, generation: owner?.connectionGeneration, tasks: new Set(), closed: false }
+    state = { active: 0, queue: [], completions: new WeakMap(), lastWarnAt: 0, owner, generation: owner?.connectionGeneration, tasks: new Set(), closed: false }
     qqbotMessageQueues.set(id, state)
+  }
+  state.completions.set(event, complete)
+  const settle = (message, error) => {
+    state.completions.get(message)?.(error)
+    state.completions.delete(message)
   }
   const runNext = () => {
     if (state.closed) return
@@ -668,7 +679,8 @@ function enqueueQQBotMessage (adapter, id, event) {
         onStage: stage => noteQQBotMessagePhase(id, stage, next)
       })
       state.tasks.add(task)
-      task.run(() => adapter.makeMessage(id, next)).catch(err => {
+      task.run(() => adapter.makeMessage(id, next)).then(() => settle(next), err => {
+        settle(next, err)
         Bot.makeLog(err?.name === 'AbortError' ? 'debug' : 'error', [`[${id}] 消息处理${err?.name === 'AbortError' ? '取消' : '失败'}`, { stage: task.stage, message: err?.message || String(err) }], id)
       }).finally(() => {
         state.tasks.delete(task)
@@ -687,9 +699,11 @@ function enqueueQQBotMessage (adapter, id, event) {
       const sameSourceDrop = findQQBotQueueDropIndex(id, state.queue, sep, source, 'passive')
       if (sameSourceDrop >= 0) {
         const dropped = state.queue.splice(sameSourceDrop, 1)[0]
+        settle(dropped) // intentional filtering is a completed business decision
         recordMessageProtectionQueueDrop(id, dropped, getQQBotMessageQueueSource(id, dropped, sep))
       } else {
         recordMessageProtectionQueueDrop(id, event, source)
+        settle(event)
         return false
       }
     }
@@ -698,6 +712,7 @@ function enqueueQQBotMessage (adapter, id, event) {
         const passiveIndex = findQQBotQueueDropIndex(id, state.queue, sep, source, 'passive')
         if (passiveIndex >= 0) {
           const dropped = state.queue.splice(passiveIndex, 1)[0]
+          settle(dropped)
           recordMessageProtectionQueueDrop(id, dropped, getQQBotMessageQueueSource(id, dropped, sep))
         } else {
           if (Date.now() - state.lastWarnAt > 60000) {
@@ -705,6 +720,7 @@ function enqueueQQBotMessage (adapter, id, event) {
             Bot.makeLog('warn', [`[${id}] 消息处理队列已满，丢弃被动全量消息以保护内存`, { active: state.active, queued: state.queue.length }], id)
           }
           recordMessageProtectionQueueDrop(id, event, source)
+          settle(event)
           return false
         }
       } else if (state.queue.length >= QQBOT_PRIORITY_QUEUE_LIMIT) {
@@ -713,6 +729,7 @@ function enqueueQQBotMessage (adapter, id, event) {
           : -1
         if (replaceIndex >= 0) {
           const dropped = state.queue.splice(replaceIndex, 1)[0]
+          settle(dropped)
           recordMessageProtectionQueueDrop(id, dropped, getQQBotMessageQueueSource(id, dropped, sep))
         } else {
           if (Date.now() - state.lastWarnAt > 60000) {
@@ -720,6 +737,7 @@ function enqueueQQBotMessage (adapter, id, event) {
             Bot.makeLog('error', [`[${id}] 高优先级消息处理队列已达硬上限，拒绝新消息`, { active: state.active, queued: state.queue.length }], id)
           }
           recordMessageProtectionQueueDrop(id, event, source)
+          settle(event, new Error('高优先级消息队列已满'))
           return false
         }
       }
@@ -734,6 +752,7 @@ function clearQQBotMessageQueue (id) {
   const state = qqbotMessageQueues.get(id)
   if (!state) return
   state.closed = true
+  for (const event of state.queue) state.completions.get(event)?.(new DOMException('消息队列已取消', 'AbortError'))
   state.queue.length = 0
   for (const task of state.tasks) task.cancel()
   if (qqbotMessageQueues.get(id) === state) qqbotMessageQueues.delete(id)
@@ -1768,14 +1787,8 @@ function ensureBotConfig (selfId = '') {
   const key = selfId || 'default'
   if (!config.bots[key] || typeof config.bots[key] !== 'object') config.bots[key] = {}
   const botConfig = config.bots[key]
-
-  for (const cfgKey of PER_BOT_CONFIG_KEYS) {
-    if (typeof botConfig[cfgKey] === 'undefined' && typeof config[cfgKey] !== 'undefined') {
-      if (cfgKey === 'offlineDetect' || cfgKey === 'imageFallback') botConfig[cfgKey] = { ...(config[cfgKey] || {}) }
-      else botConfig[cfgKey] = config[cfgKey]
-    }
-  }
-  if (!botConfig.offlineDetect || typeof botConfig.offlineDetect !== 'object') botConfig.offlineDetect = { ...(config.offlineDetect || {}) }
+  const globalValues = Object.fromEntries(PER_BOT_CONFIG_KEYS.filter(name => config[name] !== undefined).map(name => [name, config[name]]))
+  fillMissing(botConfig, globalValues, key === 'default' ? {} : config.bots.default, botOptionDefaults())
   return botConfig
 }
 
@@ -1921,10 +1934,11 @@ function appendQQBotMessageSuffix (messages, markdown = '', state = {}) {
 }
 
 function getOfflineDetectConfig (selfId = '') {
-  return ensureBotConfig(selfId).offlineDetect || {}
+  return wsStore.settings(selfId).offline
 }
 
 function ensureUserManageConfig (selfId = '') {
+  migrateLegacyUserAgent(config, selfId || 'default')
   if (!config.userManage || typeof config.userManage !== 'object') config.userManage = { bots: {} }
   if (!config.userManage.bots || typeof config.userManage.bots !== 'object' || Array.isArray(config.userManage.bots)) config.userManage.bots = {}
   const key = selfId || 'default'
@@ -2194,23 +2208,12 @@ function getQQBotApiMode () {
   return config.apiMode === 'new' ? 'new' : 'old'
 }
 
-function getQQBotApiEndpoints () {
-  if (getQQBotApiMode() === 'new') {
-    return {
-      tokenUrl: 'https://api.bot.qq.com/app/getAppAccessToken',
-      apiBase: 'https://api.bot.qq.com',
-      wsUrl: 'wss://api.bot.qq.com/websocket/'
-    }
-  }
-  return {
-    tokenUrl: 'https://bots.qq.com/app/getAppAccessToken',
-    apiBase: config.bot?.sandbox ? 'https://sandbox.api.sgroup.qq.com' : 'https://api.sgroup.qq.com',
-    wsUrl: config.bot?.sandbox ? 'wss://sandbox.api.sgroup.qq.com/websocket' : 'wss://api.sgroup.qq.com/websocket'
-  }
+function getQQBotApiEndpoints (selfId = '', sandbox = Bot[selfId]?.wsEnvironment ?? wsStore.settings(selfId).sandbox) {
+  return wsEndpoints({ sandbox, apiMode: getQQBotApiMode() })
 }
 
-function getQQBotRequestBase (selfId = '') {
-  const apiBase = getQQBotApiEndpoints().apiBase
+function getQQBotRequestBase (selfId = '', sandbox) {
+  const apiBase = getQQBotApiEndpoints(selfId, sandbox).apiBase
   return config.bus?.[selfId]
     ? `https://${config.bus[selfId]}/proxy?url=${apiBase}`
     : apiBase
@@ -2296,11 +2299,11 @@ async function learnQQBotSelfOpenid (selfId = '', event = {}) {
   if (!selfId || !openid) return ''
   const map = ensureSelfOpenidMap()
   const previous = String(map[selfId] || '')
-  if (previous === openid) return openid
+  if (previous === openid && wsStore.selfOpenid(selfId) === openid) return openid
   map[selfId] = openid
   if (previous) Bot.makeLog?.('warn', [`[${selfId}] 机器人self_openid发生变化，已覆盖`, { previous, current: openid }], selfId)
   try {
-    await configSave()
+    await wsStore.update(selfId, record => { record.selfOpenid = openid })
   } catch (err) {
     Bot.makeLog?.('error', [`[${selfId}] 保存self_openid映射失败`, err.message], selfId)
   }
@@ -2322,7 +2325,7 @@ function exposeQQBotSelfOpenid (raw, selfId = '', currentOpenid = '') {
 }
 
 async function getQQBotMeByCredentials (appid, secret, selfId = '') {
-  const endpoints = getQQBotApiEndpoints()
+  const endpoints = getQQBotApiEndpoints(selfId)
   const tokenRes = await axios.post(endpoints.tokenUrl, {
     appId: appid,
     clientSecret: secret
@@ -2373,7 +2376,6 @@ function isQQBotNoOfficialWsError (data) {
 function getQQBotFatalWsErrorText (data) {
   const message = String(data?.message || data?.msg || data || '')
   if (message.includes('4925')) return '官方 websocket 不可用，请解绑元器'
-  if (message.includes('4903')) return '机器人停止服务(被回收)，请重新提审'
   return ''
 }
 
@@ -2382,22 +2384,25 @@ function migrateLegacyBotConfig () {
   for (const key of PER_BOT_CONFIG_KEYS) {
     if (typeof config[key] !== 'undefined') legacy[key] = config[key]
   }
-  if (!Object.keys(legacy).length) return false
   if (!config.bots || typeof config.bots !== 'object' || Array.isArray(config.bots)) config.bots = {}
-  const selfIds = Array.isArray(config.token)
-    ? config.token.map(token => String(token).split(':')[0]).filter(Boolean)
-    : []
-  const targets = selfIds.length ? selfIds : ['default']
+  const selfIds = configuredBotIds(config)
+  // Preserve a default template before deleting root values, so accounts
+  // created later in this same process inherit settings without a restart.
+  config.bots.default ||= {}
+  const templateValues = Object.fromEntries(Object.entries(legacy).filter(([key]) => key !== 'offlineDetect'))
+  fillMissing(config.bots.default, templateValues, botOptionDefaults())
+  const targets = [...new Set([...selfIds, 'default'])]
+  let changed = Object.keys(legacy).length > 0
   for (const selfId of targets) {
     if (!config.bots[selfId] || typeof config.bots[selfId] !== 'object') config.bots[selfId] = {}
-    for (const [key, value] of Object.entries(legacy)) {
-      if (typeof config.bots[selfId][key] === 'undefined') {
-        config.bots[selfId][key] = key === 'offlineDetect' ? { ...(value || {}) } : value
-      }
-    }
+    // A former global reminder belongs to the old accounts, not every future
+    // account. Do not opt newly added bots into WS notifications via a template.
+    const values = selfId === 'default' && selfIds.some(id => id !== 'default') ? templateValues : legacy
+    changed = fillMissing(config.bots[selfId], values, config.bots.default, botOptionDefaults()) || changed
+    changed = migrateLegacyUserAgent(config, selfId) || changed
   }
   for (const key of Object.keys(legacy)) delete config[key]
-  return true
+  return changed
 }
 
 function removeLegacySuffixConfig () {
@@ -2420,33 +2425,34 @@ function patchGroupMessageCreateEvent () {
     const QQBotClass = qqBotModule.QQBot
 
     if (!QQBotClass.prototype._qqbotFullMessageDispatchPatched) {
-      const originalDispatchEvent = QQBotClass.prototype.dispatchEvent
-      QQBotClass.prototype.dispatchEvent = function (event, wsRes) {
+      QQBotClass.prototype.dispatchEvent = function (event, wsRes, delivery = {}) {
+        let originalEvent
         if (wsRes?.d && typeof event === 'string') {
           const selfId = this.config?.real_self_id || this.self_id || wsRes.d.self_id || ''
           if (event === 'C2C_MESSAGE_CREATE' || event === 'GROUP_MESSAGE_CREATE' || event === 'GROUP_AT_MESSAGE_CREATE') noteQQBotMessagePhase(selfId, 'raw', wsRes.d)
-          if (shouldDropQQBotRawEvent(selfId, event, wsRes.d)) {
+          if (!delivery.retryFailed && shouldDropQQBotRawEvent(selfId, event, wsRes.d)) {
             noteQQBotMessagePhase(selfId, 'protection-dropped', wsRes.d)
             return
           }
-          qqbotOriginalEventMap.set(wsRes.d, {
+          originalEvent = {
             op: wsRes.op,
             s: wsRes.s,
             t: event,
             id: wsRes.id,
             d: { ...wsRes.d }
-          })
+          }
+          qqbotOriginalEventMap.set(wsRes.d, originalEvent)
           wsRes.d._qqbotRawEvent = event
           if (typeof wsRes.d.content === 'string' && typeof wsRes.d._rawContent !== 'string') wsRes.d._rawContent = wsRes.d.content
           if (!eventModule.QQEvent[event]) this.logger.warn(`unhandled(${event})`)
         }
-        return originalDispatchEvent.call(this, event, wsRes)
+        return dispatchSdkEvent.call(this, event, wsRes, eventModule.QQEvent, originalEvent)
       }
       QQBotClass.prototype._qqbotFullMessageDispatchPatched = true
     }
 
     if (!messageModule.MessageEvent.parse._qqbotFullMessageParsePatched) {
-      const originalParse = messageModule.MessageEvent.parse.bind(messageModule.MessageEvent)
+      const originalParse = messageModule.MessageEvent.parse
       const GroupMessageEvent = messageModule.GroupMessageEvent
       const parseGroupMessageFallback = function (payload, isFullGroupMessage = false) {
         if (typeof payload?.content === 'string') {
@@ -2501,7 +2507,7 @@ function patchGroupMessageCreateEvent () {
           payload._mentions = payload.mentions.map(item => ({ ...item }))
         }
         try {
-          const parsed = originalParse(event, payload)
+          const parsed = originalParse.call(this, event, payload)
           if (parsed) {
             const originalEvent = qqbotOriginalEventMap.get(payload)
             if (originalEvent) Object.defineProperty(parsed, '_qqbotOriginalEvent', { value: originalEvent, configurable: true })
@@ -2519,8 +2525,13 @@ function patchGroupMessageCreateEvent () {
       patchedParse._qqbotFullMessageParsePatched = true
       messageModule.MessageEvent.parse = patchedParse
     }
+    // EventParserMap otherwise keeps the original function captured by the SDK
+    // at import time, bypassing the message normalization/fallback wrapper.
+    for (const event of ['AT_MESSAGE_CREATE', 'DIRECT_MESSAGE_CREATE', 'MESSAGE_CREATE', 'GROUP_AT_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE']) {
+      eventModule.EventParserMap.set(eventModule.QQEvent[event], messageModule.MessageEvent.parse)
+    }
     if (!noticeModule.ActionNoticeEvent.parse._qqbotClawConfigParsePatched) {
-      const originalActionParse = noticeModule.ActionNoticeEvent.parse.bind(noticeModule.ActionNoticeEvent)
+      const originalActionParse = noticeModule.ActionNoticeEvent.parse
       noticeModule.ActionNoticeEvent.parse = function (event, payload) {
         if (payload?.scene === 'group' && !payload.group_openid) {
           payload.group_openid = payload.group_id || payload.data?.resolved?.group_openid || payload.data?.resolved?.group_id || ''
@@ -2553,7 +2564,11 @@ function patchGroupMessageCreateEvent () {
           return notice
         }
         try {
-          const notice = originalActionParse.call(this, event, payload)
+          // SDK 1.0.3 misspells resolved as resoloved in the guild constructor.
+          // Supply a compatibility copy without changing the original raw data.
+          const parserPayload = payload?.scene === 'guild' && payload.data?.resolved && !payload.data.resoloved
+            ? { ...payload, data: { ...payload.data, resoloved: payload.data.resolved } } : payload
+          const notice = originalActionParse.call(this, event, parserPayload)
           if (notice) {
             notice.raw = payload
             notice.group_openid ||= payload?.group_openid || payload?.group_id || payload?.data?.resolved?.group_openid || payload?.data?.resolved?.group_id || ''
@@ -2561,7 +2576,7 @@ function patchGroupMessageCreateEvent () {
           }
           return notice
         } catch (err) {
-          if (payload?.data?.type === 11) {
+          if (type === 11) {
             const noticeType = payload.scene === 'group' ? 'group' : payload.scene === 'c2c' ? 'friend' : 'guild'
             return {
               bot: this,
@@ -2756,16 +2771,37 @@ if (typeof segment?.button === 'function' && !segment.button._qqbotLimitPatched)
 if (typeof segment?.txt !== 'function') segment.txt = text => ({ type: 'text', text: String(text ?? ''), _qqbotPlainText: true })
 
 // ========== 账号掉线检测状态管理 ==========
-const offlineCheckState = {
-  timers: {},       // 每个bot的检测定时器 id => intervalId
-  retrying: {},     // 正在重连中 id => true
-  retryingAt: {},
-  waitingSessionReset: {}, // 官方 reset_after 等待 id => timeoutId
-  waitingReconnectRetry: {}, // 重连失败后的延迟重试 id => timeoutId
-  reconnectSeq: {},
-  reconnectWatchdog: {},
-  reconnectNotice: {} // 当前异常重连事务的下线通知状态
+const offlineCheckState = { timers: {} }
+const wsProbeState = new Map()
+const readWsQuota = createWsQuotaReader({ request: axios })
+
+async function loadWsAccount (id) {
+  const record = await wsStore.loadAccount(id, legacyWsAccountConfig(config, id))
+  if (record.selfOpenid) ensureSelfOpenidMap()[id] = record.selfOpenid
+  return record
 }
+
+function refreshWsProbe (id) {
+  id = String(id)
+  const old = wsProbeState.get(id)
+  if (old) clearInterval(old)
+  wsProbeState.delete(id)
+  const runtime = Bot[id]
+  if (!runtime || runtime.disabledRuntime || !runtime.wsNotifications?.shouldProbe()) return
+  const timer = setInterval(() => {
+    if (Bot[id] !== runtime || runtime.disabledRuntime || !runtime.wsNotifications.shouldProbe()) { clearInterval(timer); return }
+    void adapter._getSessionInfo(id)
+  }, 60000)
+  timer.unref?.()
+  wsProbeState.set(id, timer)
+}
+
+installWsShutdown({ flush: async () => {
+  await Promise.allSettled([
+    configSave.flush(),
+    ...Object.values(Bot).filter(bot => bot?.wsSession).map(bot => bot.wsSession.flush())
+  ])
+} })
 
 const CLAW_DEFAULT_CFG = {
   channel_type: 'qqbot',
@@ -2781,18 +2817,8 @@ const CLAW_DEFAULT_CFG = {
 function ensureClawConfig (selfId = '') {
   if (!config.claw || typeof config.claw !== 'object') config.claw = {}
 
-  const legacyKeys = ['online', 'code', 'json', 'groups']
-  const hasLegacy = legacyKeys.some(key => Object.prototype.hasOwnProperty.call(config.claw, key))
+  if (migrateLegacyClawConfig(config, selfId)) void configSave().catch(error => Bot.makeLog('error', ['龙虾配置迁移保存失败', error.message], selfId))
   if (!config.claw.bots || typeof config.claw.bots !== 'object' || Array.isArray(config.claw.bots)) config.claw.bots = {}
-  if (hasLegacy && selfId) {
-    if (!config.claw.bots[selfId] || typeof config.claw.bots[selfId] !== 'object') config.claw.bots[selfId] = {}
-    const target = config.claw.bots[selfId]
-    if (typeof target.online !== 'boolean' && typeof config.claw.online === 'boolean') target.online = config.claw.online
-    if (typeof target.code === 'undefined' && typeof config.claw.code !== 'undefined') target.code = config.claw.code
-    if (!target.json && config.claw.json && typeof config.claw.json === 'object') target.json = config.claw.json
-    for (const key of legacyKeys) delete config.claw[key]
-    configSave()
-  }
 
   const key = selfId || 'default'
   if (!config.claw.bots[key] || typeof config.claw.bots[key] !== 'object') config.claw.bots[key] = {}
@@ -2901,7 +2927,7 @@ const adapter = new class QQBotAdapter {
   }
 
   async makeRecord (file, selfId = '', forceSilk = false) {
-    if (getBotConfigValue('', 'toBotUpload')) {
+    if (getBotConfigValue(selfId, 'toBotUpload')) {
       for (const i of Bot.uin) {
         if (!Bot[i].uploadRecord) continue
         try {
@@ -6467,14 +6493,21 @@ const adapter = new class QQBotAdapter {
    */
   async _getSessionInfo (id) {
     const bot = Bot[id]
-    if (!bot || bot.disabledRuntime) return null
+    const account = config.token.map(parseQQBotAccount).find(value => value.ok && value.account.selfId === String(id))?.account ||
+      (bot?.sdk?.config?.appid ? { appid: bot.sdk.config.appid, secret: bot.sdk.config.secret } : null)
+    if (!account) return null
     try {
-      const { data } = await bot.sdk.request.get('/gateway/bot')
-      if (Bot[id] !== bot || bot.disabledRuntime) return null
-      if (!data || !data.session_start_limit) return null
-      return data.session_start_limit
+      await loadWsAccount(id)
+      const endpoints = { ...getQQBotApiEndpoints(id), apiBase: getQQBotRequestBase(id) }
+      const response = await readWsQuota({ id, appid: account.appid, secret: account.secret, endpoints,
+        headers: withQQBotUserAgentHeaders(id), accessToken: bot?.sdk?.sessionManager?.access_token, tokenExpireTime: bot?.tokenExpireTime })
+      if (!response) return null
+      const remainingReset = Math.max(0, response.data.session_start_limit.reset_after - (Date.now() - response.at))
+      const data = { ...response.data, session_start_limit: { ...response.data.session_start_limit, reset_after: remainingReset } }
+      if (Bot[id] === bot && bot && !bot.disabledRuntime && !response.cached) bot.sessionQuota?.observe(data)
+      return { ...data.session_start_limit, cached: response.cached }
     } catch (err) {
-      if (Bot[id] === bot && !bot.disabledRuntime) Bot.makeLog('debug', [`[${id}] 获取 Session 信息失败`, getQQBotSdkErrorSummary(err)], id)
+      Bot.makeLog('debug', [`[${id}] 获取 Session 信息失败（未创建WS连接）`], id)
       return null
     }
   }
@@ -6508,28 +6541,13 @@ const adapter = new class QQBotAdapter {
       clearInterval(offlineCheckState.timers[id])
       delete offlineCheckState.timers[id]
     }
-    // 同时取消等待重置/重试的 timeout（如果有）
-    if (offlineCheckState.waitingSessionReset[id]) {
-      clearTimeout(offlineCheckState.waitingSessionReset[id])
-      delete offlineCheckState.waitingSessionReset[id]
-    }
-    if (offlineCheckState.waitingReconnectRetry[id]) {
-      clearTimeout(offlineCheckState.waitingReconnectRetry[id])
-      delete offlineCheckState.waitingReconnectRetry[id]
-    }
-    if (offlineCheckState.reconnectWatchdog[id]) {
-      clearTimeout(offlineCheckState.reconnectWatchdog[id])
-      delete offlineCheckState.reconnectWatchdog[id]
-    }
   }
 
   disableBotRuntime (id, reason = '') {
     clearQQBotMessageQueue(id)
     this.stopOfflineCheck(id)
-    offlineCheckState.reconnectSeq[id] = (offlineCheckState.reconnectSeq[id] || 0) + 1
-    delete offlineCheckState.retrying[id]
-    delete offlineCheckState.retryingAt[id]
-    delete offlineCheckState.reconnectNotice[id]
+    clearInterval(wsProbeState.get(id))
+    wsProbeState.delete(id)
     const bot = Bot[id]
     if (!bot) return
     if (bot.disabledRuntime) return
@@ -6537,6 +6555,7 @@ const adapter = new class QQBotAdapter {
     bot.connectionGeneration = (bot.connectionGeneration || 0) + 1
     bot.disabledReason = reason || bot.disabledReason || '机器人运行态已停止'
     bot.isReconnecting = false
+    bot.wsNotifications?.dispose()
     bot.sdk._sessionLifecycle?.dispose()
     bot._cancelLogin?.()
     try { bot.sdk.logger = Object.fromEntries(['trace', 'debug', 'info', 'mark', 'warn', 'error', 'fatal'].map(level => [level, () => {}])) } catch {}
@@ -6549,36 +6568,13 @@ const adapter = new class QQBotAdapter {
   async _doOfflineCheck (id) {
     const bot = Bot[id]
     if (!bot || bot.disabledRuntime) return
-    const generation = bot.connectionGeneration
-    const reconnectSeq = offlineCheckState.reconnectSeq[id]
-    const canCheck = () => Bot[id] === bot && !bot.disabledRuntime &&
-      bot.connectionGeneration === generation && offlineCheckState.reconnectSeq[id] === reconnectSeq &&
-      ![0, 1].includes(bot.sdk.ws?.readyState) && !bot.isReconnecting &&
-      !offlineCheckState.retrying[id] && !offlineCheckState.waitingReconnectRetry[id]
-    // OPEN sockets are monitored by the lifecycle ACK deadline; quota is not health.
-    if (!canCheck() || offlineCheckState.waitingSessionReset[id]) return
-    const sessionInfo = await this._getSessionInfo(id)
-    if (!canCheck() || offlineCheckState.waitingSessionReset[id]) return
-    if (!Number.isFinite(sessionInfo?.remaining) || sessionInfo.remaining < 0) {
-      Bot.makeLog('debug', [`[${id}] Session 配额未知，等待下次检测`], id)
-      return
-    }
-    const offlineDetect = getOfflineDetectConfig(id)
-    if (!offlineDetect.autoReconnect) return
-    if (sessionInfo.remaining === 0) {
-      const resetMs = Number(sessionInfo.reset_after)
-      if (!Number.isFinite(resetMs) || resetMs <= 0) return
-      Bot.makeLog('debug', [`[${id}] Session 配额耗尽，将在 ${this._formatMs(resetMs)} 后重试`], id)
-      const timer = setTimeout(async () => {
-        if (offlineCheckState.waitingSessionReset[id] !== timer) return
-        delete offlineCheckState.waitingSessionReset[id]
-        if (!canCheck() || !getOfflineDetectConfig(id).autoReconnect) return
-        await this._doOfflineCheck(id)
-      }, resetMs)
-      offlineCheckState.waitingSessionReset[id] = timer
-      return
-    }
-    await this._doReconnect(id, 0, { reason: 'socket-closed' })
+    const lifecycle = bot.sdk._sessionLifecycle
+    if (!lifecycle || lifecycle.terminal || lifecycle.busy || !lifecycle.isActive()) return
+    if (lifecycle.readySocket && bot.sdk.ws?.readyState === 1) return
+    // Quota is checked centrally before every connection, never as a health test.
+    void this._doReconnect(id, 0, { reason: '定时检测发现连接不可用' }).catch(err => {
+      if (Bot[id] === bot && !bot.disabledRuntime) Bot.makeLog('error', [`[${id}] 掉线恢复失败`, err.message], id)
+    })
   }
 
   /**
@@ -6594,176 +6590,10 @@ const adapter = new class QQBotAdapter {
   async _doReconnect (id, retryCount = 0, options = {}) {
     const bot = Bot[id]
     if (!bot || bot.disabledRuntime) return
-    // 如果已经在重连中，跳过（包括重试调用）
-    if (offlineCheckState.retrying[id]) {
-      Bot.makeLog('warn', [`[${id}] 已在重连中，跳过本次重连 (retryCount=${retryCount})`], id)
-      return
-    }
-
-    const offlineDetect = getOfflineDetectConfig(id)
-    if (!offlineDetect.autoReconnect) return
-    const existingNotice = offlineCheckState.reconnectNotice[id]
-    const reconnectNotice = existingNotice || {
-      attempted: false,
-      notified: false,
-      reason: options.reason || 'socket-closed',
-      startedAt: Date.now()
-    }
-    offlineCheckState.reconnectNotice[id] = reconnectNotice
-    const canProceed = typeof options.canProceed === 'function' ? options.canProceed : () => true
-
-    offlineCheckState.retrying[id] = true
-    offlineCheckState.retryingAt[id] = Date.now()
-    const reconnectSeq = (offlineCheckState.reconnectSeq[id] || 0) + 1
-    offlineCheckState.reconnectSeq[id] = reconnectSeq
-    const ownsAttempt = () => Bot[id] === bot && offlineCheckState.reconnectSeq[id] === reconnectSeq
-    const isCurrentAttempt = () => ownsAttempt() && !bot.disabledRuntime
-    bot.isReconnecting = true  // 设置重连标志
-
-    if (offlineCheckState.reconnectWatchdog[id]) clearTimeout(offlineCheckState.reconnectWatchdog[id])
-    offlineCheckState.reconnectWatchdog[id] = setTimeout(() => {
-      if (!isCurrentAttempt()) return
-      if (!offlineCheckState.retrying[id]) return
-      delete offlineCheckState.reconnectWatchdog[id]
-      Bot.makeLog('error', [`[${id}] 重连状态超过120秒未释放，已强制解除重连锁，等待下一轮检测/重连`], id)
-      offlineCheckState.reconnectSeq[id] = reconnectSeq + 1
-      bot.connectionGeneration = (bot.connectionGeneration || 0) + 1
-      try { bot.sdk._sessionLifecycle?.stop() } catch {}
-      bot._cancelLogin?.()
-      delete offlineCheckState.retrying[id]
-      delete offlineCheckState.retryingAt[id]
-      delete offlineCheckState.reconnectNotice[id]
-      bot.isReconnecting = false
-    }, 120000)
-
-    // 临时固定为10，忽略配置中的 maxRetry（调试完成后删除这行，恢复下面的注释）
-    const maxRetries = 10
-    // const configMaxRetry = config.bot?.maxRetry
-    // let maxRetries = 10
-    // if (configMaxRetry === '.inf' || configMaxRetry === Infinity) {
-    //   maxRetries = Infinity
-    // } else if (typeof configMaxRetry === 'number' && !isNaN(configMaxRetry)) {
-    //   maxRetries = configMaxRetry
-    // }
-    const retryDelay = Math.min(30000, 5000 * (retryCount + 1))  // 5s, 10s, 15s... 最大30s
-
-    Bot.makeLog('warn', [`[${id}] 开始自动重连... (第 ${retryCount + 1} 次尝试)`], id)
-
-    try {
-      if (!reconnectNotice.attempted) {
-        reconnectNotice.attempted = true
-        bot.reconnectCount = (bot.reconnectCount || 0) + 1
-        if (offlineDetect.notify) {
-          const action = `，正在重连(已经${bot.reconnectCount}次)`
-          const offlineMessage = reconnectNotice.reason === 'heartbeat'
-            ? `[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效${action}`
-            : `[${id}] 账号下线：[下线通知]你的帐号当前连接已断开${action}`
-          try {
-            if (!canProceed()) return
-            await sendQQBotInternalMasterMsg(offlineMessage)
-            reconnectNotice.notified = true
-          } catch (err) {
-            if (!isCurrentAttempt()) return
-            Bot.makeLog('error', ['发送下线通知失败', err.message], id)
-          }
-        }
-      }
-      if (!canProceed()) return
-
-      Bot.makeLog('warn', [`[${id}] 正在断开旧连接...`], id)
-      try {
-        await bot.logout()
-        if (!isCurrentAttempt()) return
-        Bot.makeLog('warn', [`[${id}] 旧连接已断开`], id)
-      } catch (err) {
-        if (!isCurrentAttempt()) return
-        Bot.makeLog('warn', [`[${id}] 断开旧连接失败（忽略）`, err.message], id)
-      }
-
-      // 等待一小段时间确保旧连接完全关闭
-      await new Promise(resolve => setTimeout(resolve, 1000))
-      if (!isCurrentAttempt()) return
-
-      Bot.makeLog('warn', [`[${id}] 正在重新登录...`], id)
-      const loginResult = await bot.login()
-      if (!isCurrentAttempt() || loginResult === false) return
-      Bot.makeLog('warn', [`[${id}] 重新登录成功`], id)
-
-      // 重连成功，重置计数和状态
-      bot.reconnectCount = 0
-      delete offlineCheckState.retrying[id]
-      delete offlineCheckState.retryingAt[id]
-      if (offlineCheckState.reconnectWatchdog[id]) {
-        clearTimeout(offlineCheckState.reconnectWatchdog[id])
-        delete offlineCheckState.reconnectWatchdog[id]
-      }
-      bot.isReconnecting = false
-      Bot.makeLog('warn', [`[${id}] 自动重连成功`], id)
-
-      // 只有异常重连已经发送过下线通知，才发送对应的成功通知。
-      const shouldNotifySuccess = offlineDetect.notify && reconnectNotice.notified
-      delete offlineCheckState.reconnectNotice[id]
-      if (shouldNotifySuccess) {
-        try {
-          await sendQQBotInternalMasterMsg(`[${id}] 账号重连成功！`)
-        } catch (err) {
-          if (!isCurrentAttempt()) return
-          Bot.makeLog('error', ['发送重连成功通知失败', err.message], id)
-        }
-      }
-    } catch (err) {
-      if (!isCurrentAttempt()) return
-      Bot.makeLog('error', [`[${id}] 自动重连失败 (第 ${retryCount + 1} 次)`, err.message], id)
-      
-      // 判断是否还有重试次数（Infinity 永远为 true）
-      if (retryCount + 1 < maxRetries) {
-        // 还有重试次数，延迟后重试
-        Bot.makeLog('warn', [`[${id}] 将在 ${retryDelay / 1000}s 后重试...`], id)
-        
-        const retryGeneration = bot.connectionGeneration
-        const retryTimer = setTimeout(async () => {
-          if (offlineCheckState.waitingReconnectRetry[id] !== retryTimer) return
-          delete offlineCheckState.waitingReconnectRetry[id]
-          if (!isCurrentAttempt() || bot.connectionGeneration !== retryGeneration) return
-          if (offlineCheckState.retrying[id] || bot.isReconnecting || [0, 1].includes(bot.sdk.ws?.readyState) || !getOfflineDetectConfig(id).autoReconnect) return
-          await this._doReconnect(id, retryCount + 1)
-        }, retryDelay)
-        offlineCheckState.waitingReconnectRetry[id] = retryTimer
-        delete offlineCheckState.retrying[id]
-        delete offlineCheckState.retryingAt[id]
-        bot.isReconnecting = false
-        if (offlineCheckState.reconnectWatchdog[id]) {
-          clearTimeout(offlineCheckState.reconnectWatchdog[id])
-          delete offlineCheckState.reconnectWatchdog[id]
-        }
-        
-        return
-      } else {
-        // 达到最大重试次数，彻底失败
-        Bot.makeLog('error', [`[${id}] 重连失败次数已达上限 (${maxRetries})，停止重试`], id)
-        
-        if (offlineDetect.notify) {
-          try {
-            await sendQQBotInternalMasterMsg(`[${id}] 自动重连失败：已达最大重试次数 (${maxRetries === Infinity ? '无限制' : maxRetries})，请手动处理`)
-          } catch (e) {
-            if (!isCurrentAttempt()) return
-            Bot.makeLog('error', ['发送重连失败通知失败', e.message], id)
-          }
-        }
-      }
-    } finally {
-      // 只有彻底成功或彻底失败时才清除 retrying 状态和异常通知事务。
-      if (ownsAttempt() && !offlineCheckState.waitingReconnectRetry[id]) {
-        delete offlineCheckState.retrying[id]
-        delete offlineCheckState.retryingAt[id]
-        if (offlineCheckState.reconnectWatchdog[id]) {
-          clearTimeout(offlineCheckState.reconnectWatchdog[id])
-          delete offlineCheckState.reconnectWatchdog[id]
-        }
-        delete offlineCheckState.reconnectNotice[id]
-        bot.isReconnecting = false  // 清除重连标志
-      }
-    }
+    if (getOfflineDetectConfig(id).autoReconnect === false || options.canProceed?.() === false) return
+    const lifecycle = bot.sdk._sessionLifecycle
+    if (!lifecycle || lifecycle.terminal || lifecycle.busy) return
+    return lifecycle.reconnect(options.reason || '连接已断开')
   }
 
   // ========== 掉线检测结束 ==========
@@ -6775,16 +6605,20 @@ async connect (token) {
   if (!parsed.ok) return { ok: false, reason: parsed.error }
   const account = parsed.account
   const id = account.selfId
+  try { await loadWsAccount(id) } catch (error) {
+    Bot.makeLog('error', [`[${id}] 无法读取本账号WS配置，拒绝猜测运行环境；其他账号继续连接`, error.message], id)
+    return { ok: false, reason: '本账号WS配置不可用，请检查Level数据库后重试' }
+  }
   ensureUserManageConfig(id)
   const existingBot = Bot[id]
   if (existingBot) {
     clearQQBotMessageQueue(id)
     existingBot.connectionGeneration = (existingBot.connectionGeneration || 0) + 1
     this.stopOfflineCheck(id)
-    offlineCheckState.reconnectSeq[id] = (offlineCheckState.reconnectSeq[id] || 0) + 1
-    delete offlineCheckState.retrying[id]
-    delete offlineCheckState.retryingAt[id]
-    delete offlineCheckState.reconnectNotice[id]
+    clearInterval(wsProbeState.get(id))
+    wsProbeState.delete(id)
+    existingBot.wsNotifications?.dispose()
+    await existingBot.wsSession?.dispose().catch(error => Bot.makeLog('error', [`[${id}] 替换账号前保存Session失败`, error.message], id))
     existingBot.sdk._sessionLifecycle?.dispose()
     existingBot._cancelLogin?.()
     try { await existingBot.logout() } catch (err) {
@@ -6795,6 +6629,8 @@ async connect (token) {
   }
   const opts = {
     ...config.bot,
+    sandbox: wsStore.settings(id).sandbox,
+    maxRetry: wsStore.settings(id).offline.maxRetry,
     real_self_id: id,
     appid: account.appid,
     secret: account.secret,
@@ -6814,7 +6650,9 @@ async connect (token) {
   else opts.intents.push('PUBLIC_GUILD_MESSAGES')
 
   let sdk = new QQBot(opts)
-  sdk.request.defaults.baseURL = getQQBotRequestBase(id)
+  const dispatch = sdk.dispatchEvent.bind(sdk)
+  sdk.dispatchEvent = (event, payload, detail) => collectGatewayWork(() => dispatch(event, payload, detail))
+  sdk.request.defaults.baseURL = getQQBotRequestBase(id, opts.sandbox)
   const getCurrentUserAgent = () => getQQBotUserAgentHeader(id)
   const applyUserAgentToRequest = () => {
     const ua = getCurrentUserAgent()
@@ -6833,7 +6671,7 @@ async connect (token) {
       const ua = getCurrentUserAgent()
       if (!ua) return originalGetAccessToken()
       const { secret, appid } = this.bot.config
-      const getToken = () => axios.post(getQQBotApiEndpoints().tokenUrl, {
+      const getToken = () => axios.post(getQQBotApiEndpoints(id, opts.sandbox).tokenUrl, {
         appId: appid,
         clientSecret: secret
       }, { headers: { 'User-Agent': ua } }).then(res => res.data)
@@ -6894,7 +6732,7 @@ async connect (token) {
     return {
       status: 200,
       data: {
-        url: getQQBotApiEndpoints().wsUrl,
+        url: getQQBotApiEndpoints(id, opts.sandbox).wsUrl,
         shards: 1
       }
     }
@@ -6906,7 +6744,7 @@ async connect (token) {
     return {
       status: 200,
       data: {
-        url: getQQBotApiEndpoints().wsUrl,
+        url: getQQBotApiEndpoints(id, opts.sandbox).wsUrl,
         shards: 1
       }
     }
@@ -6918,7 +6756,7 @@ async connect (token) {
     return {
       status: 200,
       data: {
-        url: getQQBotApiEndpoints().wsUrl,
+        url: getQQBotApiEndpoints(id, opts.sandbox).wsUrl,
         shards: 1
       }
     }
@@ -6930,7 +6768,7 @@ async connect (token) {
     return {
       status: 200,
       data: {
-        url: getQQBotApiEndpoints().wsUrl,
+        url: getQQBotApiEndpoints(id, opts.sandbox).wsUrl,
         shards: 1
       }
     }
@@ -6942,7 +6780,7 @@ async connect (token) {
     return {
       status: 200,
       data: {
-        url: getQQBotApiEndpoints().wsUrl,
+        url: getQQBotApiEndpoints(id, opts.sandbox).wsUrl,
         shards: 1
       }
     }
@@ -7071,6 +6909,7 @@ async connect (token) {
       timeout: 15000
     })
     checkSessionRequest(signal)
+    sessionQuota.observe(res.data)
     let wsUrl
     try { wsUrl = new URL(res.data?.url) } catch { throw new Error('获取ws连接信息异常') }
     if (!['ws:', 'wss:'].includes(wsUrl.protocol) || !wsUrl.hostname) throw new Error('获取ws连接信息异常')
@@ -7088,14 +6927,13 @@ async connect (token) {
   Bot[id] = {
     adapter: this,
     sdk,
+    wsEnvironment: opts.sandbox,
     connectionGeneration: (existingBot?.connectionGeneration || 0) + 1,
     login () {
       clearQQBotMessageQueue(id)
       this._cancelLogin?.()
       return new Promise((resolve, reject) => {
         let settled = false
-        let timer
-        let readyPoll
         const sessionManager = this.sdk.sessionManager
         const lifecycle = this.sdk._sessionLifecycle
         const loginGeneration = this.connectionGeneration = (this.connectionGeneration || 0) + 1
@@ -7127,8 +6965,6 @@ async connect (token) {
           finishReject(new Error(data?.msg || 'connection dead'))
         }
         const cleanup = () => {
-          if (timer) clearTimeout(timer)
-          if (readyPoll) clearInterval(readyPoll)
           try { sessionManager?.off?.('READY', onReady) } catch {}
           try { sessionManager?.off?.('DEAD', onDead) } catch {}
           if (this._cancelLogin === cancelLogin) this._cancelLogin = null
@@ -7162,17 +6998,8 @@ async connect (token) {
           return
         }
 
-        timer = setTimeout(() => {
-          if (!ownsLogin() || this.disabledRuntime || gatewayIpBlocked) {
-            finishResolve(false)
-            return
-          }
-          finishReject(new Error('login timeout after 60s'))
-        }, 60000)
-
-        // RESUMED need not emit READY; only the lifecycle's current socket can succeed.
-        readyPoll = setInterval(onReady, 1000)
-        
+        // Lifecycle owns the 60s handshake deadline. Quota waits and backoff
+        // must not be mistaken for a timed-out login and delete this runtime.
         sessionManager.on('READY', onReady)
         sessionManager.on('DEAD', onDead)
         
@@ -7184,6 +7011,7 @@ async connect (token) {
         }).then(() => {
           if (settled) return
           if (gatewayIpBlocked || this.disabledRuntime || !ownsLogin()) finishResolve(false)
+          else onReady() // start() also resolves after RESUMED, without READY.
         }).catch(err => {
           if (settled) return
           if (!ownsLogin() || this.disabledRuntime) {
@@ -7209,6 +7037,7 @@ async connect (token) {
     },
     logout () {
       clearQQBotMessageQueue(id)
+      void this.wsSession?.flush()
       return new Promise((resolve) => {
         const socket = this.sdk.ws
         let timer
@@ -7280,6 +7109,44 @@ async connect (token) {
   }
 
   const runtime = Bot[id]
+  let resolveInitialWait
+  const initialWait = new Promise(resolve => { resolveInitialWait = resolve })
+  const sessionQuota = createSessionQuota({
+    key: String(opts.appid),
+    onWait: detail => resolveInitialWait(detail),
+    onObserve: value => runtime.wsNotifications?.observe(value),
+    log: (level, message) => {
+      if (Bot[id] === runtime && !runtime.disabledRuntime) Bot.makeLog(level, [`[${id}] ${message}`], id)
+    }
+  })
+  runtime.sessionQuota = sessionQuota
+  runtime.wsNotifications = createWsNotifications({
+    store: wsStore, id, environment: `${opts.appid}:${opts.sandbox ? 'sandbox' : 'production'}`,
+    separator: this.sep,
+    isCurrent: () => Bot[id] === runtime && !runtime.disabledRuntime,
+    sendMaster: message => sendQQBotInternalMasterMsg(message),
+    sendPrivate: (recipient, message) => withQQBotInternalSend(() => this.sendFriendMsg({ self_id: id, bot: runtime, user_id: recipient }, [message])),
+    log: (level, message) => Bot.makeLog(level, [`[${id}] ${message}`], id)
+  })
+  runtime.wsSession = createWsSession({
+    store: wsStore, id, appid: opts.appid, environment: opts.sandbox ? 'sandbox' : 'production',
+    signature: crypto.createHash('sha256').update(JSON.stringify([opts.appid, opts.secret, opts.intents, [0, 1]])).digest('hex'),
+    isCurrent: () => Bot[id] === runtime && !runtime.disabledRuntime,
+    onError: error => Bot.makeLog('error', [`[${id}] Session持久化失败`, error.message], id)
+  })
+  const savedSession = await runtime.wsSession.restore().catch(error => {
+    Bot.makeLog('error', [`[${id}] 读取Session失败，回退Identify`, error.message], id)
+    return null
+  })
+  if (Bot[id] !== runtime || runtime.disabledRuntime) return { ok: false, reason: '登录已取消' }
+  if (savedSession) {
+    if (restoreWsIdentity(sdk.sessionManager, savedSession)) {
+      Bot.makeLog('info', [`[${id}] 已载入持久化Session及机器人身份，连接后优先Resume`], id)
+    } else {
+      await runtime.wsSession.clear()
+      Bot.makeLog('warn', [`[${id}] 持久化Session缺少身份信息，安全回退Identify`], id)
+    }
+  }
   readOnlyRecovery = createReadOnlyRecovery(runtime, {
     isCurrent: () => Bot[id] === runtime && runtime.sdk === sdk && !runtime.disabledRuntime,
     probe: signal => originalRequestGet('/gateway/bot', {
@@ -7291,6 +7158,9 @@ async connect (token) {
   runtime._readOnlyRecovery = readOnlyRecovery
   const failConnection = async reason => {
     if (Bot[id] !== runtime) return { ok: false, reason: reason || '登录已取消' }
+    clearInterval(wsProbeState.get(id))
+    wsProbeState.delete(id)
+    runtime.wsNotifications.dispose()
     const logoutPromise = runtime.logout()
     const generation = runtime.connectionGeneration
     try { await logoutPromise } catch {}
@@ -7317,7 +7187,7 @@ async connect (token) {
     Bot[id].sdk.logger[i] = (...args) => {
       if (Bot[id] !== runtime || runtime.disabledRuntime) return
       const fatalWsErrorText = i === 'error'
-        ? args.map(arg => getQQBotFatalWsErrorText(arg)).find(text => text && (text === '机器人停止服务(被回收)，请重新提审' || Bot[id]?.readOnlyMode))
+        ? args.map(arg => getQQBotFatalWsErrorText(arg)).find(text => text && Bot[id]?.readOnlyMode)
         : ''
       if (fatalWsErrorText) {
         Bot.makeLog('error', [`[${id}] ${fatalWsErrorText}`, args], id)
@@ -7338,6 +7208,11 @@ async connect (token) {
   // 接管 SDK 的连接生命周期，避免旧 start()/socket 在停用或替换后继续回调。
   sdk._sessionLifecycle = installSessionLifecycle(sdk.sessionManager, {
     isCurrent: () => Bot[id] === runtime && runtime.sdk === sdk && !runtime.disabledRuntime,
+    // Basic transport recovery is on unless explicitly disabled. The optional
+    // offlineDetect.enabled switch controls periodic fallback checks only.
+    shouldReconnect: () => getOfflineDetectConfig(id).autoReconnect !== false,
+    beforeConnect: detail => sessionQuota.acquire(detail),
+    beforeIdentify: detail => sessionQuota.beforeIdentify(detail),
     getHeartbeatTimeout: () => {
       const timeout = Number(getOfflineDetectConfig(id).heartbeatTimeout)
       return Number.isFinite(timeout) && timeout > 0 ? timeout : 60000
@@ -7345,38 +7220,28 @@ async connect (token) {
     onReady: socket => {
       if (Bot[id] !== runtime || runtime.sdk !== sdk || runtime.disabledRuntime || sdk.ws !== socket) return
       runtime.reconnectCount = 0
+      runtime.isReconnecting = false
+      runtime.wsNotifications.ready()
       void readOnlyRecovery?.recover('READY/RESUMED')
     },
-    onHeartbeatTimeout: async ({ socket, timeoutMs, isStillTimedOut }) => {
-      const generation = runtime.connectionGeneration
-      const canHandle = () => Bot[id] === runtime && runtime.sdk === sdk && !runtime.disabledRuntime &&
-        runtime.connectionGeneration === generation && sdk.ws === socket && isStillTimedOut() &&
-        !runtime.isReconnecting && !offlineCheckState.retrying[id] && !offlineCheckState.waitingReconnectRetry[id]
-      if (!canHandle()) return
-      const offlineDetect = getOfflineDetectConfig(id)
-      Bot.makeLog('warn', [`[${id}] 心跳超时 (${timeoutMs / 1000}s 无ACK)，判定为掉线`], id)
-      if (!offlineDetect.autoReconnect) {
-        if (!offlineDetect.notify) return
-        if (!canHandle()) return
-        try {
-          await sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前心跳包已失效，自动重连已关闭`)
-        } catch (err) {
-          if (!canHandle()) return
-          Bot.makeLog('error', ['发送心跳超时通知失败', err.message], id)
-        }
-        return
-      }
-      // 只把连接身份和当前心跳超时作为继续条件；_doReconnect 会自行设置重连锁。
-      const canProceed = () => Bot[id] === runtime && runtime.sdk === sdk && !runtime.disabledRuntime &&
-        runtime.connectionGeneration === generation && sdk.ws === socket && isStillTimedOut()
-      if (!canProceed()) return
-      await adapter._doReconnect(id, 0, { reason: 'heartbeat', canProceed })
+    onSession: (record, detail) => runtime.wsSession.update(record, detail),
+    onSessionInvalidated: () => runtime.wsSession.clear(),
+    onIdentify: () => runtime.wsNotifications.identify(),
+    onStop: () => runtime.wsSession.flush(),
+    onReconnect: ({ reason, disabled, expected, terminal }) => {
+      if (Bot[id] !== runtime || runtime.disabledRuntime) return
+      runtime.isReconnecting = !disabled && !terminal
+      runtime.reconnectCount = (runtime.reconnectCount || 0) + 1
+      if (!expected) runtime.wsNotifications.offline(reason, disabled, { terminal })
     },
     onError: async err => {
       if (Bot[id] !== runtime || runtime.disabledRuntime || runtime.sdk !== sdk) return
-      Bot.makeLog('error', [`[${id}] SDK 连接失败`, err?.message || String(err)], id)
+      const dispatch = err?.stage === 'dispatch'
+      Bot.makeLog('error', [`[${id}] ${dispatch ? '网关事件处理失败（连接保持，失败进度未确认）' : 'SDK 连接失败'}`, dispatch ? err.stack : err?.message || String(err)], id)
     }
   })
+  runtime.connectionHealth = sdk._sessionLifecycle.health
+  refreshWsProbe(id)
 
   // ===== 拦截 getAccessToken，添加重试机制和 token 过期检查 =====
   const tokenRuntime = Bot[id]
@@ -7402,7 +7267,7 @@ async connect (token) {
           try {
             checkSessionRequest(signal)
             const { secret, appid } = sdk.config
-            const res = await axios.post(getQQBotApiEndpoints().tokenUrl, { appId: appid, clientSecret: secret }, { headers: withQQBotUserAgentHeaders(id), timeout: 15000, signal })
+            const res = await axios.post(getQQBotApiEndpoints(id, opts.sandbox).tokenUrl, { appId: appid, clientSecret: secret }, { headers: withQQBotUserAgentHeaders(id), timeout: 15000, signal })
             checkSessionRequest(signal)
             if (res.status !== 200 || !res.data?.access_token) throw Object.assign(new Error(getQQBotAuthError(res.data) || 'Invalid response'), { response: res })
             const expiresIn = Number(res.data.expires_in)
@@ -7417,20 +7282,18 @@ async connect (token) {
             const authError = getQQBotAuthError(err.response?.data)
             if (authError) {
               sdk.logger.error(`[TOKEN] ${authError}，中断连接`)
-              throw new Error(authError)
+              throw Object.assign(new Error(authError), { fatal: true })
             }
             failures++
             sdk.logger.warn(`[TOKEN] 获取 access_token 失败 (${failures}次)`)
             const delay = Math.min(retryDelays[i] + round * 10, 60)
-            if (failures % 5 === 0 && getOfflineDetectConfig(id).notify) {
+            if (failures % 5 === 0) {
               // Notification delivery must not hold the token request open on shutdown.
-              void sendQQBotInternalMasterMsg(`[${id}] 账号下线：[下线通知]你的帐号当前token已失效，(已经${failures}次失败)，${Math.min(delay + 2, 60)}s后继续`).catch(() => {})
+              runtime.wsNotifications.offline(`获取token已失败${failures}次，稍后继续`)
             }
             if (failures >= 25) {
               sdk.logger.error(`[TOKEN] 获取 access_token 失败已达上限 (${failures}次)，放弃连接`)
-              if (getOfflineDetectConfig(id).notify) {
-                void sendQQBotInternalMasterMsg(`[${id}] 获取token失败已达上限 (${failures}次)，请手动处理`).catch(() => {})
-              }
+              runtime.wsNotifications.offline(`获取token失败已达${failures}次`)
               throw new Error(`getAccessToken failed after ${failures} retries`)
             }
             sdk.logger.warn(`[TOKEN] ${delay}s 后重试...`)
@@ -7522,43 +7385,40 @@ async connect (token) {
   sdk.on('message', event => {
     if (Bot[id] !== runtime || runtime.disabledRuntime) return
     noteQQBotMessagePhase(id, 'parsed', event)
-    enqueueQQBotMessage(this, id, event)
+    trackGatewayWork(new Promise((resolve, reject) => enqueueQQBotMessage(this, id, event, error => error ? reject(error) : resolve())))
   })
-  sdk.on('notice', event => this.makeNotice(id, event).catch(err => Bot.makeLog('error', [`[${id}] 通知处理失败`, err.message], id)))
-  sdk.on('request', event => this.makeRequest(id, event).catch(err => Bot.makeLog('error', [`[${id}] 加群申请处理失败`, err.message], id)))
+  sdk.on('notice', event => trackGatewayWork(this.makeNotice(id, event)))
+  sdk.on('request', event => trackGatewayWork(this.makeRequest(id, event)))
 
   // 初次登录失败必须返回给设置命令，不能继续伪装成已连接。
-  let initialLoginGeneration
-  try {
-    const loginPromise = runtime.login()
-    initialLoginGeneration = runtime.connectionGeneration
-    const loginResult = await loginPromise
+  // A quota wait is a pending runtime, not an authenticated connection. Return
+  // that state to the command/startup without cancelling background recovery.
+  const loginPromise = runtime.login()
+  const initialLoginGeneration = runtime.connectionGeneration
+  const completion = loginPromise.then(async loginResult => {
     if (Bot[id] !== runtime || runtime.connectionGeneration !== initialLoginGeneration) return { ok: false, reason: '登录已取消' }
-    if (loginResult === false) {
-      return failConnection(runtime.disabledReason || '登录未完成')
+    if (loginResult === false) return failConnection(runtime.disabledReason || '登录未完成')
+    if (gatewayIpBlocked) {
+      this.disableBotRuntime(id, '接口访问源IP不在白名单')
+      return failConnection('接口访问源IP不在白名单')
     }
-  } catch (err) {
+    if (runtime.disabledRuntime) return failConnection(runtime.disabledReason || '机器人运行态已停止')
+    groupInfoStore.resumePending(id).catch(err => Bot.makeLog('warn', [`[${id}] 恢复群资料刷新任务失败`, err.message], id))
+    this.startOfflineCheck(id)
+    Bot.makeLog('mark', `${this.name}(${this.id}) ${this.version} 已连接`, id)
+    Bot.em(`connect.${id}`, { self_id: id })
+    return { ok: true, selfId: id }
+  }).catch(err => {
     if (Bot[id] !== runtime || runtime.connectionGeneration !== initialLoginGeneration) return { ok: false, reason: '登录已取消' }
     if (runtime.disabledRuntime) return failConnection(runtime.disabledReason || err.message || '登录失败')
     Bot.makeLog('error', [`[${id}] 初次登录失败`, err.message], id)
     return failConnection(getQQBotSdkErrorSummary(err))
-  }
-  if (gatewayIpBlocked) {
-    this.disableBotRuntime(id, '接口访问源IP不在白名单')
-    return failConnection('接口访问源IP不在白名单')
-  }
-  if (runtime.disabledRuntime) return failConnection(runtime.disabledReason || '机器人运行态已停止')
-  
-  if (Bot[id] !== runtime || runtime.disabledRuntime || runtime.connectionGeneration !== initialLoginGeneration) return { ok: false, reason: '登录已取消' }
-
-  groupInfoStore.resumePending(id).catch(err => Bot.makeLog('warn', [`[${id}] 恢复群资料刷新任务失败`, err.message], id))
-
-  // 启动掉线检测
-  this.startOfflineCheck(id)
-
-  Bot.makeLog('mark', `${this.name}(${this.id}) ${this.version} 已连接`, id)
-  Bot.em(`connect.${id}`, { self_id: id })
-  return { ok: true, selfId: id }
+  })
+  runtime.initialConnection = completion
+  return Promise.race([completion, initialWait.then(detail => {
+    if (Bot[id] !== runtime || runtime.disabledRuntime) return { ok: false, reason: '登录已取消' }
+    return { ok: true, pending: true, selfId: id, reason: detail.reason === 'quota' ? 'Session 可用连接次数为0，等待重置后自动复核并连接' : 'Session 可用连接次数未知，稍后自动复核并连接' }
+  })])
 }
 
   async load () {
@@ -7578,6 +7438,7 @@ const cleanedBotConfig = migrateLegacyBotConfig()
 const cleanedSuffixConfig = removeLegacySuffixConfig()
 const migratedAccountConfig = migrateLegacyAccountConfig()
 const migratedMessageProtectionConfig = migrateLegacyMessageProtectionConfig()
+const migratedClawConfig = migrateLegacyClawConfig(config)
 
 const timedStoreInit = async (name, init) => {
   const startedAt = Date.now()
@@ -7589,9 +7450,20 @@ const timedStoreInit = async (name, init) => {
 }
 
 const qqbotStoreInitializers = [
+  ['ws', () => timedStoreInit('ws', async () => {
+    const accounts = config.token.map(parseQQBotAccount).filter(value => value.ok)
+    await initializeWsAccounts(accounts.map(value => value.account), loadWsAccount, (id, error) => {
+      Bot.makeLog('error', [`[${id}] WS配置初始化失败，仅隔离此账号`, error.message], id)
+    })
+    // One migration write; the serializer excludes only successfully migrated
+    // fields. Subsequent heartbeat/Session/notification writes never touch YAML.
+    if (accounts.some(({ account }) => config.selfOpenid?.[account.selfId] || config.bots?.[account.selfId]?.offlineDetect) || config.offlineDetect) {
+      try { await configSave() } catch (error) { Bot.makeLog('error', ['WS配置迁移后的YAML清理失败，源数据保留，不阻止其他账号连接', error.message], 'QQBot-Plugin') }
+    }
+  })],
   ['groupProactiveResults', () => timedStoreInit('groupProactiveResults', () => groupProactiveResultStore.migrate(config, configSave))],
   ['fullMessage', () => timedStoreInit('fullMessage', () => initFullMessageStore(config)).then(cleanedConfig => {
-    if (cleanedConfig || cleanedBotConfig || cleanedSuffixConfig || migratedMessageProtectionConfig || migratedAccountConfig) return configSave()
+    if (cleanedConfig || cleanedBotConfig || cleanedSuffixConfig || migratedMessageProtectionConfig || migratedAccountConfig || migratedClawConfig) return configSave()
   })],
   ['invite', () => timedStoreInit('invite', () => initInviteStore(config))],
   ['chat', () => timedStoreInit('chat', () => chatStore.init())],
@@ -7693,6 +7565,16 @@ export class QQBotAdapter extends plugin {
         {
           reg: /^#q+bot(添加|删除)过滤日志/i,
           fnc: 'filterLog',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot(?:ws(?:配置|通知配置|掉线配置|全部(?:连接|链接)次数(?:\s+\d+)?|(?:零次数|大量消耗|掉线)?通知\s*(?:开启|关闭)|通知方式\s+(?:本号|sendmastermsg))|Session保存\s*(?:开启|关闭)|开启(?:正式|沙箱)环境)(?:\s+[\s\S]*)?$/i,
+          fnc: 'wsCommand',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot\s*(?:ws\s*)?(?:可用)?(?:连接|链接)次数(?:\s+\d+)?$/i,
+          fnc: 'sessionQuotaStatus',
           permission: config.permission
         },
         {
@@ -8066,7 +7948,6 @@ export class QQBotAdapter extends plugin {
   async help () {
   if (!this.guardOfficialBot()) return true
   const botConfig = ensureBotConfig(this.e.self_id)
-  const od = getOfflineDetectConfig(this.e.self_id)
   let isRawMarkdown = config.markdown?.[this.e.self_id] === 'raw'
   if (!isRawMarkdown && !qqbotHelpMarkdownTried.has(this.e.self_id)) {
     qqbotHelpMarkdownTried.add(this.e.self_id)
@@ -8126,13 +8007,9 @@ export class QQBotAdapter extends plugin {
     ])
     
     this.reply([
-      '🔌 掉线检测\n\n' +
-      `<qqbot-cmd-input text="#QQBot账号掉线检测${od.enabled ? '关闭' : '开启'}" show="${od.enabled ? '关闭' : '开启'}掉线检测" />\n` +
-      `<qqbot-cmd-input text="#QQBot账号掉线提醒${od.notify ? '关闭' : '开启'}" show="${od.notify ? '关闭' : '开启'}掉线提醒" />\n` +
-      `<qqbot-cmd-input text="#QQBot账号掉线自动重连${od.autoReconnect ? '关闭' : '开启'}" show="${od.autoReconnect ? '关闭' : '开启'}自动重连" />\n` +
+      '🔌 WS配置\n\n' +
+      '<qqbot-cmd-input text="#QQBotws配置" show="WS连接、Session、通知与环境设置" />\n' +
       '<qqbot-cmd-input text="#QQBot普通设置" show="普通设置" />\n' +
-      '<qqbot-cmd-input text="#QQBot账号掉线检测时间设置 5分钟" show="检测间隔5分钟" />\n' +
-      '<qqbot-cmd-input text="#QQBot账号掉线检测时间设置 10分钟" show="检测间隔10分钟" />\n\n' +
       '🛠️ 管理功能\n\n' +
       '<qqbot-cmd-input text="#QQBot添加过滤日志 " show="添加过滤日志" />\n' +
       '<qqbot-cmd-input text="#QQBot删除过滤日志 " show="删除过滤日志" />\n' +
@@ -8140,16 +8017,8 @@ export class QQBotAdapter extends plugin {
       '<qqbot-cmd-input text="#QQBot高级设置" show="高级设置" />',
       segment.button(
         [
-          { text: `${od.enabled ? '关' : '开'}检测`, callback: `#QQBot账号掉线检测${od.enabled ? '关闭' : '开启'}` },
-          { text: `${od.notify ? '关' : '开'}提醒`, callback: `#QQBot账号掉线提醒${od.notify ? '关闭' : '开启'}` }
-        ],
-        [
-          { text: `${od.autoReconnect ? '关' : '开'}重连`, callback: `#QQBot账号掉线自动重连${od.autoReconnect ? '关闭' : '开启'}` },
+          { text: 'WS配置', callback: '#QQBotws配置' },
           { text: '普通设置', callback: '#QQBot普通设置' }
-        ],
-        [
-          { text: '间隔5分钟', callback: '#QQBot账号掉线检测时间设置5分钟' },
-          { text: '间隔10分钟', callback: '#QQBot账号掉线检测时间设置10分钟' }
         ],
         [
           { text: '添加过滤', input: '#QQBot添加过滤日志 ' },
@@ -8180,11 +8049,8 @@ export class QQBotAdapter extends plugin {
       `#QQBot设置二维码开启/关闭 [当前: ${botConfig.toQRCode ? '开启' : '关闭'}]\n` +
       '#QQBot其他菜单 - 转图片、消息后缀等设置\n' +
       '#QQBot高级群欢迎菜单 - 高级群欢迎设置\n\n' +
-      '🔌 掉线检测\n' +
-      `#QQBot账号掉线检测开启/关闭 [当前: ${od.enabled ? '开启' : '关闭'}]\n` +
-      `#QQBot账号掉线提醒开启/关闭 [当前: ${od.notify ? '开启' : '关闭'}]\n` +
-      `#QQBot账号掉线自动重连开启/关闭 [当前: ${od.autoReconnect ? '开启' : '关闭'}]\n` +
-      '#QQBot账号掉线检测时间设置 X分钟 (1-30分钟)\n\n' +
+      '🔌 WS配置\n' +
+      '#QQBotws配置 - 连接次数、Session保存、通知、掉线与环境设置\n\n' +
       '🛠️ 管理功能\n' +
       '#QQBot添加过滤日志 <消息内容>\n' +
       '#QQBot删除过滤日志 <消息内容>\n' +
@@ -8279,6 +8145,7 @@ export class QQBotAdapter extends plugin {
 
       const connection = await adapter.connect(accountText)
       if (!connection?.ok) throw new Error(connection?.reason || '账号连接失败')
+      if (connection.pending) return this.reply(`账号已保存(机器人QQ:${robotUin})，尚未连接：${connection.reason}`, true)
       await this.reply(`登录成功(机器人QQ:${robotUin})，如果需要开启频道私域/删除配置，自行修改或者查看配置文件`, true)
     } catch (err) {
       const reason = getQQBotAuthError(err.response?.data) || err.response?.data?.message || err.response?.data?.msg || err.message || String(err)
@@ -8324,7 +8191,7 @@ export class QQBotAdapter extends plugin {
         if (updateIndex >= 0) config.token[updateIndex] = account.text
         else config.token.push(account.text)
         const warnText = validation.warnings?.length ? `\n警告：${validation.warnings.join('\n')}` : ''
-        this.reply(`账号已验证并连接，共${config.token.length}个账号${warnText}`, true)
+        this.reply(`账号已验证${connection.pending ? `，尚未连接：${connection.reason}` : '并连接'}，共${config.token.length}个账号${warnText}`, true)
       } else {
         this.reply(`账号连接失败：${connection?.reason || '未知原因'}`, true)
         return false
@@ -8427,24 +8294,119 @@ export class QQBotAdapter extends plugin {
 
   // ========== 掉线检测命令 ==========
 
+  async wsCommand () {
+    const overview = /^#q+botws全部(?:连接|链接)次数(?:\s+(\d+))?$/i.exec(String(this.e.msg || '').trim())
+    // Read-only overview also works through another online adapter when all
+    // configured QQBots are offline. Settings still require the current QQBot.
+    if (overview) return this.wsAllStatus(Number(overview[1]) || 1)
+    if (!this.guardOfficialBot()) return true
+    const id = String(this.e.self_id)
+    await loadWsAccount(id)
+    return handleWsCommand({
+      event: this.e, store: wsStore, separator: adapter.sep, reply: (...args) => this.reply(...args), buttons: (...rows) => segment.button(...rows),
+      runtime: Bot[id], currentStatus: () => this.sessionQuotaStatus(), allStatus: page => this.wsAllStatus(page),
+      changed: async (kind, enabled) => {
+        const runtime = Bot[id]
+        if (runtime?.adapter !== adapter) return
+        if (kind === 'session') {
+          if (enabled) {
+            runtime.wsSession.update(runtime.sdk._sessionLifecycle.sessionSnapshot, { immediate: true })
+            await runtime.wsSession.flush()
+          } else {
+            // Erase both environments so disabling/re-enabling cannot restore
+            // an old Session from the other environment.
+            await runtime.wsSession.clear({ force: true })
+            const appid = runtime.sdk.config.appid
+            await wsStore.saveSession(`${id}:${appid}:${runtime.wsEnvironment ? 'production' : 'sandbox'}`, null)
+          }
+        }
+        if (kind === 'notifications') {
+          refreshWsProbe(id)
+          void runtime.wsNotifications.refresh()
+        }
+      }
+    })
+  }
+
+  async wsAllStatus (requestedPage = 1) {
+    const accounts = [...new Map(config.token.map(parseQQBotAccount).filter(value => value.ok).map(value => [value.account.selfId, value.account])).values()]
+    const pages = Math.max(1, Math.ceil(accounts.length / 8))
+    const page = Math.max(1, Math.min(pages, requestedPage))
+    const selected = accounts.slice((page - 1) * 8, page * 8)
+    const results = new Array(selected.length)
+    let index = 0
+    // At most two REST-only queries at once, including bots without a runtime.
+    const worker = async () => {
+      while (index < selected.length) {
+        const position = index++
+        const account = selected[position]
+        const info = await adapter._getSessionInfo(account.selfId)
+        const runtime = Bot[account.selfId]
+        const status = runtime?.disabledRuntime ? '已停用' : runtime?.sdk?._sessionLifecycle?.readySocket ? '在线' : runtime?.sessionQuota?.waiting ? '等待配额' : runtime ? '离线/恢复中' : '未运行/启动失败'
+        results[position] = `[${account.selfId}](https://qun.qq.com/qunpro/robot/qunshare?robot_uin=${account.selfId}):\n\`\`\`text\nAppID ${account.appid} ${status}；可用 ${info ? `${info.remaining}/${info.total}${info.cached ? '（缓存）' : ''}` : '未知'}；重置 ${info ? adapter._formatMs(info.reset_after) : '未知'}\n\`\`\``
+      }
+    }
+    await Promise.all([worker(), worker()])
+    const rows = []
+    if (page > 1 || page < pages) {
+      const row = []
+      if (page > 1) row.push({ text: '上一页', callback: `#QQBotWS全部连接次数 ${page - 1}` })
+      if (page < pages) row.push({ text: '下一页', callback: `#QQBotWS全部连接次数 ${page + 1}` })
+      rows.push(row)
+    }
+    rows.push([{ text: '刷新', callback: `#QQBotWS全部连接次数 ${page}` }, { text: '返回', callback: '#QQBotws配置' }])
+    return this.reply([`本地配置QQBot共${accounts.length}个，第${page}/${pages}页\n\n${results.join('\n\n') || '暂无账号'}\n\n只查询REST，不创建WS连接；未知不是0。`, segment.button(...rows)], true)
+  }
+
+  async sessionQuotaStatus () {
+    const respond = message => this.reply([message, segment.button([{ text: '返回', callback: '#QQBotws配置' }])], true)
+    const match = /(?:连接|链接)次数(?:\s+(\d+))?$/i.exec(this.e.msg)
+    const id = match?.[1] || this.e.self_id
+    const bot = Bot[id]
+    const configured = config.token.some(value => { const account = parseQQBotAccount(value); return account.ok && account.account.selfId === String(id) })
+    if ((!bot || bot.adapter !== adapter) && !configured) return respond('未找到本地QQBot账号，请指定机器人QQ号')
+    const fresh = await adapter._getSessionInfo(id)
+    if (Bot[id] !== bot) return respond('账号运行态已变更，请重新查询')
+    const info = fresh || bot?.sessionQuota?.snapshot()
+    const health = bot?.connectionHealth || {}
+    const messageHealth = bot?.messageHealth?.last || {}
+    const waiting = bot?.sessionQuota?.waiting
+    const states = { idle: '待连接', starting: '获取连接信息', 'quota-check': '检查配额', connecting: '连接/鉴权中', ready: '已连接', 'retry-wait': '等待重试', stopped: '已停止', terminal: '终止，需人工处理' }
+    const waitStates = { quota: '等待配额重置', 'quota-unknown': '等待配额复核', concurrency: '等待连接限速' }
+    const time = value => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '无记录'
+    const lines = [
+      `QQBot ${id} WS连接状态`,
+      `可用连接次数：${info ? `${info.remaining}/${info.total}${!fresh || fresh.cached ? '（缓存，待复核）' : ''}` : '未知，未视为可用'}`,
+      `配额重置剩余：${info ? adapter._formatMs(info.reset_after) : '未知'}`,
+      `每5秒最大创建数：${info?.max_concurrency ?? '未知'}`,
+      `状态：${waiting ? waitStates[waiting.reason] : states[health.state] || '未知'}`,
+      `下次复核/重试：${time(waiting?.until || health.nextRetryAt)}`,
+      `最后心跳ACK：${time(health.lastAckAt)}`,
+      `最后网关事件：${time(health.lastDispatchAt)}`,
+      `最后原始消息：${time(messageHealth.raw)}`,
+      `最后解析消息：${time(messageHealth.parsed)}`,
+      `最后框架分发：${time(messageHealth['framework-dispatched'])}`,
+      '次数指新建Session配额，不是当前在线连接数；查询不会创建WS连接。'
+    ]
+    return respond(lines.join('\n'))
+  }
+
   async setOfflineDetect () {
     if (!this.guardOfficialBot()) return true
     const match = /^#q+bot账号掉线检测\s*(开启|关闭)$/i.exec(this.e.msg)
     const state = match[1] === '开启'
 
+    await wsStore.update(this.e.self_id, record => { record.settings.offline.enabled = state })
     const offlineDetect = getOfflineDetectConfig(this.e.self_id)
-    offlineDetect.enabled = state
 
     if (state) {
       if (Bot[this.e.self_id]?.adapter === adapter) adapter.startOfflineCheck(this.e.self_id)
       const intervalMin = Math.max(1, Math.min(30, Number(offlineDetect.interval) || 5))
-      this.reply(`账号掉线检测已开启，检测间隔 ${intervalMin} 分钟`, true)
+      return this.reply([`账号掉线检测已开启，检测间隔 ${intervalMin} 分钟`, segment.button([{ text: '返回', callback: '#QQBotWS掉线配置' }])], true)
     } else {
       if (Bot[this.e.self_id]?.adapter === adapter) adapter.stopOfflineCheck(this.e.self_id)
-      this.reply('账号掉线检测已关闭', true)
+      return this.reply(['账号掉线检测已关闭', segment.button([{ text: '返回', callback: '#QQBotWS掉线配置' }])], true)
     }
-
-    await configSave()
   }
 
   async setOfflineNotify () {
@@ -8452,10 +8414,15 @@ export class QQBotAdapter extends plugin {
     const match = /^#q+bot账号掉线提醒\s*(开启|关闭)$/i.exec(this.e.msg)
     const state = match[1] === '开启'
 
-    getOfflineDetectConfig(this.e.self_id).notify = state
-
-    this.reply(`账号掉线提醒已${state ? '开启' : '关闭'}${state ? '（需先开启掉线检测总开关）' : ''}`, true)
-    await configSave()
+    await wsStore.update(this.e.self_id, record => {
+      record.settings.notifications.offline = state
+      // Preserve the old command's meaning: enabling the old reminder also
+      // enables the new notification master switch. Closing it leaves other
+      // independently configured WS notifications untouched.
+      if (state) record.settings.notifications.enabled = true
+    })
+    refreshWsProbe(this.e.self_id)
+    return this.reply([`账号掉线提醒已${state ? '开启' : '关闭'}${state ? '，通知总开关已同步开启' : ''}`, segment.button([{ text: '返回', callback: '#QQBotWS通知配置' }])], true)
   }
 
   async setOfflineAutoReconnect () {
@@ -8463,10 +8430,9 @@ export class QQBotAdapter extends plugin {
     const match = /^#q+bot账号掉线自动重连\s*(开启|关闭)$/i.exec(this.e.msg)
     const state = match[1] === '开启'
 
-    getOfflineDetectConfig(this.e.self_id).autoReconnect = state
-
-    this.reply(`账号掉线自动重连已${state ? '开启' : '关闭'}${state ? '（需先开启掉线检测总开关）' : ''}`, true)
-    await configSave()
+    await wsStore.update(this.e.self_id, record => { record.settings.offline.autoReconnect = state })
+    Bot[this.e.self_id]?.sdk?._sessionLifecycle?.refreshPolicy()
+    return this.reply([`账号掉线自动重连已${state ? '开启' : '关闭'}（基础连接恢复不依赖定时检测开关）`, segment.button([{ text: '返回', callback: '#QQBotWS掉线配置' }])], true)
   }
 
   async setOfflineInterval () {
@@ -8477,17 +8443,15 @@ export class QQBotAdapter extends plugin {
     if (isNaN(minutes) || minutes < 1) minutes = 1
     if (minutes > 30) minutes = 30
 
+    await wsStore.update(this.e.self_id, record => { record.settings.offline.interval = minutes })
     const offlineDetect = getOfflineDetectConfig(this.e.self_id)
-    offlineDetect.interval = minutes
-
-    await configSave()
 
     // 如果总开关已开，重启定时器使新间隔生效
     if (offlineDetect.enabled) {
       if (Bot[this.e.self_id]?.adapter === adapter) adapter.startOfflineCheck(this.e.self_id)
-      this.reply(`掉线检测时间已设置为 ${minutes} 分钟，定时器已重启`, true)
+      return this.reply([`掉线检测时间已设置为 ${minutes} 分钟，定时器已重启`, segment.button([{ text: '返回', callback: '#QQBotWS掉线配置' }])], true)
     } else {
-      this.reply(`掉线检测时间已设置为 ${minutes} 分钟（开启检测后生效）`, true)
+      return this.reply([`掉线检测时间已设置为 ${minutes} 分钟（开启检测后生效）`, segment.button([{ text: '返回', callback: '#QQBotWS掉线配置' }])], true)
     }
   }
 
@@ -8700,7 +8664,8 @@ export class QQBotAdapter extends plugin {
       '',
       '><qqbot-cmd-input text="#QQBot接口切换菜单" show="接口切换菜单"/>',
       '',
-      '><qqbot-cmd-input text="#qqbot素材管理菜单" show="素材管理菜单"/>'
+      '><qqbot-cmd-input text="#qqbot素材管理菜单" show="素材管理菜单"/>',
+      '', '><qqbot-cmd-input text="#QQBotws配置" show="WS配置"/>'
     ].join('\n')
     return this.reply([
       msg,
@@ -8710,7 +8675,7 @@ export class QQBotAdapter extends plugin {
           { text: '消息后缀', callback: '#QQBot消息后缀菜单' }
         ],
         [{ text: '接口切换', callback: '#QQBot接口切换菜单' }, { text: '素材管理', callback: '#qqbot素材管理菜单' }],
-        [{ text: '返回', callback: '#QQBot帮助' }]
+        [{ text: 'WS配置', callback: '#QQBotws配置' }, { text: '返回', callback: '#QQBot帮助' }]
       )
     ], true)
   }
