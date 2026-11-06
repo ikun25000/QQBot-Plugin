@@ -1,5 +1,6 @@
 import fullMessageStore from './fullMessageStore.js'
 import groupInfoStore from './groupInfoStore.js'
+import { fillMissing, configuredBotIds } from './configMigration.js'
 
 const FULL_MESSAGE_OPTIONS = {
   '仅回复@机器人': {
@@ -143,8 +144,7 @@ function ensureFullMessageConfig (config, selfId = '') {
     config.fullMessage = {}
   }
 
-  const legacyOptions = Object.values(FULL_MESSAGE_OPTIONS).map(option => option.key)
-  const hasLegacy = legacyOptions.some(key => Object.prototype.hasOwnProperty.call(config.fullMessage, key))
+  migrateLegacyFullMessageOptions(config, selfId)
   if (!config.fullMessage.bots || typeof config.fullMessage.bots !== 'object' || Array.isArray(config.fullMessage.bots)) {
     config.fullMessage.bots = {}
   }
@@ -155,15 +155,7 @@ function ensureFullMessageConfig (config, selfId = '') {
   }
 
   const fullMessage = config.fullMessage.bots[key]
-
-  if (hasLegacy && selfId) {
-    for (const optionKey of legacyOptions) {
-      if (Object.prototype.hasOwnProperty.call(config.fullMessage, optionKey) && typeof fullMessage[optionKey] !== 'boolean') {
-        fullMessage[optionKey] = config.fullMessage[optionKey]
-      }
-    }
-    for (const optionKey of legacyOptions) delete config.fullMessage[optionKey]
-  }
+  if (key !== 'default') fillMissing(fullMessage, config.fullMessage.bots.default)
 
   for (const option of Object.values(FULL_MESSAGE_OPTIONS)) {
     if (typeof fullMessage[option.key] !== 'boolean') {
@@ -188,9 +180,9 @@ function ensureFullMessageConfig (config, selfId = '') {
   return fullMessage
 }
 
-function migrateLegacyFullMessageOptions (config) {
+function migrateLegacyFullMessageOptions (config, selfId = '') {
   if (!config.fullMessage || typeof config.fullMessage !== 'object') return false
-  const legacyOptions = Object.values(FULL_MESSAGE_OPTIONS).map(option => option.key)
+  const legacyOptions = [...Object.values(FULL_MESSAGE_OPTIONS).map(option => option.key), ...Object.keys(FULL_MESSAGE_EXTRA_DEFAULTS)]
   const legacy = {}
   for (const key of legacyOptions) {
     if (Object.prototype.hasOwnProperty.call(config.fullMessage, key)) legacy[key] = config.fullMessage[key]
@@ -198,14 +190,11 @@ function migrateLegacyFullMessageOptions (config) {
   if (!Object.keys(legacy).length) return false
 
   if (!config.fullMessage.bots || typeof config.fullMessage.bots !== 'object' || Array.isArray(config.fullMessage.bots)) config.fullMessage.bots = {}
-  const selfIds = Array.isArray(config.token)
-    ? config.token.map(token => String(token).split(':')[0]).filter(Boolean)
-    : []
-  const targets = selfIds.length ? selfIds : ['default']
+  const targets = configuredBotIds(config, Object.keys(config.fullMessage.bots), selfId, 'default')
   for (const selfId of targets) {
     if (!config.fullMessage.bots[selfId] || typeof config.fullMessage.bots[selfId] !== 'object') config.fullMessage.bots[selfId] = {}
     for (const [key, value] of Object.entries(legacy)) {
-      if (typeof config.fullMessage.bots[selfId][key] !== 'boolean') config.fullMessage.bots[selfId][key] = value
+      if (config.fullMessage.bots[selfId][key] === undefined) config.fullMessage.bots[selfId][key] = structuredClone(value)
     }
   }
   for (const key of Object.keys(legacy)) delete config.fullMessage[key]
