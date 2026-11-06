@@ -1,33 +1,20 @@
 import makeConfig from '../../../lib/plugins/config.js'
-import { allowNextQQBotCredentialRemoval, flushQQBotCredentialLossNotification, installQQBotConfigSafetyHook, prepareQQBotConfig, reloadSafeQQBotConfig, setQQBotCredentialLossNotifier, setQQBotCredentialLossSync, startQQBotConfigBackupCheck, stopQQBotConfigBackupCheck } from './configSafety.js'
+import fs from 'node:fs/promises'
+import YAML from 'yaml'
+import { wsStore } from './wsStore.js'
+import { fixedConfigValue } from './fixedConfigSerializer.js'
+import { createConfigSaver } from './configSaver.js'
+import { botOptionDefaults } from './configMigration.js'
+import { allowNextQQBotCredentialRemoval as authorizeCredentialRemoval, flushQQBotCredentialLossNotification, installQQBotConfigSafetyHook, prepareQQBotConfig, reloadSafeQQBotConfig, setQQBotCredentialLossNotifier, setQQBotCredentialLossSync, startQQBotConfigBackupCheck, stopQQBotConfigBackupCheck } from './configSafety.js'
 
 installQQBotConfigSafetyHook()
 await prepareQQBotConfig()
 
-let { config, configSave } = await makeConfig('QQBot', {
+let { config } = await makeConfig('QQBot', {
   tips: '',
   permission: 'master',
-  toQRCode: true,
-  toCallback: false,
-  toBotUpload: true,
-  markdownImageConvert: false,
-  imageFallback: {
-    provider: 'official',
-    autoCleanup: true,
-    retentionDays: 3,
-    quotaPolicy: 'cleanup'
-  },
-  forceSilk: true,
-  audioErrorFallback: true,
-  audioErrorFallbackPriority: 'file',
-  audioCorrectFileName: true,
-  markdownReference: false,
-  groupEvent: false,
+  ...botOptionDefaults(),
   hideGuildRecall: false,
-  toQQUin: false,
-  toImg: true,
-  callStats: false,
-  userStats: false,
   markdown: {
     template: 'abcdefghij'
   },
@@ -95,14 +82,27 @@ let { config, configSave } = await makeConfig('QQBot', {
     '欢迎使用 TRSS-Yunzai QQBot Plugin ! 作者：时雨🌌星空 & 小叶',
     '参考：https://github.com/XasYer/Yunzai-QQBot-Plugin'
   ]
+}, {
+  replacer: text => YAML.stringify(fixedConfigValue(YAML.parse(text), wsStore))
 })
+
+// Credential changes must await the actual serialized atomic write, not the
+// framework debounce callback. The safety hook below handles no-op writes.
+const configSave = createConfigSaver({
+  snapshot: () => fixedConfigValue(config, wsStore),
+  write: value => fs.writeFile('config/QQBot.yaml', YAML.stringify(value), 'utf8')
+})
+const allowNextQQBotCredentialRemoval = next => authorizeCredentialRemoval(YAML.stringify(fixedConfigValue(typeof next === 'string' ? YAML.parse(next) : next, wsStore)))
 
 startQQBotConfigBackupCheck()
 
 async function refConfig () {
+  await configSave.flush()
   const next = await reloadSafeQQBotConfig()
   for (const key of Object.keys(config)) delete config[key]
   Object.assign(config, next)
+  config.selfOpenid ||= {}
+  for (const [id, record] of wsStore.accounts) if (record.selfOpenid) config.selfOpenid[id] = record.selfOpenid
 }
 
 export {
