@@ -115,6 +115,7 @@ async function writeAtomic (file, text, mode = 0o600) {
     await originalWriteFile(tmp, text, { encoding: 'utf8', mode })
     await syncFile(tmp)
     await originalRename(tmp, file)
+    if (file === CONFIG_FILE) state.internalConfigText = text
     await syncDirectory(dirname(file))
   } catch (err) {
     try { await originalUnlink(tmp) } catch {}
@@ -148,13 +149,21 @@ async function saveBackup (text, updateCredential = true) {
   await originalMkdir(BACKUP_DIR, { recursive: true, mode: 0o700 })
   const hash = hashText(text)
   const entries = await originalReaddir(BACKUP_DIR).catch(() => [])
-  if (!entries.some(name => name.endsWith(`-${hash.slice(0, 12)}.yaml`))) {
+  const newHistory = !entries.some(name => name.endsWith(`-${hash.slice(0, 12)}.yaml`))
+  if (newHistory) {
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, '')
     await writeAtomic(join(BACKUP_DIR, `QQBot-${stamp}-${hash.slice(0, 12)}.yaml`), text)
   }
-  await writeAtomic(LATEST_BACKUP, text)
-  if (updateCredential && hasCredentials(value)) await writeAtomic(LATEST_CREDENTIAL_BACKUP, text)
-  await pruneBackups()
+  await writeIfChanged(LATEST_BACKUP, text)
+  if (updateCredential && hasCredentials(value)) await writeIfChanged(LATEST_CREDENTIAL_BACKUP, text)
+  if (newHistory) await pruneBackups()
+}
+
+async function writeIfChanged (file, text) {
+  try { if (await originalReadFile(file, 'utf8') === text) return } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
+  await writeAtomic(file, text)
 }
 
 async function findLatestValidBackup () {
@@ -323,7 +332,7 @@ async function safeConfigWrite (file, data, options) {
     }
     if (allowRemoval && !hasCredentials(next)) await writeAtomic(REMOVAL_AUTHORIZATION, hashText(text))
     else if (allowRemoval) { try { await originalUnlink(REMOVAL_AUTHORIZATION) } catch {} }
-    await writeAtomic(CONFIG_FILE, text)
+    if (current !== text) await writeAtomic(CONFIG_FILE, text)
     await saveBackup(text, allowRemoval || currentAuthorizedRemoval || missingAppids.length === 0)
     if (missingAppids.length) await queueCredentialLossNotification(missingAppids, next.token)
     else await clearCredentialLossNotification()
@@ -360,7 +369,12 @@ function startQQBotConfigBackupCheck () {
       if (state.watchTimer) clearTimeout(state.watchTimer)
       state.watchTimer = setTimeout(() => {
         state.watchTimer = null
-        state.writeQueue = state.writeQueue.catch(() => {}).then(() => state.backupCheck())
+        state.writeQueue = state.writeQueue.catch(() => {}).then(async () => {
+          // Ignore our own fully validated atomic rename, but still inspect
+          // external deletion/corruption even immediately after an internal save.
+          try { if (await originalReadFile(CONFIG_FILE, 'utf8') === state.internalConfigText) return } catch {}
+          await state.backupCheck()
+        })
         state.writeQueue.catch(err => globalThis.logger?.error?.('[QQBot-Plugin] QQBot配置变更校验失败:', err.message))
       }, 500)
       state.watchTimer.unref?.()
