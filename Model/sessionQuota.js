@@ -24,12 +24,15 @@ export function createSessionQuota ({ key, log = () => {}, onWait = () => {}, on
     log('info', `Session 可用连接次数 ${value.remaining}/${value.total}，${Math.ceil(value.reset_after / 1000)}秒后重置，每5秒最多 ${value.max_concurrency} 次`)
   }
 
-  async function acquire ({ signal, refresh, resume = false }) {
+  async function acquire ({ signal, refresh, resume = false, probeReserve }) {
     try {
       for (;;) {
         signal.throwIfAborted()
         const exhausted = limit?.remaining === 0
         const unknown = !limit || refreshRequired || now() - limit.observedAt > 60000
+        if (probeReserve !== undefined && (unknown || exhausted || limit.remaining <= probeReserve)) {
+          throw new Error('配额未知或不足预留次数，未建立临时连接')
+        }
         if (exhausted || unknown) {
           const waitMs = exhausted && limit.resetAt > now() ? limit.resetAt - now() + 1000 : 60000
           waiting = { reason: exhausted ? 'quota' : 'quota-unknown', until: now() + waitMs }
