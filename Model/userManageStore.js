@@ -425,6 +425,7 @@ class UserManageStore {
       group_openid: String(item.group_openid),
       seq: Number(item.seq) || 0,
       time_ms: this._historyTimeMs(item.time_ms || item.time),
+      received: typeof item.received === 'boolean' ? item.received : undefined,
       key: key || item.key || ''
     }
     const list = this._recentGroupIndexes.get(normalized.self_id) || []
@@ -805,7 +806,7 @@ class UserManageStore {
     this._data.historySeqs[key] = Math.max(lastSeq, seq)
     const isGroup = (msg.type || 'group') === 'group'
     const recentItem = isGroup
-      ? { self_id: String(selfId), group_openid: String(targetOpenid), seq, time_ms: this._historyTimeMs(msg.time) }
+      ? { self_id: String(selfId), group_openid: String(targetOpenid), seq, time_ms: this._historyTimeMs(msg.time), received: msg.local_bot !== true }
       : { self_id: String(selfId), user_openid: String(targetOpenid), seq, time_ms: this._historyTimeMs(msg.time) }
     if (this.type === 'level' && this._db) {
       const removedIndexes = isGroup
@@ -875,6 +876,30 @@ class UserManageStore {
     const knownPages = windowNo * RECENT_GROUP_WINDOW_PAGES + Math.ceil(snapshot.list.length / size)
     const hasMore = snapshot.list.length === RECENT_GROUP_WINDOW_PAGES * size
     return { list, page: requested, pageCount: Math.max(requested, knownPages, hasMore && requested % RECENT_GROUP_WINDOW_PAGES === 0 ? requested + 1 : 0), total: windowNo * RECENT_GROUP_WINDOW_PAGES * size + snapshot.list.length, hasMore, snapshot_at: snapshot.created_at }
+  }
+
+  async listRecentlyReceivedGroups (selfId = '', limit = 50, { signal } = {}) {
+    const id = String(selfId)
+    await this._ensureLegacyRecentIndex(id, 'group')
+    signal?.throwIfAborted()
+    const result = [], seen = new Set()
+    const count = Math.min(50, Math.max(1, Number(limit) || 50))
+    const indexes = [...(this._recentGroupIndexes.get(id) || [])].reverse()
+    for (const index of indexes) {
+      signal?.throwIfAborted()
+      if (seen.has(index.group_openid) || index.received === false) continue
+      // Old indexes lack direction. Inspect the actual history rather than
+      // treating a self-sent message or a metadata refresh as inbound activity.
+      if (index.received !== true) {
+        const item = await this.findHistoryBySeq(id, index.group_openid, index.seq)
+        signal?.throwIfAborted()
+        if (!item || item.local_bot === true) continue
+      }
+      seen.add(index.group_openid)
+      result.push({ openid: index.group_openid, receivedAt: index.time_ms })
+      if (result.length >= count) break
+    }
+    return result
   }
 
   async _loadRecentGroupWindow (selfId, windowNo, size) {
