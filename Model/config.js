@@ -4,8 +4,9 @@ import YAML from 'yaml'
 import { wsStore } from './wsStore.js'
 import { fixedConfigValue } from './fixedConfigSerializer.js'
 import { createConfigSaver } from './configSaver.js'
+import { createWsYamlSettings } from './wsSettings.js'
 import { botOptionDefaults } from './configMigration.js'
-import { allowNextQQBotCredentialRemoval as authorizeCredentialRemoval, flushQQBotCredentialLossNotification, installQQBotConfigSafetyHook, prepareQQBotConfig, reloadSafeQQBotConfig, setQQBotCredentialLossNotifier, setQQBotCredentialLossSync, startQQBotConfigBackupCheck, stopQQBotConfigBackupCheck } from './configSafety.js'
+import { allowNextQQBotCredentialRemoval as authorizeCredentialRemoval, flushQQBotCredentialLossNotification, installQQBotConfigSafetyHook, prepareQQBotConfig, readQQBotConfigRevision, reloadSafeQQBotConfig, setQQBotCredentialLossNotifier, setQQBotCredentialLossSync, startQQBotConfigBackupCheck, stopQQBotConfigBackupCheck } from './configSafety.js'
 
 installQQBotConfigSafetyHook()
 await prepareQQBotConfig()
@@ -88,21 +89,30 @@ let { config } = await makeConfig('QQBot', {
 
 // Credential changes must await the actual serialized atomic write, not the
 // framework debounce callback. The safety hook below handles no-op writes.
+let configRevision = await readQQBotConfigRevision()
 const configSave = createConfigSaver({
   snapshot: () => fixedConfigValue(config, wsStore),
-  write: value => fs.writeFile('config/QQBot.yaml', YAML.stringify(value), 'utf8')
+  write: (value, { credentialUpsert }) => fs.writeFile('config/QQBot.yaml', YAML.stringify(value), {
+    encoding: 'utf8', credentialUpsert, expectedRevision: () => configRevision, onCommitted: revision => { configRevision = revision }
+  })
 })
 const allowNextQQBotCredentialRemoval = next => authorizeCredentialRemoval(YAML.stringify(fixedConfigValue(typeof next === 'string' ? YAML.parse(next) : next, wsStore)))
+const wsYamlSettings = createWsYamlSettings({ config, save: configSave })
+wsStore.useSettings(wsYamlSettings)
 
 startQQBotConfigBackupCheck()
 
 async function refConfig () {
-  await configSave.flush()
-  const next = await reloadSafeQQBotConfig()
-  for (const key of Object.keys(config)) delete config[key]
-  Object.assign(config, next)
-  config.selfOpenid ||= {}
-  for (const [id, record] of wsStore.accounts) if (record.selfOpenid) config.selfOpenid[id] = record.selfOpenid
+  return wsYamlSettings.exclusive(async () => {
+    await configSave.flush().catch(error => { if (error.code !== 'QQBOT_CONFIG_EDITED') throw error })
+    const { config: next, revision } = await reloadSafeQQBotConfig({ withRevision: true })
+    wsYamlSettings.validate(next)
+    for (const key of Object.keys(config)) delete config[key]
+    Object.assign(config, next)
+    configRevision = revision
+    config.selfOpenid ||= {}
+    for (const [id, record] of wsStore.accounts) if (record.selfOpenid) config.selfOpenid[id] = record.selfOpenid
+  })
 }
 
 export {
