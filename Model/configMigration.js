@@ -28,7 +28,7 @@ export function configuredBotIds (config, ...extra) {
 export function botOptionDefaults () {
   return {
     toQRCode: true, toCallback: false, toBotUpload: true,
-    markdownImageConvert: false,
+    markdownImageConvert: false, messageLinkEscape: false,
     imageFallback: { provider: 'official', autoCleanup: true, retentionDays: 3, quotaPolicy: 'cleanup' },
     forceSilk: true, audioErrorFallback: true, audioErrorFallbackPriority: 'file', audioCorrectFileName: true,
     markdownReference: false, groupEvent: false, toQQUin: false, toImg: true, callStats: false, userStats: false,
