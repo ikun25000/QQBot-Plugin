@@ -12,12 +12,17 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFile } from 'node:child_process'
 import { setTimeout as sessionDelay } from 'node:timers/promises'
 import { installSessionLifecycle } from './Model/sessionLifecycle.js'
+import { redactWsText, wsSessionLabel } from './Model/wsDiagnostics.js'
 import { createSessionQuota } from './Model/sessionQuota.js'
 import { wsStore } from './Model/wsStore.js'
 import { createWsSession, restoreWsIdentity } from './Model/wsSession.js'
 import { createWsNotifications } from './Model/wsNotifications.js'
 import { wsEndpoints } from './Model/wsEnvironment.js'
 import { handleWsCommand } from './Model/wsCommands.js'
+import { createWsBusiness } from './Model/wsBusiness.js'
+import { listUsableBusinessBots } from './Model/wsBusinessAccounts.js'
+import { createWsCandidate } from './Model/wsCandidate.js'
+import { handleBusinessCommand } from './Model/wsBusinessCommands.js'
 import { createWsQuotaReader } from './Model/wsQuotaReader.js'
 import { collectGatewayWork, trackGatewayWork, dispatchSdkEvent } from './Model/gatewayDelivery.js'
 import { initializeWsAccounts } from './Model/wsStartup.js'
@@ -31,6 +36,7 @@ import { MediaImageApi, mediaErrorText } from './Model/mediaImageApi.js'
 import { MediaImageStore } from './Model/mediaImageStore.js'
 import { MediaImageManager, mediaImageSettings } from './Model/mediaImageManager.js'
 import { handleMediaImageCommand, handleImageConvertCommand } from './Model/mediaImageCommands.js'
+import { escapeMessageLinkPayload } from './Model/messageLinkEscape.js'
 import {
   Dau,
   importJS,
@@ -1764,6 +1770,7 @@ const PER_BOT_CONFIG_KEYS = [
   'toCallback',
   'toBotUpload',
   'markdownImageConvert',
+  'messageLinkEscape',
   'imageFallback',
   'forceSilk',
   'audioErrorFallback',
@@ -2258,6 +2265,50 @@ function parseQQBotAccount (value = '') {
   return { ok: true, account }
 }
 
+let qrCredentialWrites = Promise.resolve()
+function saveScannedQQBotAccount (robotUin, appId, clientSecret) {
+  const work = qrCredentialWrites.catch(() => {}).then(async () => {
+    const previous = Array.isArray(config.token) ? [...config.token] : config.token
+    if (!Array.isArray(previous)) throw new Error('QQBot账号配置不是有效列表')
+    const accounts = previous.map(parseQQBotAccount)
+    const sameQQ = value => String(value || '').split(':')[0]?.trim() === String(robotUin)
+    const matches = account => account.ok && account.account.selfId === String(robotUin)
+    const existing = accounts.find(account => matches(account) && account.account.appid === String(appId)) || accounts.find(matches)
+    const parsed = parseQQBotAccount(`${robotUin}:${appId}:${clientSecret}:${existing?.account.guildPrivate ?? '0'}`)
+    if (!parsed.ok) throw new Error(parsed.error)
+    const accountText = parsed.account.text
+    // Remove duplicate credentials for this QQ only; otherwise a stale entry
+    // can win at startup even when the new secret was successfully written.
+    const next = []
+    let replaced = false
+    for (let i = 0; i < previous.length; i++) {
+      if (!sameQQ(previous[i])) next.push(previous[i])
+      else if (!replaced) { next.push(accountText); replaced = true }
+    }
+    if (!replaced) next.push(accountText)
+    config.token = next
+    try {
+      await configSave({ credentialUpsert: accountText })
+    } catch (error) {
+      // A failed scan save must not become a later ordinary setting's accidental
+      // credential write, nor roll back another account changed while awaiting I/O.
+      const current = Array.isArray(config.token) ? config.token : []
+      const currentMatches = current.filter(sameQQ)
+      if (currentMatches.length === 1 && currentMatches[0] === accountText) {
+        const restored = current.filter(value => !sameQQ(value))
+        const old = previous.filter(sameQQ)
+        const at = current.indexOf(accountText)
+        restored.splice(Math.min(at, restored.length), 0, ...old)
+        config.token = restored
+      }
+      throw error
+    }
+    return accountText
+  })
+  qrCredentialWrites = work
+  return work
+}
+
 function migrateLegacyAccountConfig () {
   if (!Array.isArray(config.token)) {
     config.token = []
@@ -2426,6 +2477,11 @@ function patchGroupMessageCreateEvent () {
 
     if (!QQBotClass.prototype._qqbotFullMessageDispatchPatched) {
       QQBotClass.prototype.dispatchEvent = function (event, wsRes, delivery = {}) {
+        // Unknown IDs are informational, not messages: preserve their complete
+        // frame/shape and do not run message dedupe or protection against them.
+        if (typeof event === 'string' && (!Object.hasOwn(eventModule.QQEvent, event) || !eventModule.QQEvent[event])) {
+          return dispatchSdkEvent.call(this, event, wsRes, eventModule.QQEvent)
+        }
         let originalEvent
         if (wsRes?.d && typeof event === 'string') {
           const selfId = this.config?.real_self_id || this.self_id || wsRes.d.self_id || ''
@@ -2435,16 +2491,13 @@ function patchGroupMessageCreateEvent () {
             return
           }
           originalEvent = {
-            op: wsRes.op,
-            s: wsRes.s,
+            ...wsRes,
             t: event,
-            id: wsRes.id,
             d: { ...wsRes.d }
           }
           qqbotOriginalEventMap.set(wsRes.d, originalEvent)
           wsRes.d._qqbotRawEvent = event
           if (typeof wsRes.d.content === 'string' && typeof wsRes.d._rawContent !== 'string') wsRes.d._rawContent = wsRes.d.content
-          if (!eventModule.QQEvent[event]) this.logger.warn(`unhandled(${event})`)
         }
         return dispatchSdkEvent.call(this, event, wsRes, eventModule.QQEvent, originalEvent)
       }
@@ -2529,6 +2582,19 @@ function patchGroupMessageCreateEvent () {
     // at import time, bypassing the message normalization/fallback wrapper.
     for (const event of ['AT_MESSAGE_CREATE', 'DIRECT_MESSAGE_CREATE', 'MESSAGE_CREATE', 'GROUP_AT_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE']) {
       eventModule.EventParserMap.set(eventModule.QQEvent[event], messageModule.MessageEvent.parse)
+    }
+    // SDK 1.0.3 routes post deletion to the thread constructor and marks reply
+    // deletion as creation. Correct only these two parser entries; leave forum
+    // subscriptions and the adapter's existing notice/QQ-group scope unchanged.
+    for (const [event, Notice] of [
+      ['FORUM_POST_DELETE', noticeModule.PostChangeNoticeEvent],
+      ['FORUM_REPLY_DELETE', noticeModule.ReplyChangeNoticeEvent]
+    ]) {
+      const mapped = eventModule.QQEvent[event]
+      if (!mapped || typeof Notice !== 'function' || eventModule.EventParserMap.get(mapped)?._qqbotForumDeletePatched) continue
+      const parse = function (_event, payload) { return new Notice(this, 'delete', payload) }
+      parse._qqbotForumDeletePatched = true
+      eventModule.EventParserMap.set(mapped, parse)
     }
     if (!noticeModule.ActionNoticeEvent.parse._qqbotClawConfigParsePatched) {
       const originalActionParse = noticeModule.ActionNoticeEvent.parse
@@ -2774,6 +2840,116 @@ if (typeof segment?.txt !== 'function') segment.txt = text => ({ type: 'text', t
 const offlineCheckState = { timers: {} }
 const wsProbeState = new Map()
 const readWsQuota = createWsQuotaReader({ request: axios })
+const wsBusiness = createWsBusiness({
+  store: wsStore,
+  listUsableBots: () => listUsableBusinessBots({ tokens: config.token, parseAccount: parseQQBotAccount, getBot: id => Bot[id], adapter }),
+  getRuntime: id => {
+    const bot = Bot[id]
+    if (bot?.adapter !== adapter) return null
+    const lifecycle = bot.sdk?._sessionLifecycle
+    return { identity: bot, appid: String(bot.sdk.config.appid), sandbox: !!bot.wsEnvironment,
+      ready: !!lifecycle?.readySocket, socket: lifecycle?.readySocket, busy: lifecycle?.busy,
+      disabled: bot.disabledRuntime || bot.readOnlyMode, readyAt: lifecycle?.health.protocolReadyAt }
+  },
+  getGroup: async (id, openid, { info = false, force = false, signal } = {}) => {
+    if (!/^[a-z\d_-]{1,128}$/i.test(openid)) throw new Error('群OpenID无效')
+    signal?.throwIfAborted()
+    const sdk = Bot[id]?.sdk
+    const request = endpoint => () => {
+      signal?.throwIfAborted()
+      if (!sdk || Bot[id]?.sdk !== sdk) throw new DOMException('群资料查询已取消', 'AbortError')
+      return sdk.request.get(`/v2/groups/${openid}/${endpoint}`, { signal, timeout: 8000 })
+    }
+    let metadata = groupInfoStore.peekInfo(id, openid)
+    const [state, refreshed] = await Promise.all([
+      groupInfoStore.recheckProactiveState(id, openid, request('bot_state')),
+      info && (force || !metadata?.group_name || metadata.error) ? groupInfoStore.refreshInfo(id, openid, request('info')) : null
+    ])
+    signal?.throwIfAborted()
+    metadata = refreshed?.info || metadata
+    return { state: state.ok ? state.state : null, stateError: state.ok ? null : state.error, info: metadata }
+  },
+  peekGroup: (id, openid) => ({ info: groupInfoStore.peekInfo(id, openid), state: groupInfoStore.peekBotState(id, openid) }),
+  getRecentGroups: (id, options) => userManageStore.listRecentlyReceivedGroups(id, 50, options),
+  getGroups: async id => (await getAllQQBotGroups(id)).map(group => {
+    const cached = groupInfoStore.peekInfo(id, group.openid)
+    return { ...group, openid: group.openid,
+      group_name: cached?.group_name || group.group_name || group.name || group.remark_name || '',
+      group_member_num: cached?.group_member_num || group.group_member_num || 0,
+      allow_proactive_msg: groupInfoStore.peekBotState(id, group.openid)?.allow_proactive_msg }
+  }),
+  send: async (id, group, content, signal) => {
+    const sdk = Bot[id]?.sdk
+    if (!sdk?._sessionLifecycle?.readySocket) throw new Error('发送者未连接，未发出探针')
+    let response
+    try {
+      // Do not use the command's reply context, hooks, or the ordinary sender:
+      // this request is explicitly a new, proactive plain-text group message.
+      response = await sdk.request.post(`/v2/groups/${encodeURIComponent(group)}/messages`, { msg_type: 0, content }, { signal, timeout: 8000 })
+    } catch { throw new Error('发送者主动消息失败，请检查群内主动权限或频控') }
+    if (!response?.data?.id) throw new Error('主动消息未返回消息ID，无法确认已发送')
+    return { id: response.data.id }
+  },
+  queryQuota: (id, fresh = false) => adapter._getSessionInfo(id, { fresh, includeGateway: true }),
+  createCandidate: (id, { signal, quota, reserve, onFrame, timeoutMs, validate = () => {} }) => {
+    const bot = Bot[id], sdk = bot.sdk, sm = sdk.sessionManager
+    const expectedSocket = sdk._sessionLifecycle.readySocket
+    const checkMain = () => {
+      signal.throwIfAborted()
+      validate()
+      if (Bot[id] !== bot || bot.disabledRuntime || bot.readOnlyMode || !expectedSocket ||
+          sdk._sessionLifecycle.readySocket !== expectedSocket || sdk._sessionLifecycle.busy) {
+        throw new DOMException('主连接已改变，检测已取消', 'AbortError')
+      }
+    }
+    return createWsCandidate({ signal, onFrame, timeoutMs, expectedUserId: sdk.self_id, validate: checkMain,
+      heartbeatTimeout: getOfflineDetectConfig(id).heartbeatTimeout,
+      beforeIdentify: async detail => {
+        checkMain()
+        await bot.sessionQuota.beforeIdentify(detail)
+        detail.signal.throwIfAborted()
+        checkMain()
+      },
+      onIdentify: () => { bot.wsNotifications.identify(); bot.wsBusiness.identify(id, { probe: true }) },
+      openSocket: async candidateSignal => {
+        candidateSignal.throwIfAborted()
+        checkMain()
+        const gateway = new URL(quota.gateway)
+        if (gateway.protocol !== 'wss:' || !gateway.hostname) throw new Error('临时连接网关地址无效')
+        const target = config.bus?.[id] ? new URL(`wss://${config.bus[id]}/ws?url=${encodeURIComponent(gateway.href)}&appid=${encodeURIComponent(sdk.config.appid)}`) : gateway
+        await sm.getAccessToken()
+        candidateSignal.throwIfAborted()
+        checkMain()
+        await bot.sessionQuota.acquire({ signal: candidateSignal, probeReserve: reserve })
+        candidateSignal.throwIfAborted()
+        checkMain()
+        const { WebSocket } = require('ws')
+        const token = sm.access_token
+        if (!token) throw new Error('缺少访问凭证')
+        return { token, intents: sm.getValidIntends(), socket: new WebSocket(target, {
+          headers: withQQBotUserAgentHeaders(id, { Authorization: `QQBot ${token}`, 'X-Union-Appid': sdk.config.appid })
+        }) }
+      }
+    })
+  },
+  promote: (id, candidate, original) => {
+    const bot = Bot[id]
+    const lifecycle = bot?.sdk?._sessionLifecycle
+    if (bot !== original.identity || lifecycle?.readySocket !== original.socket || lifecycle.busy) return false
+    const transfer = candidate.take()
+    let adopted = false
+    try {
+      adopted = lifecycle.adoptConnection({ ...transfer, expectedSocket: original.socket })
+      return adopted
+    } finally {
+      if (!adopted) {
+        transfer.socket.on('error', () => {})
+        try { transfer.socket.terminate() } catch {}
+      }
+    }
+  },
+  log: (level, id, message) => Bot.makeLog(level, [`[${id}] 业务检测：${message}`], id)
+})
 
 async function loadWsAccount (id) {
   const record = await wsStore.loadAccount(id, legacyWsAccountConfig(config, id))
@@ -2796,7 +2972,29 @@ function refreshWsProbe (id) {
   wsProbeState.set(id, timer)
 }
 
+async function applyWsRuntimeSettings (id, { sessionChanged = false, businessChanged = false } = {}) {
+  const runtime = Bot[id]
+  if (runtime?.adapter !== adapter || runtime.disabledRuntime) return
+  const settings = wsStore.settings(id)
+  runtime.sdk.config.maxRetry = settings.offline.maxRetry
+  runtime.sdk._sessionLifecycle?.refreshPolicy()
+  adapter.startOfflineCheck(id)
+  refreshWsProbe(id)
+  if (businessChanged) runtime.wsBusiness?.refresh(id)
+  void runtime.wsNotifications?.refresh().catch(error => Bot.makeLog('error', [`[${id}] 刷新WS通知失败`, error.message], id))
+  if (!sessionChanged) return
+  if (settings.sessionSave) {
+    runtime.wsSession.update(runtime.sdk._sessionLifecycle.sessionSnapshot, { immediate: true })
+    await runtime.wsSession.flush()
+  } else {
+    await runtime.wsSession.clear({ force: true })
+    if (Bot[id] !== runtime || wsStore.settings(id).sessionSave) return
+    await wsStore.saveSession(`${id}:${runtime.sdk.config.appid}:${runtime.wsEnvironment ? 'production' : 'sandbox'}`, null)
+  }
+}
+
 installWsShutdown({ flush: async () => {
+  wsBusiness.shutdown()
   await Promise.allSettled([
     configSave.flush(),
     ...Object.values(Bot).filter(bot => bot?.wsSession).map(bot => bot.wsSession.flush())
@@ -4175,7 +4373,8 @@ const adapter = new class QQBotAdapter {
     for (const temp of template) {
       if (!temp.length) continue
 
-      for (const i of splitMarkDownTemplate(temp)) {
+      // Keep URL syntax together for the final request-level link formatter.
+      for (const i of getBotConfigValue(data.self_id, 'messageLinkEscape') === true ? [temp] : splitMarkDownTemplate(temp)) {
         if (index == (type == 1 ? markdown_template.params.length : keys.length)) {
           result.push({
             type: 'markdown',
@@ -6491,21 +6690,22 @@ const adapter = new class QQBotAdapter {
   /**
    * 查询账号 Session 信息（remaining / reset_after）
    */
-  async _getSessionInfo (id) {
+  async _getSessionInfo (id, { fresh = false, includeGateway = false } = {}) {
     const bot = Bot[id]
-    const account = config.token.map(parseQQBotAccount).find(value => value.ok && value.account.selfId === String(id))?.account ||
-      (bot?.sdk?.config?.appid ? { appid: bot.sdk.config.appid, secret: bot.sdk.config.secret } : null)
+    const current = bot?.sdk?.config?.appid ? { appid: bot.sdk.config.appid, secret: bot.sdk.config.secret } : null
+    const account = (includeGateway && current) || config.token.map(parseQQBotAccount).find(value => value.ok && value.account.selfId === String(id))?.account || current
     if (!account) return null
     try {
       await loadWsAccount(id)
       const endpoints = { ...getQQBotApiEndpoints(id), apiBase: getQQBotRequestBase(id) }
       const response = await readWsQuota({ id, appid: account.appid, secret: account.secret, endpoints,
-        headers: withQQBotUserAgentHeaders(id), accessToken: bot?.sdk?.sessionManager?.access_token, tokenExpireTime: bot?.tokenExpireTime })
+        headers: withQQBotUserAgentHeaders(id), accessToken: bot?.sdk?.sessionManager?.access_token, tokenExpireTime: bot?.tokenExpireTime, fresh })
       if (!response) return null
       const remainingReset = Math.max(0, response.data.session_start_limit.reset_after - (Date.now() - response.at))
       const data = { ...response.data, session_start_limit: { ...response.data.session_start_limit, reset_after: remainingReset } }
-      if (Bot[id] === bot && bot && !bot.disabledRuntime && !response.cached) bot.sessionQuota?.observe(data)
-      return { ...data.session_start_limit, cached: response.cached }
+      if (Bot[id] === bot && bot && !bot.disabledRuntime && !response.cached && current?.appid === account.appid && current?.secret === account.secret) bot.sessionQuota?.observe(data)
+      return { ...data.session_start_limit, cached: response.cached || response.failed,
+        ...(includeGateway ? { gateway: data.url } : {}) }
     } catch (err) {
       Bot.makeLog('debug', [`[${id}] 获取 Session 信息失败（未创建WS连接）`], id)
       return null
@@ -6552,6 +6752,7 @@ const adapter = new class QQBotAdapter {
     if (!bot) return
     if (bot.disabledRuntime) return
     bot.disabledRuntime = true
+    bot.wsBusiness?.unregister(id)
     bot.connectionGeneration = (bot.connectionGeneration || 0) + 1
     bot.disabledReason = reason || bot.disabledReason || '机器人运行态已停止'
     bot.isReconnecting = false
@@ -6612,6 +6813,7 @@ async connect (token) {
   ensureUserManageConfig(id)
   const existingBot = Bot[id]
   if (existingBot) {
+    existingBot.wsBusiness?.unregister(id)
     clearQQBotMessageQueue(id)
     existingBot.connectionGeneration = (existingBot.connectionGeneration || 0) + 1
     this.stopOfflineCheck(id)
@@ -6677,7 +6879,6 @@ async connect (token) {
       }, { headers: { 'User-Agent': ua } }).then(res => res.data)
       const token = await getToken()
       if (!token?.access_token) throw new Error(token?.message || token?.msg || '获取access_token失败')
-      this.bot.logger.debug('getAccessToken', token)
       this.access_token = token.access_token
       const nextSeconds = Math.max(60, Number(token.expires_in || 7200) - 1)
       setTimeout(() => this.getAccessToken().catch(() => {}), nextSeconds * 1000)
@@ -6954,6 +7155,7 @@ async connect (token) {
           }
           const authError = getQQBotAuthError(data)
           if (authError) {
+            this.businessCredentialInvalid = true
             Bot.makeLog('error', [`[${id}] ${authError}，中断连接`, data], id)
             finishReject(new Error(authError))
             return
@@ -7027,6 +7229,7 @@ async connect (token) {
             return
           }
           if (isQQBotCanceledError(err)) {
+            this.defaultWsMode = true
             Bot.makeLog('error', [`[${id}] 机器人已注销，尝试默认 websocket 地址`, err.message], id)
             return
           }
@@ -7036,6 +7239,7 @@ async connect (token) {
       })
     },
     logout () {
+      this.wsBusiness?.unregister(id)
       clearQQBotMessageQueue(id)
       void this.wsSession?.flush()
       return new Promise((resolve) => {
@@ -7109,12 +7313,13 @@ async connect (token) {
   }
 
   const runtime = Bot[id]
+  runtime.wsBusiness = wsBusiness
   let resolveInitialWait
   const initialWait = new Promise(resolve => { resolveInitialWait = resolve })
   const sessionQuota = createSessionQuota({
     key: String(opts.appid),
     onWait: detail => resolveInitialWait(detail),
-    onObserve: value => runtime.wsNotifications?.observe(value),
+    onObserve: value => { runtime.wsNotifications?.observe(value); runtime.wsBusiness?.quota(id, value) },
     log: (level, message) => {
       if (Bot[id] === runtime && !runtime.disabledRuntime) Bot.makeLog(level, [`[${id}] ${message}`], id)
     }
@@ -7141,7 +7346,8 @@ async connect (token) {
   if (Bot[id] !== runtime || runtime.disabledRuntime) return { ok: false, reason: '登录已取消' }
   if (savedSession) {
     if (restoreWsIdentity(sdk.sessionManager, savedSession)) {
-      Bot.makeLog('info', [`[${id}] 已载入持久化Session及机器人身份，连接后优先Resume`], id)
+      const sdkId = redactWsText(savedSession.user.id, [opts.secret, savedSession.sessionID]).replace(/[\r\n]/g, ' ').slice(0, 120)
+      Bot.makeLog('info', [`[${id}] 已载入持久化Session，优先Resume：环境=${opts.sandbox ? '沙箱' : '正式'} AppID=${opts.appid} SDK身份=${sdkId} SessionID=${wsSessionLabel(savedSession.sessionID)} 处理seq=${savedSession.seq} 保存时间=${new Date(savedSession.updatedAt).toISOString()}`], id)
     } else {
       await runtime.wsSession.clear()
       Bot.makeLog('warn', [`[${id}] 持久化Session缺少身份信息，安全回退Identify`], id)
@@ -7225,8 +7431,9 @@ async connect (token) {
       void readOnlyRecovery?.recover('READY/RESUMED')
     },
     onSession: (record, detail) => runtime.wsSession.update(record, detail),
-    onSessionInvalidated: () => runtime.wsSession.clear(),
-    onIdentify: () => runtime.wsNotifications.identify(),
+    onSessionInvalidated: () => runtime.wsSession.clear({ invalidated: true }),
+    onIdentify: () => { runtime.wsNotifications.identify(); runtime.wsBusiness?.identify(id) },
+    onRawDispatch: (frame, detail) => runtime.wsBusiness?.observe(id, frame, detail) === true,
     onStop: () => runtime.wsSession.flush(),
     onReconnect: ({ reason, disabled, expected, terminal }) => {
       if (Bot[id] !== runtime || runtime.disabledRuntime) return
@@ -7237,7 +7444,7 @@ async connect (token) {
     onError: async err => {
       if (Bot[id] !== runtime || runtime.disabledRuntime || runtime.sdk !== sdk) return
       const dispatch = err?.stage === 'dispatch'
-      Bot.makeLog('error', [`[${id}] ${dispatch ? '网关事件处理失败（连接保持，失败进度未确认）' : 'SDK 连接失败'}`, dispatch ? err.stack : err?.message || String(err)], id)
+      Bot.makeLog('error', [`[${id}] ${dispatch ? '网关事件处理失败（连接保持，失败进度未确认）' : 'SDK 连接失败'}`, err?.stack || err?.message || String(err)], id)
     }
   })
   runtime.connectionHealth = sdk._sessionLifecycle.health
@@ -7262,6 +7469,8 @@ async connect (token) {
     const retryDelays = [1, 3, 5, 7, 10]
     let failures = 0
     const promise = Promise.resolve().then(async () => {
+      checkSessionRequest(signal)
+      if (tokenSessionManager.access_token) sdk.logger.warn(`[TOKEN] ${force ? '主动刷新' : 'Token 即将过期，正在刷新'} access_token（不重建WS连接）`)
       for (let round = 0; ; round++) {
         for (let i = 0; i < retryDelays.length; i++) {
           try {
@@ -7275,12 +7484,14 @@ async connect (token) {
             tokenSessionManager.access_token = res.data.access_token
             tokenRuntime.tokenExpireTime = Date.now() + Math.max(0, expiresIn - 60) * 1000
             cachedToken = res.data
+            tokenRuntime.businessCredentialInvalid = false
             sdk.logger.info(`[TOKEN] access_token 已刷新，过期时间: ${expiresIn}秒`)
             return res.data
           } catch (err) {
             checkSessionRequest(signal, err)
             const authError = getQQBotAuthError(err.response?.data)
             if (authError) {
+              tokenRuntime.businessCredentialInvalid = true
               sdk.logger.error(`[TOKEN] ${authError}，中断连接`)
               throw Object.assign(new Error(authError), { fatal: true })
             }
@@ -7331,6 +7542,7 @@ async connect (token) {
       Bot.makeLog('error', [`[${id}] 检测到无效群接口地址`, requestUrl], id)
       throw err
     }
+    config.data = escapeMessageLinkPayload(requestUrl, config.data, getBotConfigValue(id, 'messageLinkEscape'))
     config.data = stripQQBotMessageReference(requestUrl, config.data, isQQBotInternalSend(), getBotConfigValue(id, 'markdownReference'))
     // 如果 token 即将过期（60秒内），先刷新
     if ((tokenRefreshPromise && tokenRefreshSignal === signal) || !tokenSessionManager.access_token || Date.now() >= tokenRuntime.tokenExpireTime) {
@@ -7389,6 +7601,7 @@ async connect (token) {
   })
   sdk.on('notice', event => trackGatewayWork(this.makeNotice(id, event)))
   sdk.on('request', event => trackGatewayWork(this.makeRequest(id, event)))
+  runtime.wsBusiness?.register(id)
 
   // 初次登录失败必须返回给设置命令，不能继续伪装成已连接。
   // A quota wait is a pending runtime, not an authenticated connection. Return
@@ -7568,6 +7781,16 @@ export class QQBotAdapter extends plugin {
           permission: config.permission
         },
         {
+          reg: /#q+bot(?:检测|业务检测|辅助探测|临时(?:鉴权|\s*identify)|自动接管|静默检测|消耗检测|允许辅助发送|查看辅助对象|立即检测|停止检测)/i,
+          fnc: 'businessCommand',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot清理所有session$/i,
+          fnc: 'clearAllSessions',
+          permission: config.permission
+        },
+        {
           reg: /^#q+bot(?:ws(?:配置|通知配置|掉线配置|全部(?:连接|链接)次数(?:\s+\d+)?|(?:零次数|大量消耗|掉线)?通知\s*(?:开启|关闭)|通知方式\s+(?:本号|sendmastermsg))|Session保存\s*(?:开启|关闭)|开启(?:正式|沙箱)环境)(?:\s+[\s\S]*)?$/i,
           fnc: 'wsCommand',
           permission: config.permission
@@ -7610,6 +7833,11 @@ export class QQBotAdapter extends plugin {
         {
           reg: /^#q+bot其他菜单$/i,
           fnc: 'otherMenu',
+          permission: config.permission
+        },
+        {
+          reg: /^#q+bot链接自动转义(?:\s+(?:开启|关闭))?$/i,
+          fnc: 'messageLinkEscapeSetting',
           permission: config.permission
         },
         {
@@ -8009,6 +8237,7 @@ export class QQBotAdapter extends plugin {
     this.reply([
       '🔌 WS配置\n\n' +
       '<qqbot-cmd-input text="#QQBotws配置" show="WS连接、Session、通知与环境设置" />\n' +
+      '<qqbot-cmd-input text="#qqbot检测菜单" show="业务检测" />\n' +
       '<qqbot-cmd-input text="#QQBot普通设置" show="普通设置" />\n' +
       '🛠️ 管理功能\n\n' +
       '<qqbot-cmd-input text="#QQBot添加过滤日志 " show="添加过滤日志" />\n' +
@@ -8051,6 +8280,7 @@ export class QQBotAdapter extends plugin {
       '#QQBot高级群欢迎菜单 - 高级群欢迎设置\n\n' +
       '🔌 WS配置\n' +
       '#QQBotws配置 - 连接次数、Session保存、通知、掉线与环境设置\n\n' +
+      '#qqbot检测菜单 - 业务检测\n\n' +
       '🛠️ 管理功能\n' +
       '#QQBot添加过滤日志 <消息内容>\n' +
       '#QQBot删除过滤日志 <消息内容>\n' +
@@ -8078,11 +8308,18 @@ export class QQBotAdapter extends plugin {
 
   async refConfig () {
     if (!this.guardOfficialBot()) return true
+    const previous = new Map([...wsStore.accounts.keys()].map(id => [id, wsStore.settings(id)]))
     await refConfig()
+    const runtimeResults = await Promise.allSettled([...previous].map(([id, settings]) => applyWsRuntimeSettings(id, {
+      sessionChanged: settings.sessionSave !== wsStore.settings(id).sessionSave,
+      businessChanged: JSON.stringify(settings.businessDetection) !== JSON.stringify(wsStore.settings(id).businessDetection)
+    })))
+    const runtimeFailures = runtimeResults.filter(result => result.status === 'rejected')
+    for (const result of runtimeFailures) Bot.makeLog('error', ['刷新WS运行设置失败', result.reason?.message], 'QQBot-Plugin')
     await groupProactiveResultStore.migrate(config, configSave)
     if (migrateLegacyAccountConfig()) await configSave()
     ensureFullMessageConfig(config, this.e.self_id)
-    this.reply('QQBot配置已安全刷新', true)
+    this.reply(`QQBot配置已安全刷新${runtimeFailures.length ? `；${runtimeFailures.length}个账号的WS缓存操作未完成，请查看日志` : ''}。WS环境改动重启生效。`, true)
   }
 
   List () {
@@ -8099,6 +8336,8 @@ export class QQBotAdapter extends plugin {
     await this.reply(riskText, true)
     const eventAdapter = this.e?.bot?.adapter
     const isQQBotEvent = (eventAdapter === adapter || eventAdapter?.id === 'QQBot' || this.e?.adapter_id === 'QQBot') && this.isOfficialBotEvent()
+    let scannedSecret
+    let savedRobotUin
     try {
       const result = await qrRegister({
         onQRCode: async (imageBuffer, connectUrl) => {
@@ -8131,25 +8370,27 @@ export class QQBotAdapter extends plugin {
           if (status === BindStatus.EXPIRED) Bot.makeLog('warn', ['QQBot扫码登录', message], this.e.self_id)
         }
       })
+      scannedSecret = result.clientSecret
       const { robotUin } = await getQQBotMeByCredentials(result.appId, result.clientSecret, this.e.self_id)
       if (!robotUin) throw new Error('@me接口未返回机器人QQ号')
 
-      const accountText = `${robotUin}:${result.appId}:${result.clientSecret}:0`
-      const existingIndex = config.token.findIndex(value => {
-        const parsed = parseQQBotAccount(value)
-        return parsed.ok && parsed.account.selfId === robotUin
-      })
-      if (existingIndex >= 0) config.token[existingIndex] = accountText
-      else config.token.push(accountText)
-      await configSave()
+      let accountText
+      try {
+        accountText = await saveScannedQQBotAccount(robotUin, result.appId, result.clientSecret)
+      } catch (error) {
+        const conflict = error.code === 'QQBOT_CONFIG_EDITED'
+        Bot.makeLog('error', [`[${robotUin}] 无法确认扫码凭据写入QQBot.yaml`, conflict ? '检测到外部配置修改' : '请检查配置文件及磁盘写入权限'], robotUin)
+        return this.reply(`扫码已授权（机器人QQ:${robotUin}），但未确认凭据保存，未尝试连接。${conflict ? '请先刷新配置，再重新扫码。' : '请检查 config/QQBot.yaml 的保存权限和磁盘空间后重试。'}`, true)
+      }
+      savedRobotUin = robotUin
 
       const connection = await adapter.connect(accountText)
       if (!connection?.ok) throw new Error(connection?.reason || '账号连接失败')
-      if (connection.pending) return this.reply(`账号已保存(机器人QQ:${robotUin})，尚未连接：${connection.reason}`, true)
-      await this.reply(`登录成功(机器人QQ:${robotUin})，如果需要开启频道私域/删除配置，自行修改或者查看配置文件`, true)
+      if (connection.pending) return this.reply(`账号已保存(机器人QQ:${robotUin})，尚未连接：${redactWsText(connection.reason, [scannedSecret])}`, true)
+      await this.reply(`登录成功(机器人QQ:${robotUin})，凭据已保存至 config/QQBot.yaml，重启后自动登录。`, true)
     } catch (err) {
       const reason = getQQBotAuthError(err.response?.data) || err.response?.data?.message || err.response?.data?.msg || err.message || String(err)
-      await this.reply(`登录失败: ${reason}`, true)
+      await this.reply(`${savedRobotUin ? `账号已保存(机器人QQ:${savedRobotUin})，但连接未成功` : '登录失败'}：${redactWsText(reason, [scannedSecret])}`, true)
     }
   }
 
@@ -8294,6 +8535,29 @@ export class QQBotAdapter extends plugin {
 
   // ========== 掉线检测命令 ==========
 
+  async businessCommand () {
+    await qqbotStoresReady
+    return handleBusinessCommand({
+      event: this.e, store: wsStore, manager: wsBusiness,
+      isLocalEvent: Bot[this.e.self_id]?.adapter === adapter && this.e.bot?.adapter === adapter,
+      configured: id => config.token.some(token => { const parsed = parseQQBotAccount(token); return parsed.ok && parsed.account.selfId === String(id) }),
+      listConfigured: () => [...new Set(config.token.map(parseQQBotAccount).filter(value => value.ok).map(value => value.account.selfId))],
+      reply: (...args) => this.reply(...args), buttons: (...rows) => segment.button(...rows)
+    })
+  }
+
+  async clearAllSessions () {
+    // Deliberately global and adapter-independent; framework command permission
+    // still applies. Do not load/create settings for the triggering adapter.
+    try {
+      const count = await wsStore.clearAllSessions()
+      return this.reply(`已清空所有本地QQBot的Session缓存（${count}条，含正式/沙箱及未运行账号）。\n当前连接不变，未修改任何配置；本进程不再写回Session。\n下次重启后所有QQBot重新Identify建立连接，将消耗连接次数，仍受配额及限速约束；原先开启Session保存的机器人会自动保存新的Session。`, true)
+    } catch (error) {
+      Bot.makeLog('error', ['清理所有QQBot Session失败', error.message], 'QQBot-Plugin')
+      return this.reply('所有机器人Session缓存清理未完成，请检查存储错误后重试。当前连接和配置未改变，本进程已暂停Session写回，不能视为清理成功。', true)
+    }
+  }
+
   async wsCommand () {
     const overview = /^#q+botws全部(?:连接|链接)次数(?:\s+(\d+))?$/i.exec(String(this.e.msg || '').trim())
     // Read-only overview also works through another online adapter when all
@@ -8305,26 +8569,7 @@ export class QQBotAdapter extends plugin {
     return handleWsCommand({
       event: this.e, store: wsStore, separator: adapter.sep, reply: (...args) => this.reply(...args), buttons: (...rows) => segment.button(...rows),
       runtime: Bot[id], currentStatus: () => this.sessionQuotaStatus(), allStatus: page => this.wsAllStatus(page),
-      changed: async (kind, enabled) => {
-        const runtime = Bot[id]
-        if (runtime?.adapter !== adapter) return
-        if (kind === 'session') {
-          if (enabled) {
-            runtime.wsSession.update(runtime.sdk._sessionLifecycle.sessionSnapshot, { immediate: true })
-            await runtime.wsSession.flush()
-          } else {
-            // Erase both environments so disabling/re-enabling cannot restore
-            // an old Session from the other environment.
-            await runtime.wsSession.clear({ force: true })
-            const appid = runtime.sdk.config.appid
-            await wsStore.saveSession(`${id}:${appid}:${runtime.wsEnvironment ? 'production' : 'sandbox'}`, null)
-          }
-        }
-        if (kind === 'notifications') {
-          refreshWsProbe(id)
-          void runtime.wsNotifications.refresh()
-        }
-      }
+      changed: kind => applyWsRuntimeSettings(id, { sessionChanged: kind === 'session' })
     })
   }
 
@@ -8370,6 +8615,7 @@ export class QQBotAdapter extends plugin {
     const info = fresh || bot?.sessionQuota?.snapshot()
     const health = bot?.connectionHealth || {}
     const messageHealth = bot?.messageHealth?.last || {}
+    const messageCounts = bot?.messageHealth?.counts || {}
     const waiting = bot?.sessionQuota?.waiting
     const states = { idle: '待连接', starting: '获取连接信息', 'quota-check': '检查配额', connecting: '连接/鉴权中', ready: '已连接', 'retry-wait': '等待重试', stopped: '已停止', terminal: '终止，需人工处理' }
     const waitStates = { quota: '等待配额重置', 'quota-unknown': '等待配额复核', concurrency: '等待连接限速' }
@@ -8382,10 +8628,16 @@ export class QQBotAdapter extends plugin {
       `状态：${waiting ? waitStates[waiting.reason] : states[health.state] || '未知'}`,
       `下次复核/重试：${time(waiting?.until || health.nextRetryAt)}`,
       `最后心跳ACK：${time(health.lastAckAt)}`,
-      `最后网关事件：${time(health.lastDispatchAt)}`,
+      `传输层：${({ connecting: '建立中', open: '已收到网关帧', acknowledged: '已收到心跳ACK', disconnected: '已断开' })[health.transportState] || '待验证'}`,
+      `协议就绪：${time(health.protocolReadyAt)}；业务事件：${health.eventState === 'verified' ? '已验证' : '待验证（不等同故障）'}`,
+      `Session：${health.session || '无'}；Resume请求seq=${health.resumeRequestedSeq ?? '无'}，RESUMED seq=${health.resumedSeq ?? '无'}`,
+      `最近接收seq=${health.receivedSeq ?? '无'}；已处理seq=${bot?.sdk?._sessionLifecycle?.sessionSnapshot?.seq ?? '无'}`,
+      `网关事件：收到${health.rawDispatchCount || 0}，过滤${health.filteredDispatchCount || 0}，处理中${health.pendingDispatchCount || 0}，完成${health.completedDispatchCount || 0}，失败${health.dispatchErrorCount || 0}`,
+      `最后网关事件：${time(health.lastRawDispatchAt || health.lastDispatchAt)}；最后处理完成：${time(health.lastProcessedAt)}`,
       `最后原始消息：${time(messageHealth.raw)}`,
       `最后解析消息：${time(messageHealth.parsed)}`,
       `最后框架分发：${time(messageHealth['framework-dispatched'])}`,
+      `消息计数：进入解析${messageCounts.raw || 0}，解析完成${messageCounts.parsed || 0}，交付框架${messageCounts['framework-dispatched'] || 0}`,
       '次数指新建Session配额，不是当前在线连接数；查询不会创建WS连接。'
     ]
     return respond(lines.join('\n'))
@@ -8652,6 +8904,18 @@ export class QQBotAdapter extends plugin {
       '',
       `><qqbot-cmd-input text="#QQBot设置转图片${botConfig.toImg ? '关闭' : '开启'}" show="${botConfig.toImg ? '关闭' : '开启'}转图片"/>`,
       '',
+      `>链接自动转义：<qqbot-cmd-input text="#QQBot链接自动转义 ${botConfig.messageLinkEscape === true ? '关闭' : '开启'}" show="${botConfig.messageLinkEscape === true ? '开启' : '关闭'}"/>`,
+      '',
+      '```text',
+      '默认关闭，按机器人设置；在最终消息请求发送前处理正文URL。',
+      '自动为协议头的两个斜杠各补一个反斜杠，已转义的不重复添加。',
+      '无需外部插件改用String.raw；保留中文、下划线、%编码和正常换行。',
+      '适用于各类segment最终产生的文本、Markdown及模板参数、卡片说明。',
+      '代码、Markdown图片、引用链接定义、qbotcmd及按钮跳转数据不改。',
+      '上传/接口地址和原有图片、音频、转二维码等处理不受此开关影响。',
+      '这是主动补转义，不是原样发送；旧原样开关已移除且不自动迁入。',
+      '```',
+      '',
       `>消息后缀（分离机器人）：${suffix.enabled ? '开启' : '关闭'}`,
       '',
       `>后缀内容：${suffix.markdown.trim() ? '已设置' : '未设置'}`,
@@ -8677,6 +8941,27 @@ export class QQBotAdapter extends plugin {
         [{ text: '接口切换', callback: '#QQBot接口切换菜单' }, { text: '素材管理', callback: '#qqbot素材管理菜单' }],
         [{ text: 'WS配置', callback: '#QQBotws配置' }, { text: '返回', callback: '#QQBot帮助' }]
       )
+    ], true)
+  }
+
+  async messageLinkEscapeSetting () {
+    if (!this.guardOfficialBot()) return true
+    const selfId = this.e.self_id
+    const match = /^#q+bot链接自动转义(?:\s+(开启|关闭))?$/i.exec(String(this.e.msg || '').trim())
+    if (!match) return this.reply('用法：#QQBot链接自动转义 开启/关闭', true)
+    const previous = getBotConfigValue(selfId, 'messageLinkEscape') === true
+    const enabled = match[1] ? match[1] === '开启' : previous
+    if (match[1]) {
+      setBotConfigValue(selfId, 'messageLinkEscape', enabled)
+      try { await configSave() } catch (error) {
+        if (getBotConfigValue(selfId, 'messageLinkEscape') === enabled) setBotConfigValue(selfId, 'messageLinkEscape', previous)
+        return this.reply(`[${selfId}] 链接自动转义保存失败：${error.message}；本次设置未生效，请处理保存问题后重试。`, true)
+      }
+    }
+    const status = `<qqbot-cmd-input text="#QQBot链接自动转义 ${enabled ? '关闭' : '开启'}" show="${enabled ? '开启' : '关闭'}"/>`
+    return this.reply([
+      `[${selfId}] 链接自动转义${match[1] ? '已' : '：'}${status}\n仅作用于本机器人，${match[1] ? '下条消息起生效，无需重启。' : '默认关闭。'}\n在最终消息请求发送前，自动为正文URL协议头补反斜杠，已转义的不重复添加；外部插件无需改写。\n中文、下划线、%编码和正常换行保留；代码、图片URL、qbotcmd、按钮跳转及接口/上传地址不改动。\n不会修改转二维码、图片、音频等其他设置；旧原样开关已移除，不自动迁入。`,
+      segment.button([{ text: '返回', callback: '#QQBot其他菜单' }])
     ], true)
   }
 
