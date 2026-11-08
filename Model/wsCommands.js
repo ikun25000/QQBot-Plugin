@@ -26,11 +26,15 @@ export async function handleWsCommand ({ event, store, reply, buttons, runtime, 
       [
         `#[${id}] QQBot WS配置`, '',
         `>Session持久保存：${state(settings.sessionSave)}（默认关闭，仅影响进程重启；运行中断线优先Resume）`, '',
+        `>设置保存于QQBot.yaml的 bots.${id}.ws；Session与运行状态仍存Level。手改后刷新配置，环境重启生效。`, '',
         `>通知总开关：${state(settings.notifications.enabled)}，方式：${settings.notifications.method}`, '',
         `>当前运行环境：${runtime ? runtime.wsEnvironment ? '沙箱' : '正式' : '未运行'}`, '',
         `>下次启动环境：${settings.sandbox ? '沙箱' : '正式'}（忽略全局sandbox，重启生效）`, '',
-        hint('#QQBotWS连接次数', '本机器人连接次数'), '', hint('#QQBotWS全部连接次数', '查看本地所有机器人'), '',
+        hint('#QQBotWS连接次数', '本机器人连接次数'), '',
+        hint('#qqbot清理所有session', '清空所有机器人session'), '',
+        hint('#QQBotWS全部连接次数', '查看本地所有机器人'), '',
         hint('#QQBotWS通知配置', '通知配置'), '', hint('#QQBotWS掉线配置', '掉线设置'), '',
+        hint('#qqbot检测菜单', '业务检测'), '',
         hint(`#QQBotSession保存 ${toggle(settings.sessionSave)}`, `${toggle(settings.sessionSave)}Session保存`), '',
         hint('#QQBot开启正式环境', '开启正式环境'), '', hint('#QQBot开启沙箱环境', '开启沙箱环境')
       ].join('\n'), buttons(...rows)
