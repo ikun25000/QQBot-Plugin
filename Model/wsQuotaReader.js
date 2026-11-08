@@ -3,11 +3,11 @@
 export function createWsQuotaReader ({ request, now = Date.now }) {
   const queries = new Map()
   const tokens = new Map()
-  return async function read ({ id, appid, secret, endpoints, headers = {}, accessToken, tokenExpireTime }) {
+  return async function read ({ id, appid, secret, endpoints, headers = {}, accessToken, tokenExpireTime, fresh = false }) {
     const previous = queries.get(id)
     const same = previous?.appid === appid && previous?.secret === secret && previous?.base === endpoints.apiBase
     if (same && previous.pending) return previous.pending
-    if (same && now() - previous.attemptAt < 15000) return previous.value ? { ...previous.value, cached: true, failed: previous.failed } : null
+    if (!fresh && same && now() - previous.attemptAt < 15000) return previous.value ? { ...previous.value, cached: true, failed: previous.failed } : null
     const entry = { appid, secret, base: endpoints.apiBase, value: same ? previous.value : null, attemptAt: now() }
     queries.set(id, entry)
     entry.pending = Promise.resolve().then(async () => {
