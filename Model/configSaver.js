@@ -5,24 +5,24 @@ export function createConfigSaver ({ snapshot, write, credentials = value => JSO
   let waiting = []
   let timer
   let inFlight = Promise.resolve()
-  function submit () {
+  function submit (credentialUpsert) {
     clearTimer(timer)
     timer = undefined
     const listeners = waiting
     waiting = []
     let work
-    try { work = Promise.resolve(write(snapshot())) } catch (error) { work = Promise.reject(error) }
+    try { work = Promise.resolve(write(snapshot(), { credentialUpsert })) } catch (error) { work = Promise.reject(error) }
     inFlight = Promise.all([inFlight.catch(() => {}), work]).then(() => {})
     inFlight.catch(() => {})
     work.then(() => listeners.forEach(item => item.resolve()), error => listeners.forEach(item => item.reject(error)))
     return work
   }
-  function save ({ immediate = false } = {}) {
+  function save ({ immediate = false, credentialUpsert } = {}) {
     const key = credentials(snapshot())
     const changedCredentials = key !== credentialKey
     credentialKey = key
     const promise = new Promise((resolve, reject) => waiting.push({ resolve, reject }))
-    if (immediate || changedCredentials) void submit().catch(() => {})
+    if (immediate || changedCredentials || credentialUpsert !== undefined) void submit(credentialUpsert).catch(() => {})
     else {
       clearTimer(timer)
       timer = setTimer(() => { void submit().catch(() => {}) }, delayMs)
