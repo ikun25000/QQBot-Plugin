@@ -82,13 +82,13 @@ function getMissingCredentialAppids (next, current) {
     .filter(Boolean)
 }
 
-function preserveCurrentCredentialRemovals (next, current, baseline) {
+function preserveCurrentCredentialRemovals (next, current, baseline, credentialUpsert) {
   const baselineTokens = credentialTokenMap(baseline)
   const currentTokens = credentialTokenMap(current)
   const nextTokens = credentialTokenMap(next)
   const result = []
   for (const [selfId, token] of nextTokens) {
-    if (currentTokens.has(selfId) || !baselineTokens.has(selfId)) result.push(token)
+    if (currentTokens.has(selfId) || !baselineTokens.has(selfId) || token === credentialUpsert) result.push(token)
   }
   for (const [selfId, token] of currentTokens) {
     if (!nextTokens.has(selfId)) result.push(token)
@@ -108,12 +108,13 @@ async function syncDirectory (dir) {
   } catch {}
 }
 
-async function writeAtomic (file, text, mode = 0o600) {
+async function writeAtomic (file, text, mode = 0o600, beforeRename) {
   await originalMkdir(dirname(file), { recursive: true, mode: 0o700 })
   const tmp = `${file}.${process.pid}.${Date.now()}.${++state.writeSeq}.tmp`
   try {
     await originalWriteFile(tmp, text, { encoding: 'utf8', mode })
     await syncFile(tmp)
+    if (beforeRename) await beforeRename()
     await originalRename(tmp, file)
     if (file === CONFIG_FILE) state.internalConfigText = text
     await syncDirectory(dirname(file))
@@ -297,12 +298,31 @@ async function safeConfigWrite (file, data, options) {
   try { next = parseValidConfig(text) } catch (err) {
     throw err
   }
+  // A verified scan may deliberately re-add a previously removed account. The
+  // exception is limited to this exact token and this one serialized write.
+  const credentialUpsert = options?.credentialUpsert
+  const verifyUpsert = value => {
+    if (credentialUpsert === undefined) return
+    const id = typeof credentialUpsert === 'string' ? credentialUpsert.split(':')[0] : ''
+    const matches = Array.isArray(value.token) ? value.token.filter(token => String(token || '').split(':')[0]?.trim() === id) : []
+    if (!id || matches.length !== 1 || credentialTokenMap(value).get(id) !== credentialUpsert) {
+      throw Object.assign(new Error('无法确认扫码凭据已写入QQBot.yaml'), { code: 'QQBOT_CREDENTIAL_NOT_SAVED' })
+    }
+  }
+  const verifySavedUpsert = async () => verifyUpsert(parseValidConfig(await originalReadFile(CONFIG_FILE, 'utf8')))
+  verifyUpsert(next)
   const allowRemoval = state.allowedCredentialRemovalHash === hashText(text) && state.allowedCredentialRemovalUntil >= Date.now()
   if (allowRemoval || state.allowedCredentialRemovalUntil < Date.now()) {
     state.allowedCredentialRemovalHash = ''
     state.allowedCredentialRemovalUntil = 0
   }
   state.writeQueue = state.writeQueue.catch(() => {}).then(async () => {
+    const conflict = () => Object.assign(new Error('QQBot.yaml 已在外部修改，请先刷新配置再保存'), { code: 'QQBOT_CONFIG_EDITED' })
+    const expected = options?.expectedRevision?.()
+    const assertRevision = expected === undefined ? undefined : async () => {
+      if (expected !== await readQQBotConfigRevision()) throw conflict()
+    }
+    if (assertRevision) await assertRevision()
     let current = ''
     try {
       current = await readValidText(CONFIG_FILE)
@@ -316,11 +336,13 @@ async function safeConfigWrite (file, data, options) {
     const currentValue = current ? parseValidConfig(current) : null
     const currentMissingAppids = currentValue && !currentAuthorizedRemoval && baseline ? getMissingCredentialAppids(currentValue, baseline) : []
     if (!allowRemoval && currentMissingAppids.length && baseline && getMissingCredentialAppids(next, baseline).length < currentMissingAppids.length) {
-      next.token = preserveCurrentCredentialRemovals(next, currentValue, baseline)
+      next.token = preserveCurrentCredentialRemovals(next, currentValue, baseline, credentialUpsert)
       text = YAML.stringify(next)
     }
+    verifyUpsert(next)
     const missingAppids = !allowRemoval && !currentAuthorizedRemoval && baseline ? getMissingCredentialAppids(next, baseline) : []
     if (missingAppids.length && !hasCredentials(next)) {
+      if (expected !== undefined) throw new Error('QQBot配置保存将丢失全部凭据，拒绝写入')
       await writeAtomic(CONFIG_FILE, credentialBackup.text)
       await saveBackup(credentialBackup.text)
       await clearCredentialLossNotification()
@@ -330,14 +352,26 @@ async function safeConfigWrite (file, data, options) {
     if (current && hashText(current) !== hashText(text)) {
       await saveBackup(current, currentAuthorizedRemoval || currentMissingAppids.length === 0)
     }
+    if (assertRevision) await assertRevision()
     if (allowRemoval && !hasCredentials(next)) await writeAtomic(REMOVAL_AUTHORIZATION, hashText(text))
     else if (allowRemoval) { try { await originalUnlink(REMOVAL_AUTHORIZATION) } catch {} }
-    if (current !== text) await writeAtomic(CONFIG_FILE, text)
-    await saveBackup(text, allowRemoval || currentAuthorizedRemoval || missingAppids.length === 0)
-    if (missingAppids.length) await queueCredentialLossNotification(missingAppids, next.token)
-    else await clearCredentialLossNotification()
-    if (currentAuthorizedRemoval && !allowRemoval && !hasCredentials(next)) await writeAtomic(REMOVAL_AUTHORIZATION, hashText(text))
-    else if (currentAuthorizedRemoval && hasCredentials(next)) { try { await originalUnlink(REMOVAL_AUTHORIZATION) } catch {} }
+    if (current !== text) await writeAtomic(CONFIG_FILE, text, 0o600, assertRevision)
+    if (credentialUpsert !== undefined) await verifySavedUpsert()
+    // The primary file is committed now. Ancillary backup/notification failures
+    // must not roll memory back to the previous YAML or leave its revision stale.
+    options?.onCommitted?.(hashText(text))
+    try { await saveBackup(text, allowRemoval || currentAuthorizedRemoval || missingAppids.length === 0) } catch {
+      globalThis.logger?.warn?.('[QQBot-Plugin] QQBot主配置已保存，但备份更新失败；请检查备份目录权限和磁盘空间，下次检查会重试')
+    }
+    try {
+      if (missingAppids.length) await queueCredentialLossNotification(missingAppids, next.token)
+      else await clearCredentialLossNotification()
+      if (currentAuthorizedRemoval && !allowRemoval && !hasCredentials(next)) await writeAtomic(REMOVAL_AUTHORIZATION, hashText(text))
+      else if (currentAuthorizedRemoval && hasCredentials(next)) { try { await originalUnlink(REMOVAL_AUTHORIZATION) } catch {} }
+    } catch {
+      globalThis.logger?.warn?.('[QQBot-Plugin] QQBot主配置已保存，但凭据状态维护未完成；请检查备份目录权限和磁盘空间')
+    }
+    if (credentialUpsert !== undefined) await verifySavedUpsert()
   })
   return state.writeQueue
 }
@@ -407,9 +441,18 @@ function stopQQBotConfigBackupCheck () {
   if (globalThis[TIMER_KEY]) globalThis[TIMER_KEY] = null
 }
 
-async function reloadSafeQQBotConfig () {
+async function readQQBotConfigRevision () {
+  try { return hashText(await originalReadFile(CONFIG_FILE, 'utf8')) } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+    return hashText('')
+  }
+}
+
+async function reloadSafeQQBotConfig ({ withRevision = false } = {}) {
   await prepareQQBotConfig()
-  return parseValidConfig(await originalReadFile(CONFIG_FILE, 'utf8'))
+  const text = await originalReadFile(CONFIG_FILE, 'utf8')
+  const config = parseValidConfig(text)
+  return withRevision ? { config, revision: hashText(text) } : config
 }
 
 export {
@@ -418,6 +461,7 @@ export {
   installQQBotConfigSafetyHook,
   allowNextQQBotCredentialRemoval,
   prepareQQBotConfig,
+  readQQBotConfigRevision,
   reloadSafeQQBotConfig,
   startQQBotConfigBackupCheck,
   stopQQBotConfigBackupCheck,
