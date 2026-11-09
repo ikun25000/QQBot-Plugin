@@ -12025,6 +12025,7 @@ export class QQBotAdapter extends plugin {
   }
 
   async advancedWelcomeUserCommand () {
+    if (this.e?.bot?.adapter !== adapter) return
     const msg = String(this.e.msg || '').trim()
     if (!this.e.isGroup && this.e.message_type !== 'group') {
       this.reply('请前往群聊使用，当前环境不可用', true)
@@ -12036,6 +12037,8 @@ export class QQBotAdapter extends plugin {
 
     let m = /^#?我要投诉通知\s+确认\s+(\S+)$/i.exec(msg)
     if (m) {
+      const aw = ensureAdvancedWelcomeConfig(config, this.e.self_id)
+      if (!aw.enabled || advancedWelcomeStore.getGroup(this.e.self_id, groupOpenid)?.disabled) return
       if (advancedWelcomeStore.isComplaintBlacklisted(this.e.self_id, groupOpenid)) {
         await this._replyAndRecall('当前群已被禁止使用投诉；群管理员仍可使用关闭通知')
         return
@@ -12051,7 +12054,6 @@ export class QQBotAdapter extends plugin {
         await this._replyAndRecall('你已经投诉过当前群推送，无需重复提交')
         return
       }
-      const aw = ensureAdvancedWelcomeConfig(config, this.e.self_id)
       const complaints = Object.keys(result.item?.complaints || {}).length
       if (aw.complaintAutoClose > 0 && complaints >= aw.complaintAutoClose) {
         await advancedWelcomeStore.autoDisableGroup(this.e.self_id, groupOpenid, `被投诉${complaints}次自动关闭`)
